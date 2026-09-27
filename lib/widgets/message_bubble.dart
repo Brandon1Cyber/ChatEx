@@ -2,13 +2,17 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:math' as math;
 import 'dart:ui' as ui;
+import 'dart:typed_data';
 
-import 'package:cloud_firestore/cloud_firestore.dart';
-import 'package:firebase_auth/firebase_auth.dart';
+import 'package:gal/gal.dart';
+import 'package:http/http.dart' as http;
+
 import 'package:flutter/material.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:just_audio/just_audio.dart';
 import 'package:latlong2/latlong.dart';
+import 'package:video_player/video_player.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 class MessageBubble extends StatefulWidget {
   // ============================================================
@@ -16,7 +20,15 @@ class MessageBubble extends StatefulWidget {
   // ============================================================
 
   final String type;
-  final String message;
+final String message;
+
+final String imageUrl;
+final String videoUrl;
+final String documentUrl;
+
+final String fileName;
+final String mimeType;
+final int fileSize;
 
   // ============================================================
   // VOICE
@@ -34,9 +46,16 @@ class MessageBubble extends StatefulWidget {
 
   final String time;
 
-  final bool isMe;
-  final bool isSeen;
-  final bool isDelivered;
+final bool isMe;
+final bool isSeen;
+final bool isDelivered;
+
+// ============================================================
+// VOICE CALL
+// ============================================================
+
+final String callStatus;
+final int callDuration;
 
   // ============================================================
   // LOCATION
@@ -73,14 +92,23 @@ class MessageBubble extends StatefulWidget {
     super.key,
     required this.type,
     required this.message,
+    required this.imageUrl,
+required this.videoUrl,
+required this.documentUrl,
+
+required this.fileName,
+required this.mimeType,
+required this.fileSize,
     required this.voiceUrl,
     required this.voiceDuration,
     this.voiceWaveform = const [],
     required this.time,
-    required this.isMe,
-    required this.isSeen,
-    required this.isDelivered,
-    required this.isReply,
+required this.isMe,
+required this.isSeen,
+required this.isDelivered,
+this.callStatus = '',
+this.callDuration = 0,
+required this.isReply,
     required this.replyTo,
     required this.isFrozen,
     required this.isMelted,
@@ -103,7 +131,7 @@ class _MessageBubbleState extends State<MessageBubble>
 
   final AudioPlayer _audioPlayer = AudioPlayer();
 
-  StreamSubscription? _playerStateSubscription;
+  StreamSubscription<PlayerState>? _playerStateSubscription;
   StreamSubscription<Duration?>? _durationSubscription;
   StreamSubscription? _positionSubscription;
 
@@ -151,39 +179,53 @@ class _MessageBubbleState extends State<MessageBubble>
     );
 
     _flameController = AnimationController(
-      vsync: this,
-      duration: const Duration(milliseconds: 650),
-    );
+  vsync: this,
+  duration: const Duration(milliseconds: 650),
+)..repeat();
 
-    _playerStateSubscription =
-        _audioPlayer.playerStateStream.listen((state) {
-      if (!mounted) return;
+   _playerStateSubscription =
+    _audioPlayer.playerStateStream.listen((state) async {
+  if (!mounted) return;
 
-      setState(() {
-        _isPlaying = state.playing;
-      });
+  // ------------------------------------------------------------
+  // NORMAL PLAY / PAUSE STATE
+  // ------------------------------------------------------------
 
-      if (state.playing) {
-        _glowController.repeat(reverse: true);
-      } else {
-        _glowController.stop();
-      }
+  setState(() {
+    _isPlaying = state.playing;
+  });
 
-      if (state.processingState == ProcessingState.completed) {
-        _audioPlayer.seek(Duration.zero);
+  if (state.playing) {
+    _glowController.repeat(reverse: true);
+  } else {
+    _glowController.stop();
+  }
 
-        if (!mounted) return;
+  // ------------------------------------------------------------
+  // AUDIO FINISHED
+  // ------------------------------------------------------------
 
-        setState(() {
-          _isPlaying = false;
-          _hasPlayed = false;
-          _speed = 1.0;
-          _position = Duration.zero;
-        });
+  if (state.processingState == ProcessingState.completed) {
+    // Make absolutely sure playback has stopped.
+    await _audioPlayer.pause();
 
-        _glowController.stop();
-      }
+    // Reset the player to the beginning.
+    await _audioPlayer.seek(Duration.zero);
+
+    if (!mounted) return;
+
+    setState(() {
+      _isPlaying = false;
+      _position = Duration.zero;
+
+      // Keep the speed button available after the user
+      // has already played the voice note.
+      _hasPlayed = true;
     });
+
+    _glowController.stop();
+  }
+});
 
     _durationSubscription =
         _audioPlayer.durationStream.listen((duration) {
@@ -263,49 +305,199 @@ class _MessageBubbleState extends State<MessageBubble>
   }
 
   String _attachmentUrl() {
-    final data = _attachmentData();
+  // ============================================================
+  // IMAGE
+  // ============================================================
 
-    return data['url']?.toString() ??
-        data['downloadUrl']?.toString() ??
-        data['fileUrl']?.toString() ??
-        data['mediaUrl']?.toString() ??
-        '';
+  if (widget.type == 'image' ||
+      widget.type == 'photo' ||
+      widget.type == 'camera' ||
+      widget.type == 'gallery') {
+    return widget.imageUrl.trim();
   }
+
+  // ============================================================
+  // VIDEO
+  // ============================================================
+
+  if (widget.type == 'video') {
+    return widget.videoUrl.trim();
+  }
+
+  // ============================================================
+  // DOCUMENT
+  // ============================================================
+
+  if (widget.type == 'document' ||
+      widget.type == 'file' ||
+      widget.type == 'pdf') {
+    return widget.documentUrl.trim();
+  }
+
+  // ============================================================
+  // VOICE
+  // ============================================================
+
+  if (widget.voiceUrl.trim().isNotEmpty) {
+    return widget.voiceUrl.trim();
+  }
+
+  // ============================================================
+  // LEGACY ATTACHMENT DATA
+  // ============================================================
+
+  final data = _attachmentData();
+
+  final candidates = [
+    data['url'],
+    data['downloadUrl'],
+    data['fileUrl'],
+    data['mediaUrl'],
+    data['imageUrl'],
+    data['videoUrl'],
+    data['documentUrl'],
+  ];
+
+  for (final candidate in candidates) {
+    final value =
+        candidate?.toString().trim() ?? '';
+
+    if (value.isEmpty) {
+      continue;
+    }
+
+    final uri =
+        Uri.tryParse(value);
+
+    if (uri != null &&
+        (uri.scheme == 'http' ||
+            uri.scheme == 'https') &&
+        uri.host.isNotEmpty) {
+      return value;
+    }
+  }
+
+  return '';
+}
 
   String _attachmentName() {
-    final data = _attachmentData();
-
-    return data['fileName']?.toString() ??
-        data['name']?.toString() ??
-        data['title']?.toString() ??
-        'Attachment';
+  if (widget.fileName.trim().isNotEmpty) {
+    return widget.fileName.trim();
   }
 
+  final data = _attachmentData();
+
+  return data['fileName']
+          ?.toString() ??
+      data['name']
+          ?.toString() ??
+      data['title']
+          ?.toString() ??
+      'Attachment';
+}
+
   String _attachmentMime() {
+  if (widget.mimeType.trim().isNotEmpty) {
+    return widget.mimeType.trim();
+  }
+
+  final data = _attachmentData();
+
+  return data['mimeType']
+          ?.toString() ??
+      data['mime']
+          ?.toString() ??
+      '';
+}
+
+  // ============================================================
+  // REAL VOICE WAVEFORM
+  // ============================================================
+  //
+  // The waveform can arrive in two ways:
+  //
+  // 1. Directly through widget.voiceWaveform
+  //
+  // 2. Inside widget.message as JSON:
+  //
+  // {
+  //   "url": "...",
+  //   "waveform": [0.12, 0.35, 0.72, ...]
+  // }
+  //
+  // This method safely converts both formats into List<double>.
+  // ============================================================
+
+  List<double> _extractWaveform(dynamic raw) {
+    if (raw is! List) {
+      return [];
+    }
+
+    final result = <double>[];
+
+    for (final value in raw) {
+      double? parsed;
+
+      if (value is num) {
+        parsed = value.toDouble();
+      } else if (value is String) {
+        parsed = double.tryParse(value);
+      }
+
+      if (parsed == null) {
+        continue;
+      }
+
+      if (parsed.isNaN || parsed.isInfinite) {
+        continue;
+      }
+
+      result.add(parsed.clamp(0.0, 1.0));
+    }
+
+    return result;
+  }
+
+  List<double> _effectiveVoiceWaveform() {
+    // ----------------------------------------------------------
+    // FIRST: use the waveform directly supplied by ChatScreen.
+    // ----------------------------------------------------------
+
+    final direct = _extractWaveform(
+      widget.voiceWaveform,
+    );
+
+    if (direct.isNotEmpty) {
+      return direct;
+    }
+
+    // ----------------------------------------------------------
+    // SECOND: try to recover the waveform from the message JSON.
+    // ----------------------------------------------------------
+
     final data = _attachmentData();
 
-    return data['mimeType']?.toString() ??
-        data['mime']?.toString() ??
-        '';
+    final rawWaveform =
+        data['waveform'] ??
+        data['voiceWaveform'] ??
+        data['waveformData'] ??
+        data['amplitudes'];
+
+    final embedded = _extractWaveform(
+      rawWaveform,
+    );
+
+    if (embedded.isNotEmpty) {
+      return embedded;
+    }
+
+    return [];
   }
 
   // ============================================================
   // SINGLE EMOJI DETECTION
   // ============================================================
 
-  /// Returns true only when the entire message is one visible emoji.
-  ///
-  /// Examples:
-  ///
-  /// 😀       -> true
-  /// ❤️       -> true
-  /// 👍🏽     -> true
-  /// 👨‍💻     -> true
-  /// 1️⃣      -> true
-  ///
-  /// 😀😀     -> false
-  /// Hello 😀 -> false
-  /// 😀 hello -> false
   bool _isSingleEmojiMessage() {
     if (widget.type != 'text' &&
         widget.type != 'message' &&
@@ -319,7 +511,6 @@ class _MessageBubbleState extends State<MessageBubble>
       return false;
     }
 
-    // Never allow whitespace inside an emoji-only message.
     if (text.contains(RegExp(r'\s'))) {
       return false;
     }
@@ -330,43 +521,15 @@ class _MessageBubbleState extends State<MessageBubble>
       return false;
     }
 
-    // ----------------------------------------------------------
-    // KEYCAP EMOJI
-    // Example: 1️⃣, #️⃣, *️⃣
-    // ----------------------------------------------------------
-
     if (_isSingleKeycapEmoji(codePoints)) {
       return true;
     }
-
-    // ----------------------------------------------------------
-    // FLAGS
-    //
-    // Example:
-    // 🇿🇦
-    // 🇺🇸
-    //
-    // A flag is represented by two regional indicator
-    // characters but visually counts as one emoji.
-    // ----------------------------------------------------------
 
     if (codePoints.length == 2 &&
         _isRegionalIndicator(codePoints[0]) &&
         _isRegionalIndicator(codePoints[1])) {
       return true;
     }
-
-    // ----------------------------------------------------------
-    // GENERAL EMOJI SEQUENCE
-    //
-    // Supports:
-    // 😀
-    // ❤️
-    // 👍🏽
-    // 👨‍💻
-    // 🏳️‍🌈
-    // etc.
-    // ----------------------------------------------------------
 
     bool foundEmoji = false;
 
@@ -375,13 +538,11 @@ class _MessageBubbleState extends State<MessageBubble>
     while (i < codePoints.length) {
       final codePoint = codePoints[i];
 
-      // Variation selectors are part of the same emoji.
       if (_isVariationSelector(codePoint)) {
         i++;
         continue;
       }
 
-      // Emoji skin tone modifier.
       if (_isEmojiModifier(codePoint)) {
         if (!foundEmoji) {
           return false;
@@ -391,8 +552,6 @@ class _MessageBubbleState extends State<MessageBubble>
         continue;
       }
 
-      // Zero-width joiner connects multiple emoji pieces
-      // into one visible emoji.
       if (codePoint == 0x200D) {
         if (!foundEmoji) {
           return false;
@@ -407,7 +566,6 @@ class _MessageBubbleState extends State<MessageBubble>
         continue;
       }
 
-      // Combining enclosing keycap.
       if (codePoint == 0x20E3) {
         if (!foundEmoji) {
           return false;
@@ -419,10 +577,6 @@ class _MessageBubbleState extends State<MessageBubble>
 
       if (_isEmojiBase(codePoint)) {
         if (foundEmoji) {
-          // A second emoji base means this is something like:
-          // 😀😀
-          // ❤️🔥
-          // 👍😂
           return false;
         }
 
@@ -431,7 +585,6 @@ class _MessageBubbleState extends State<MessageBubble>
         continue;
       }
 
-      // Anything else means it isn't emoji-only.
       return false;
     }
 
@@ -480,25 +633,21 @@ class _MessageBubbleState extends State<MessageBubble>
   }
 
   bool _isEmojiBase(int codePoint) {
-    // Main Unicode emoji blocks.
     if (codePoint >= 0x1F000 &&
         codePoint <= 0x1FAFF) {
       return true;
     }
 
-    // Miscellaneous symbols.
     if (codePoint >= 0x2600 &&
         codePoint <= 0x26FF) {
       return true;
     }
 
-    // Dingbats.
     if (codePoint >= 0x2700 &&
         codePoint <= 0x27BF) {
       return true;
     }
 
-    // Miscellaneous Technical.
     if (codePoint >= 0x2300 &&
         codePoint <= 0x23FF) {
       return true;
@@ -535,9 +684,7 @@ class _MessageBubbleState extends State<MessageBubble>
                 color: Colors.white,
               ),
             ),
-
             const SizedBox(width: 5),
-
             Padding(
               padding: const EdgeInsets.only(
                 bottom: 3,
@@ -569,7 +716,8 @@ class _MessageBubbleState extends State<MessageBubble>
         return;
       }
 
-      if (_audioPlayer.processingState == ProcessingState.idle) {
+      if (_audioPlayer.processingState ==
+          ProcessingState.idle) {
         await _audioPlayer.setUrl(url);
       }
 
@@ -631,7 +779,10 @@ class _MessageBubbleState extends State<MessageBubble>
   // ============================================================
 
   String _formatDuration(Duration duration) {
-    final seconds = duration.inSeconds.clamp(0, 359999);
+    final seconds = duration.inSeconds.clamp(
+      0,
+      359999,
+    );
 
     final minutes = seconds ~/ 60;
     final remainingSeconds = seconds % 60;
@@ -736,7 +887,7 @@ class _MessageBubbleState extends State<MessageBubble>
     );
   }
 
-  // ============================================================
+    // ============================================================
   // REPLY
   // ============================================================
 
@@ -766,51 +917,79 @@ class _MessageBubbleState extends State<MessageBubble>
 
     return Container(
       width: double.infinity,
-      margin: const EdgeInsets.only(bottom: 7),
+      margin: const EdgeInsets.only(
+        bottom: 5,
+      ),
       padding: const EdgeInsets.fromLTRB(
-        9,
         7,
-        9,
+        5,
         7,
+        5,
       ),
       decoration: BoxDecoration(
         color: widget.isMe
             ? Colors.black.withValues(alpha: .16)
             : const Color(0xff081225)
                 .withValues(alpha: .72),
-        borderRadius: BorderRadius.circular(9),
+        borderRadius: BorderRadius.circular(7),
         border: Border(
           left: BorderSide(
             color: widget.isMe
                 ? const Color(0xffD6B5FF)
                 : const Color(0xff00D9FF),
-            width: 3,
+            width: 2.2,
           ),
         ),
       ),
-      child: Column(
-        crossAxisAlignment:
-            CrossAxisAlignment.start,
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.center,
         children: [
-          Text(
-            widget.isMe ? 'You' : 'Reply',
-            style: TextStyle(
-              color: widget.isMe
-                  ? const Color(0xffE3CFFF)
-                  : const Color(0xff7DEBFF),
-              fontSize: 11,
-              fontWeight: FontWeight.w700,
-            ),
+          // Tiny reply icon
+          Icon(
+            Icons.reply_rounded,
+            size: 12,
+            color: widget.isMe
+                ? const Color(0xffE3CFFF)
+                : const Color(0xff7DEBFF),
           ),
-          const SizedBox(height: 2),
-          Text(
-            replyText,
-            maxLines: 2,
-            overflow: TextOverflow.ellipsis,
-            style: const TextStyle(
-              color: Colors.white70,
-              fontSize: 12,
-              height: 1.2,
+
+          const SizedBox(width: 5),
+
+          // Reply content
+          Expanded(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment:
+                  CrossAxisAlignment.start,
+              children: [
+                Text(
+                  widget.isMe ? 'You' : 'Reply',
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    color: widget.isMe
+                        ? const Color(0xffE3CFFF)
+                        : const Color(0xff7DEBFF),
+                    fontSize: 9.5,
+                    height: 1.0,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+
+                const SizedBox(height: 2),
+
+                Text(
+                  replyText,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                    color: Colors.white70,
+                    fontSize: 10.5,
+                    height: 1.05,
+                    fontWeight: FontWeight.w400,
+                  ),
+                ),
+              ],
             ),
           ),
         ],
@@ -840,6 +1019,34 @@ class _MessageBubbleState extends State<MessageBubble>
     );
   }
 
+  // ============================================================
+// CHATTªX MESSAGE COLOR SYSTEM
+// ============================================================
+//
+// IMPORTANT:
+// We are NOT adding new colors.
+// These only reuse colors that already exist in this file.
+//
+// MY MESSAGES     -> existing purple system
+// OTHER MESSAGES  -> existing blue/cyan system
+// ============================================================
+
+Color _messageAccentColor() {
+  if (widget.isMe) {
+    return const Color(0xffB026FF);
+  }
+
+  return const Color(0xff00D9FF);
+}
+
+Color _messageSecondaryAccentColor() {
+  if (widget.isMe) {
+    return const Color(0xffA866FF);
+  }
+
+  return const Color(0xff168BFF);
+}
+
   Gradient _messageGradient() {
     if (widget.isMe) {
       return const LinearGradient(
@@ -865,12 +1072,10 @@ class _MessageBubbleState extends State<MessageBubble>
   }
 
   Color _messageBorderColor() {
-    if (widget.isMe) {
-      return const Color(0xffA866FF);
-    }
-
-    return const Color(0xff416A9D);
-  }
+  return widget.isMe
+      ? const Color(0xffA866FF)
+      : const Color(0xff416A9D);
+}
 
   List<BoxShadow> _messageShadows() {
     if (widget.isMe) {
@@ -920,58 +1125,58 @@ class _MessageBubbleState extends State<MessageBubble>
   // ============================================================
 
   Widget _buildTextBubble() {
-    return ConstrainedBox(
-      constraints: BoxConstraints(
-        maxWidth:
-            MediaQuery.of(context).size.width * .82,
-      ),
-      child: IntrinsicWidth(
-        child: Container(
-          padding: const EdgeInsets.fromLTRB(
-            11,
-            8,
-            8,
-            5,
-          ),
-          decoration: BoxDecoration(
-            gradient: _messageGradient(),
-            borderRadius: _bubbleRadius(),
-            border: Border.all(
-              color: _messageBorderColor()
-                  .withValues(
-                alpha: widget.isMe ? .78 : .62,
-              ),
-              width: 1.05,
+  return ConstrainedBox(
+    constraints: BoxConstraints(
+      maxWidth: MediaQuery.of(context).size.width * .78,
+    ),
+    child: IntrinsicWidth(
+      child: Container(
+        padding: const EdgeInsets.fromLTRB(
+          10,
+          6,
+          7,
+          4,
+        ),
+        decoration: BoxDecoration(
+          gradient: _messageGradient(),
+          borderRadius: _bubbleRadius(),
+          border: Border.all(
+            color: _messageBorderColor().withValues(
+              alpha: widget.isMe ? .78 : .62,
             ),
-            boxShadow: _messageShadows(),
+            width: 1.05,
           ),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment:
-                CrossAxisAlignment.start,
-            children: [
-              _buildReplyPreview(),
-              Text(
-                widget.message,
-                softWrap: true,
-                style: const TextStyle(
-                  color: Colors.white,
-                  fontSize: 15,
-                  height: 1.25,
-                  fontWeight: FontWeight.w500,
-                ),
+          boxShadow: _messageShadows(),
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            _buildReplyPreview(),
+
+            Text(
+              widget.message,
+              softWrap: true,
+              style: const TextStyle(
+                color: Colors.white,
+                fontSize: 14,
+                height: 1.2,
+                fontWeight: FontWeight.w400,
               ),
-              const SizedBox(height: 3),
-              Align(
-                alignment: Alignment.centerRight,
-                child: _buildTimeRow(),
-              ),
-            ],
-          ),
+            ),
+
+            const SizedBox(height: 2),
+
+            Align(
+              alignment: Alignment.centerRight,
+              child: _buildTimeRow(),
+            ),
+          ],
         ),
       ),
-    );
-  }
+    ),
+  );
+}
 
   // ============================================================
   // IMAGE / CAMERA / GALLERY
@@ -999,9 +1204,9 @@ class _MessageBubbleState extends State<MessageBubble>
         decoration: BoxDecoration(
           borderRadius: _bubbleRadius(),
           border: Border.all(
-            color: const Color(0xffA866FF)
-                .withValues(alpha: .65),
-          ),
+  color: _messageBorderColor()
+      .withValues(alpha: .65),
+),
           boxShadow: _messageShadows(),
         ),
         clipBehavior: Clip.antiAlias,
@@ -1017,15 +1222,15 @@ class _MessageBubbleState extends State<MessageBubble>
                   return child;
                 }
 
-                return const SizedBox(
-                  height: 220,
-                  child: Center(
-                    child: CircularProgressIndicator(
-                      strokeWidth: 2,
-                      color: Color(0xffB026FF),
-                    ),
-                  ),
-                );
+                return SizedBox(
+  height: 220,
+  child: Center(
+    child: CircularProgressIndicator(
+      strokeWidth: 2,
+      color: _messageAccentColor(),
+    ),
+  ),
+);
               },
               errorBuilder:
                   (context, error, stackTrace) {
@@ -1060,166 +1265,588 @@ class _MessageBubbleState extends State<MessageBubble>
   }
 
   void _openFullImage(String url) {
-    showDialog(
-      context: context,
-      barrierColor: Colors.black
-          .withValues(alpha: .94),
-      builder: (_) {
-        return Dialog(
-          backgroundColor: Colors.transparent,
-          insetPadding:
-              const EdgeInsets.all(10),
-          child: Stack(
-            children: [
-              Center(
-                child: InteractiveViewer(
-                  minScale: .5,
-                  maxScale: 4,
-                  child: Image.network(
-                    url,
-                    fit: BoxFit.contain,
-                  ),
+  showDialog(
+    context: context,
+    barrierColor: Colors.black.withValues(alpha: .94),
+    builder: (dialogContext) {
+      return Dialog(
+        backgroundColor: Colors.transparent,
+        insetPadding: const EdgeInsets.all(10),
+        child: Stack(
+          children: [
+            // ============================================================
+            // IMAGE
+            // ============================================================
+
+            Center(
+              child: InteractiveViewer(
+                minScale: .5,
+                maxScale: 4,
+                child: Image.network(
+                  url,
+                  fit: BoxFit.contain,
                 ),
               ),
-              Positioned(
-                top: 12,
-                right: 12,
-                child: GestureDetector(
-                  onTap: () =>
-                      Navigator.of(context).pop(),
-                  child: Container(
-                    width: 40,
-                    height: 40,
-                    decoration: BoxDecoration(
-                      color: const Color(
-                        0xff111827,
-                      ).withValues(alpha: .9),
-                      shape: BoxShape.circle,
-                      border: Border.all(
+            ),
+
+            // ============================================================
+            // TOP RIGHT BUTTONS
+            // ============================================================
+
+            Positioned(
+              top: 12,
+              right: 12,
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  // ------------------------------------------------------
+                  // SAVE BUTTON
+                  // ------------------------------------------------------
+
+                  GestureDetector(
+                    onTap: () async {
+                      await _saveDocumentImage(
+                        url,
+                        dialogContext,
+                      );
+                    },
+                    child: Container(
+                      height: 40,
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 13,
+                      ),
+                      decoration: BoxDecoration(
                         color: const Color(
-                          0xffA866FF,
-                        ).withValues(alpha: .6),
+                          0xff111827,
+                        ).withValues(alpha: .92),
+                        borderRadius: BorderRadius.circular(20),
+                        border: Border.all(
+                          color: const Color(
+                            0xff00D9FF,
+                          ).withValues(alpha: .65),
+                        ),
+                        boxShadow: [
+                          BoxShadow(
+                            color: const Color(
+                              0xff00D9FF,
+                            ).withValues(alpha: .12),
+                            blurRadius: 12,
+                          ),
+                        ],
+                      ),
+                      child: const Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(
+                            Icons.download_rounded,
+                            color: Color(0xff00D9FF),
+                            size: 18,
+                          ),
+                          SizedBox(width: 6),
+                          Text(
+                            'Save',
+                            style: TextStyle(
+                              color: Colors.white,
+                              fontSize: 12,
+                              fontWeight: FontWeight.w700,
+                            ),
+                          ),
+                        ],
                       ),
                     ),
-                    child: const Icon(
-                      Icons.close_rounded,
-                      color: Colors.white,
+                  ),
+
+                  const SizedBox(width: 8),
+
+                  // ------------------------------------------------------
+                  // CLOSE BUTTON
+                  // ------------------------------------------------------
+
+                  GestureDetector(
+                    onTap: () {
+                      Navigator.of(dialogContext).pop();
+                    },
+                    child: Container(
+                      width: 40,
+                      height: 40,
+                      decoration: BoxDecoration(
+                        color: const Color(
+                          0xff111827,
+                        ).withValues(alpha: .92),
+                        shape: BoxShape.circle,
+                        border: Border.all(
+                          color: const Color(
+                            0xffA866FF,
+                          ).withValues(alpha: .6),
+                        ),
+                      ),
+                      child: const Icon(
+                        Icons.close_rounded,
+                        color: Colors.white,
+                      ),
                     ),
                   ),
-                ),
+                ],
               ),
-            ],
+            ),
+          ],
+        ),
+      );
+    },
+  );
+}
+
+Future<void> _saveDocumentImage(
+  String url,
+  BuildContext dialogContext,
+) async {
+  try {
+    final String cleanUrl = url.trim();
+
+    if (cleanUrl.isEmpty) {
+      if (!mounted) return;
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('This image has no download link.'),
+          duration: Duration(seconds: 2),
+        ),
+      );
+
+      return;
+    }
+
+    debugPrint('ChattªX SAVE IMAGE: $cleanUrl');
+
+    // ------------------------------------------------------------------------
+    // CHECK GALLERY PERMISSION
+    // ------------------------------------------------------------------------
+
+    bool hasAccess = await Gal.hasAccess();
+
+    if (!hasAccess) {
+      hasAccess = await Gal.requestAccess();
+    }
+
+    if (!hasAccess) {
+      if (!mounted) return;
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'Gallery permission is required to save this image.',
           ),
-        );
-      },
+          duration: Duration(seconds: 3),
+        ),
+      );
+
+      return;
+    }
+
+    if (!mounted) return;
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text('Saving image...'),
+        duration: Duration(seconds: 2),
+      ),
     );
+
+    // ------------------------------------------------------------------------
+    // DOWNLOAD IMAGE
+    // ------------------------------------------------------------------------
+
+    final Uri? uri = Uri.tryParse(cleanUrl);
+
+    if (uri == null ||
+        (uri.scheme != 'http' && uri.scheme != 'https') ||
+        uri.host.isEmpty) {
+      throw Exception('Invalid image URL');
+    }
+
+    final http.Response response = await http.get(uri);
+
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw Exception(
+        'Image download failed: HTTP ${response.statusCode}',
+      );
+    }
+
+    final Uint8List imageBytes = response.bodyBytes;
+
+    if (imageBytes.isEmpty) {
+      throw Exception('Downloaded image is empty');
+    }
+
+    // ------------------------------------------------------------------------
+    // SAVE DIRECTLY TO DEVICE GALLERY
+    // ------------------------------------------------------------------------
+
+    await Gal.putImageBytes(
+      imageBytes,
+      album: 'ChattªX',
+      name: 'ChattªX_${DateTime.now().millisecondsSinceEpoch}',
+    );
+
+    debugPrint('ChattªX IMAGE SAVED SUCCESSFULLY');
+
+    if (!mounted) return;
+
+    // Close the image viewer after successful save.
+    if (Navigator.of(dialogContext).canPop()) {
+      Navigator.of(dialogContext).pop();
+    }
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text('Image saved to your gallery ✓'),
+        duration: Duration(seconds: 3),
+      ),
+    );
+  } catch (e) {
+    debugPrint(
+      'ChattªX SAVE IMAGE ERROR: $e',
+    );
+
+    if (!mounted) return;
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(
+          'Could not save image: $e',
+        ),
+        duration: const Duration(seconds: 3),
+      ),
+    );
+  }
+}
+
+// ============================================================================
+// DOCUMENT BUBBLE — CHATTªX
+// COMPACT + REAL DOCUMENT OPENING
+// ============================================================================
+
+Widget _buildDocumentBubble() {
+  final String url = widget.documentUrl.trim();
+
+  final String fileName =
+    widget.fileName.trim().isNotEmpty
+        ? widget.fileName.trim()
+        : 'Document';
+
+  // --------------------------------------------------------------------------
+  // FILE EXTENSION
+  // --------------------------------------------------------------------------
+
+  String extension = '';
+
+  final int dotIndex = fileName.lastIndexOf('.');
+
+  if (dotIndex != -1 && dotIndex < fileName.length - 1) {
+    extension = fileName.substring(dotIndex + 1).toUpperCase();
+  }
+
+  // --------------------------------------------------------------------------
+  // DOCUMENT ICON
+  // --------------------------------------------------------------------------
+
+  IconData documentIcon = Icons.insert_drive_file_rounded;
+
+  if (extension == 'PDF') {
+    documentIcon = Icons.picture_as_pdf_rounded;
+  } else if (['DOC', 'DOCX'].contains(extension)) {
+    documentIcon = Icons.description_rounded;
+  } else if (['XLS', 'XLSX', 'CSV'].contains(extension)) {
+    documentIcon = Icons.table_chart_rounded;
+  } else if (['PPT', 'PPTX'].contains(extension)) {
+    documentIcon = Icons.slideshow_rounded;
+  } else if (['ZIP', 'RAR', '7Z'].contains(extension)) {
+    documentIcon = Icons.folder_zip_rounded;
+  } else if (extension == 'TXT') {
+    documentIcon = Icons.article_rounded;
+  }
+
+  // --------------------------------------------------------------------------
+  // OPEN DOCUMENT
+  // --------------------------------------------------------------------------
+
+  Future<void> openDocument() async {
+  final String cleanUrl = url.trim();
+
+  debugPrint('ChattªX DOCUMENT TAP');
+  debugPrint('ChattªX DOCUMENT URL: $cleanUrl');
+
+  if (cleanUrl.isEmpty) {
+    if (!mounted) return;
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text('This document has no download link.'),
+        duration: Duration(seconds: 2),
+      ),
+    );
+
+    return;
+  }
+
+  final Uri? uri = Uri.tryParse(cleanUrl);
+
+  if (uri == null ||
+      (uri.scheme != 'http' && uri.scheme != 'https') ||
+      uri.host.isEmpty) {
+    if (!mounted) return;
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text('Invalid document link.'),
+        duration: Duration(seconds: 2),
+      ),
+    );
+
+    return;
   }
 
   // ============================================================
-  // DOCUMENT
+  // IMAGE SENT AS A DOCUMENT
   // ============================================================
 
-  Widget _buildDocumentBubble() {
-    final String name = _attachmentName();
-    final String mime = _attachmentMime();
+  final String lowerName = fileName.toLowerCase();
+  final String lowerMime = _attachmentMime().toLowerCase();
 
-    IconData icon = Icons.description_rounded;
+  final bool isImageDocument =
+      lowerMime.startsWith('image/') ||
+      lowerName.endsWith('.jpg') ||
+      lowerName.endsWith('.jpeg') ||
+      lowerName.endsWith('.png') ||
+      lowerName.endsWith('.webp') ||
+      lowerName.endsWith('.gif') ||
+      lowerName.endsWith('.bmp') ||
+      lowerName.endsWith('.heic') ||
+      lowerName.endsWith('.heif');
 
-    if (mime.contains('pdf') ||
-        name.toLowerCase().endsWith('.pdf')) {
-      icon = Icons.picture_as_pdf_rounded;
-    } else if (name.toLowerCase().endsWith('.doc') ||
-        name.toLowerCase().endsWith('.docx')) {
-      icon = Icons.article_rounded;
-    } else if (name.toLowerCase().endsWith('.xls') ||
-        name.toLowerCase().endsWith('.xlsx')) {
-      icon = Icons.table_chart_rounded;
-    } else if (name.toLowerCase().endsWith('.zip') ||
-        name.toLowerCase().endsWith('.rar')) {
-      icon = Icons.folder_zip_rounded;
-    }
+  if (isImageDocument) {
+    _openFullImage(cleanUrl);
+    return;
+  }
 
-    return Container(
-      constraints:
-          const BoxConstraints(maxWidth: 300),
-      padding: const EdgeInsets.all(11),
-      decoration: BoxDecoration(
-        gradient: _messageGradient(),
-        borderRadius: _bubbleRadius(),
-        border: Border.all(
-          color: _messageBorderColor()
-              .withValues(alpha: .72),
+  // ============================================================
+  // REAL DOCUMENT
+  // ============================================================
+
+  try {
+    final bool launched = await launchUrl(
+      uri,
+      mode: LaunchMode.externalApplication,
+    );
+
+    if (!launched) {
+      debugPrint(
+        'ChattªX DOCUMENT ERROR: launchUrl returned false',
+      );
+
+      if (!mounted) return;
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Could not open this document.'),
+          duration: Duration(seconds: 2),
         ),
-        boxShadow: _messageShadows(),
+      );
+    }
+  } catch (e) {
+    debugPrint(
+      'ChattªX DOCUMENT OPEN ERROR: $e',
+    );
+
+    if (!mounted) return;
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text('Unable to open this document.'),
+        duration: Duration(seconds: 2),
+      ),
+    );
+  }
+}
+
+  // --------------------------------------------------------------------------
+  // COMPACT DOCUMENT BUBBLE
+  // --------------------------------------------------------------------------
+
+  return GestureDetector(
+    behavior: HitTestBehavior.opaque,
+    onTap: openDocument,
+    child: Container(
+      width: 250,
+      padding: const EdgeInsets.all(9),
+      decoration: BoxDecoration(
+        color: const Color(0xff050816),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(
+  color: _messageBorderColor()
+      .withValues(alpha: 0.65),
+  width: 1.1,
+),
+        boxShadow: [
+          BoxShadow(
+  color: _messageAccentColor()
+      .withValues(alpha: 0.12),
+  blurRadius: 10,
+  spreadRadius: 1,
+),
+        ],
       ),
       child: Row(
-        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.center,
         children: [
+          // ==================================================================
+          // SMALL DOCUMENT ICON
+          // ==================================================================
+
           Container(
-            width: 46,
-            height: 46,
+            width: 48,
+            height: 54,
             decoration: BoxDecoration(
-              color: const Color(0xff9B5CFF)
-                  .withValues(alpha: .15),
-              borderRadius:
-                  BorderRadius.circular(13),
+              color: const Color(0xff10152A),
+              borderRadius: BorderRadius.circular(8),
               border: Border.all(
-                color: const Color(0xffB77CFF)
-                    .withValues(alpha: .45),
-              ),
+  color: _messageAccentColor()
+      .withValues(alpha: 0.30),
+),
             ),
-            child: Icon(
-              icon,
-              color: const Color(0xffD6B5FF),
-              size: 25,
+            child: Stack(
+              alignment: Alignment.center,
+              children: [
+                CustomPaint(
+                  size: const Size(34, 42),
+                  painter: _DocumentPaperPainter(),
+                ),
+
+                Icon(
+  documentIcon,
+  color: _messageAccentColor(),
+  size: 21,
+),
+
+                if (extension.isNotEmpty)
+                  Positioned(
+                    bottom: 3,
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 4,
+                        vertical: 1.5,
+                      ),
+                      decoration: BoxDecoration(
+  color: _messageAccentColor(),
+  borderRadius: BorderRadius.circular(3),
+),
+                      child: Text(
+                        extension.length > 5
+                            ? extension.substring(0, 5)
+                            : extension,
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontSize: 6.5,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                    ),
+                  ),
+              ],
             ),
           ),
-          const SizedBox(width: 10),
+
+          const SizedBox(width: 9),
+
+          // ==================================================================
+          // FILE INFORMATION
+          // ==================================================================
+
           Expanded(
             child: Column(
-              crossAxisAlignment:
-                  CrossAxisAlignment.start,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
               children: [
                 Text(
-                  name,
+                  fileName,
                   maxLines: 2,
-                  overflow:
-                      TextOverflow.ellipsis,
+                  overflow: TextOverflow.ellipsis,
                   style: const TextStyle(
                     color: Colors.white,
-                    fontSize: 13,
-                    fontWeight:
-                        FontWeight.w700,
+                    fontSize: 12.5,
+                    fontWeight: FontWeight.w600,
                   ),
                 ),
-                const SizedBox(height: 4),
-                Text(
-                  mime.isNotEmpty
-                      ? mime
-                      : 'Document',
-                  maxLines: 1,
-                  overflow:
-                      TextOverflow.ellipsis,
-                  style: const TextStyle(
-                    color: Colors.white54,
-                    fontSize: 10,
-                  ),
+
+                const SizedBox(height: 5),
+
+                Row(
+                  children: [
+                    if (extension.isNotEmpty)
+                      Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 5,
+                          vertical: 2,
+                        ),
+                        decoration: BoxDecoration(
+                          color: _messageAccentColor(),
+                          borderRadius: BorderRadius.circular(4),
+                        ),
+                        child: Text(
+                          extension,
+                          style: const TextStyle(
+                            color: Color(0xff00D9FF),
+                            fontSize: 8,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                      ),
+
+                    if (extension.isNotEmpty)
+                      const SizedBox(width: 5),
+
+                    const Text(
+                      'DOCUMENT',
+                      style: TextStyle(
+                        color: Colors.white54,
+                        fontSize: 8,
+                        letterSpacing: .8,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ],
                 ),
               ],
             ),
           ),
-          const SizedBox(width: 8),
-          const Icon(
-            Icons.download_rounded,
-            color: Color(0xffC98CFF),
-            size: 21,
+
+          const SizedBox(width: 5),
+
+          // ==================================================================
+          // OPEN BUTTON
+          // ==================================================================
+
+          Container(
+            width: 30,
+            height: 30,
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              border: Border.all(
+  color: _messageAccentColor()
+      .withValues(alpha: 0.65),
+),
+            ),
+            child: Icon(
+  Icons.open_in_new_rounded,
+  color: _messageAccentColor(),
+  size: 15,
+),
           ),
-          const SizedBox(width: 6),
-          _buildTimeRow(),
         ],
       ),
-    );
-  }
+    ),
+  );
+}
 
   // ============================================================
   // MUSIC
@@ -1228,25 +1855,19 @@ class _MessageBubbleState extends State<MessageBubble>
   Widget _buildMusicBubble() {
     final String name = _attachmentName();
 
+    final waveform = _effectiveVoiceWaveform();
+
     return Container(
       constraints:
           const BoxConstraints(maxWidth: 310),
       padding: const EdgeInsets.all(10),
       decoration: BoxDecoration(
-        gradient: const LinearGradient(
-          begin: Alignment.topLeft,
-          end: Alignment.bottomRight,
-          colors: [
-            Color(0xff27164D),
-            Color(0xff111A35),
-            Color(0xff0A1328),
-          ],
-        ),
+        gradient: _messageGradient(),
         borderRadius: _bubbleRadius(),
         border: Border.all(
-          color: const Color(0xffA866FF)
-              .withValues(alpha: .72),
-        ),
+  color: _messageBorderColor()
+      .withValues(alpha: .72),
+),
         boxShadow: _messageShadows(),
       ),
       child: Row(
@@ -1266,21 +1887,12 @@ class _MessageBubbleState extends State<MessageBubble>
                   height: 45,
                   decoration: BoxDecoration(
                     shape: BoxShape.circle,
-                    gradient:
-                        const LinearGradient(
-                      colors: [
-                        Color(0xff9B35FF),
-                        Color(0xff5A20E8),
-                      ],
-                    ),
+                    gradient: _messageGradient(),
                     boxShadow: [
                       BoxShadow(
-                        color: const Color(
-                          0xffA020FF,
-                        ).withValues(
-                          alpha:
-                              .20 + glow * .20,
-                        ),
+                        color: _messageAccentColor().withValues(
+  alpha: .20 + glow * .20,
+),
                         blurRadius:
                             12 + glow * 10,
                       ),
@@ -1324,8 +1936,7 @@ class _MessageBubbleState extends State<MessageBubble>
                         child: CustomPaint(
                           painter:
                               _RealWaveformPainter(
-                            waveform:
-                                widget.voiceWaveform,
+                            waveform: waveform,
                             progress:
                                 _progress(),
                           ),
@@ -1434,20 +2045,12 @@ class _MessageBubbleState extends State<MessageBubble>
       width: 300,
       padding: const EdgeInsets.all(13),
       decoration: BoxDecoration(
-        gradient: const LinearGradient(
-          begin: Alignment.topLeft,
-          end: Alignment.bottomRight,
-          colors: [
-            Color(0xff251346),
-            Color(0xff111A35),
-            Color(0xff091226),
-          ],
-        ),
+        gradient: _messageGradient(),
         borderRadius: _bubbleRadius(),
         border: Border.all(
-          color: const Color(0xffA866FF)
-              .withValues(alpha: .75),
-        ),
+  color: _messageBorderColor()
+      .withValues(alpha: .75),
+),
         boxShadow: _messageShadows(),
       ),
       child: Column(
@@ -1457,22 +2060,16 @@ class _MessageBubbleState extends State<MessageBubble>
           Row(
             children: [
               Container(
-                width: 38,
-                height: 38,
+                width: 58,
+                height: 58,
                 decoration: BoxDecoration(
                   shape: BoxShape.circle,
-                  gradient:
-                      const LinearGradient(
-                    colors: [
-                      Color(0xffB026FF),
-                      Color(0xff6E20FF),
-                    ],
-                  ),
+                  gradient: _messageGradient(),
                   boxShadow: [
                     BoxShadow(
-                      color: const Color(
-                        0xffB026FF,
-                      ).withValues(alpha: .30),
+                      color: _messageAccentColor().withValues(
+  alpha: .30,
+),
                       blurRadius: 14,
                     ),
                   ],
@@ -1568,9 +2165,9 @@ class _MessageBubbleState extends State<MessageBubble>
         borderRadius:
             BorderRadius.circular(11),
         border: Border.all(
-          color: const Color(0xff51618A)
-              .withValues(alpha: .48),
-        ),
+  color: _messageBorderColor()
+      .withValues(alpha: .48),
+),
       ),
       clipBehavior: Clip.antiAlias,
       child: Stack(
@@ -1579,16 +2176,9 @@ class _MessageBubbleState extends State<MessageBubble>
             widthFactor:
                 percentage.clamp(0.0, 1.0),
             child: Container(
-              decoration:
-                  const BoxDecoration(
-                gradient:
-                    LinearGradient(
-                  colors: [
-                    Color(0xff6E20FF),
-                    Color(0xffB026FF),
-                  ],
-                ),
-              ),
+              decoration: BoxDecoration(
+  gradient: _messageGradient(),
+),
             ),
           ),
           Padding(
@@ -1672,196 +2262,404 @@ class _MessageBubbleState extends State<MessageBubble>
     );
   }
 
+  Widget _buildVideoBubble() {
+  final url =
+      widget.videoUrl.trim().isNotEmpty
+          ? widget.videoUrl.trim()
+          : _attachmentUrl();
+
+  if (url.isEmpty) {
+    return _buildAttachmentError(
+      Icons.videocam_off_rounded,
+      'Video unavailable',
+    );
+  }
+
+  final uri = Uri.tryParse(url);
+
+  if (uri == null ||
+      (uri.scheme != 'https' &&
+          uri.scheme != 'http') ||
+      uri.host.isEmpty) {
+    return _buildAttachmentError(
+      Icons.videocam_off_rounded,
+      'Invalid video URL',
+    );
+  }
+
+  return _ChattaxVideoBubble(
+  url: url,
+  time: widget.time,
+  isMe: widget.isMe,
+);
+}
+// ============================================================
+// VOICE CALL
+// ============================================================
+
+Widget _buildVoiceCallBubble() {
+  final bool outgoing = widget.isMe;
+
+  final Color accent = _messageAccentColor();
+
+  final Color glow = _messageAccentColor().withValues(
+    alpha: outgoing ? .08 : .07,
+  );
+
+  final String status = widget.callStatus.toLowerCase();
+
+  final bool unanswered =
+      status == 'unanswered' ||
+      status == 'missed';
+
+  final String subtitle;
+
+  if (unanswered) {
+    subtitle = 'No answer';
+  } else if (status == 'ended') {
+    final durationText = _formatDuration(
+      Duration(
+        seconds: widget.callDuration,
+      ),
+    );
+
+    subtitle = widget.callDuration > 0
+        ? 'Call ended · $durationText'
+        : 'Call ended';
+  } else {
+    subtitle = outgoing
+        ? 'Outgoing'
+        : 'Incoming';
+  }
+
+  return Container(
+    constraints: const BoxConstraints(
+      maxWidth: 175,
+    ),
+    padding: const EdgeInsets.symmetric(
+      horizontal: 7,
+      vertical: 7,
+    ),
+    decoration: BoxDecoration(
+      gradient: _messageGradient(),
+      borderRadius: _bubbleRadius(),
+      border: Border.all(
+        color: accent.withValues(alpha: .48),
+        width: 1,
+      ),
+      boxShadow: [
+        BoxShadow(
+          color: glow,
+          blurRadius: 13,
+          spreadRadius: 0,
+        ),
+      ],
+    ),
+    child: Row(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.center,
+      children: [
+        // ======================================================
+        // CALL ICON
+        // ======================================================
+
+        Container(
+          width: 32,
+          height: 32,
+          decoration: BoxDecoration(
+            color: _messageAccentColor().withValues(
+              alpha: .10,
+            ),
+            shape: BoxShape.circle,
+            border: Border.all(
+              color: accent.withValues(alpha: .32),
+              width: 1,
+            ),
+          ),
+          child: Icon(
+            unanswered
+                ? Icons.phone_missed_rounded
+                : Icons.phone_rounded,
+            color: accent,
+            size: 16,
+          ),
+        ),
+
+        const SizedBox(width: 7),
+
+        // ======================================================
+        // CALL INFORMATION
+        // ======================================================
+
+        Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              'Voice call',
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(
+                color: Colors.white,
+                fontSize: 12.5,
+                height: 1.0,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+
+            const SizedBox(height: 4),
+
+            // ==================================================
+            // SUBTITLE + TIME
+            // ==================================================
+
+            Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(
+                  subtitle,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    color: unanswered
+                        ? accent.withValues(alpha: .90)
+                        : Colors.white60,
+                    fontSize: 10,
+                    height: 1.0,
+                    fontWeight: FontWeight.w500,
+                  ),
+                ),
+
+                const SizedBox(width: 6),
+
+                Text(
+                  widget.time,
+                  maxLines: 1,
+                  style: const TextStyle(
+                    color: Colors.white38,
+                    fontSize: 9,
+                    height: 1.0,
+                    fontWeight: FontWeight.w400,
+                  ),
+                ),
+              ],
+            ),
+          ],
+        ),
+      ],
+    ),
+  );
+}
+
   // ============================================================
   // VOICE
   // ============================================================
 
-  Widget _buildWaveform() {
-    return SizedBox(
-      width: 105,
-      height: 32,
+  Widget _buildVoiceBubble() {
+  final screenWidth = MediaQuery.sizeOf(context).width;
+
+  // Compact voice-note width.
+  // This keeps the bubble comfortably sized without taking up
+  // almost the entire screen.
+  final double bubbleWidth = screenWidth < 500
+      ? (screenWidth * 0.72).clamp(245.0, 340.0).toDouble()
+      : (screenWidth * 0.50).clamp(340.0, 700.0).toDouble();
+
+  return Align(
+    alignment: widget.isMe
+        ? Alignment.centerRight
+        : Alignment.centerLeft,
+    child: Container(
+      width: bubbleWidth,
+      padding: const EdgeInsets.fromLTRB(
+        10,
+        8,
+        10,
+        7,
+      ),
+      decoration: BoxDecoration(
+        color: const Color(0xff081225),
+        borderRadius: BorderRadius.circular(19),
+        border: Border.all(
+  width: 1.15,
+  color: _messageAccentColor().withValues(alpha: .92),
+),
+        boxShadow: [
+  BoxShadow(
+    color: _messageAccentColor().withValues(alpha: .10),
+    blurRadius: 14,
+    spreadRadius: 1,
+  ),
+  BoxShadow(
+    color: _messageSecondaryAccentColor().withValues(alpha: .12),
+    blurRadius: 22,
+    spreadRadius: -2,
+  ),
+],
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.center,
+        children: [
+          // ==========================================================
+// PLAY BUTTON
+// ==========================================================
+
+GestureDetector(
+  behavior: HitTestBehavior.opaque,
+  onTap: _toggleVoice,
+  child: AnimatedBuilder(
+    animation: _glowController,
+    builder: (context, child) {
+      final glow = _isPlaying
+          ? _glowController.value
+          : 0.0;
+
+      return Container(
+        width: 38,
+        height: 38,
+        decoration: BoxDecoration(
+          shape: BoxShape.circle,
+          color: _messageAccentColor().withValues(alpha: .10),
+          border: Border.all(
+            color: _messageAccentColor().withValues(alpha: .95),
+            width: 1.4,
+          ),
+          boxShadow: [
+            BoxShadow(
+              color: const Color(0xff168CFF).withValues(
+                alpha: .12 + glow * .14,
+              ),
+              blurRadius: 10 + glow * 5,
+            ),
+          ],
+        ),
+        child: Stack(
+          alignment: Alignment.center,
+          children: [
+            if (_isPlaying)
+              SizedBox(
+                width: 43,
+                height: 43,
+                child: CircularProgressIndicator(
+                  value: _progress(),
+                  strokeWidth: 1.6,
+                  backgroundColor: Colors.transparent,
+                  valueColor:
+                      const AlwaysStoppedAnimation<Color>(
+                    Color(0xffB026FF),
+                  ),
+                ),
+              ),
+
+            Icon(
+              _isPlaying
+                  ? Icons.pause_rounded
+                  : Icons.play_arrow_rounded,
+              color: Colors.white,
+              size: 21,
+            ),
+          ],
+        ),
+      );
+    },
+  ),
+),
+
+const SizedBox(width: 3),
+
+// ==========================================================
+// REAL VOICE WAVEFORM
+// ==========================================================
+
+Expanded(
+  child: SizedBox(
+    height: 42,
+    child: Padding(
+      padding: const EdgeInsets.only(
+        right: 1,
+      ),
       child: CustomPaint(
         painter: _RealWaveformPainter(
-          waveform: widget.voiceWaveform,
+          waveform: _effectiveVoiceWaveform(),
           progress: _progress(),
         ),
       ),
-    );
-  }
+    ),
+  ),
+),
 
-  Widget _buildVoiceBubble() {
-    return Container(
-      constraints:
-          const BoxConstraints(maxWidth: 280),
-      padding: const EdgeInsets.fromLTRB(
-        8,
-        7,
-        8,
-        6,
-      ),
-      decoration: BoxDecoration(
-        gradient: _messageGradient(),
-        borderRadius: _bubbleRadius(),
-        border: Border.all(
-          color: _messageBorderColor()
-              .withValues(
-            alpha: widget.isMe ? .78 : .68,
-          ),
-          width: 1.05,
-        ),
-        boxShadow: _messageShadows(),
-      ),
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          GestureDetector(
-            behavior: HitTestBehavior.opaque,
-            onTap: _toggleVoice,
-            child: AnimatedBuilder(
-              animation: _glowController,
-              builder: (context, child) {
-                final glow = _isPlaying
-                    ? _glowController.value
-                    : 0.0;
+const SizedBox(width: 3),
 
-                return Container(
-                  width: 38,
-                  height: 38,
-                  decoration:
-                      BoxDecoration(
-                    shape: BoxShape.circle,
-                    gradient:
-                        const LinearGradient(
-                      colors: [
-                        Color(0xff152C50),
-                        Color(0xff0A142A),
-                      ],
-                    ),
-                    border: Border.all(
-                      color: const Color(
-                        0xff4C7CFF,
-                      ).withValues(alpha: .58),
-                    ),
-                    boxShadow: [
-                      BoxShadow(
-                        color: const Color(
-                          0xff287DFF,
-                        ).withValues(alpha: .13),
-                        blurRadius: 10,
+          // ==========================================================
+          // DURATION + MESSAGE TIME
+          // ==========================================================
+
+          SizedBox(
+            width: 38,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.end,
+              children: [
+                Text(
+                  _voiceTime(),
+                  maxLines: 1,
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 14,
+                    height: 1.0,
+                    fontWeight: FontWeight.w400,
+                  ),
+                ),
+
+                const SizedBox(height: 6),
+
+                Text(
+                  widget.time,
+                  maxLines: 1,
+                  style: const TextStyle(
+                    color: Colors.white54,
+                    fontSize: 11,
+                    height: 1.0,
+                    fontWeight: FontWeight.w400,
+                  ),
+                ),
+
+                if (_hasPlayed) ...[
+                  const SizedBox(height: 5),
+
+                  GestureDetector(
+                    onTap: _changeSpeed,
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 5,
+                        vertical: 2.5,
                       ),
-                      if (_isPlaying)
-                        BoxShadow(
-                          color: const Color(
-                            0xffB026FF,
-                          ).withValues(
-                            alpha:
-                                .15 +
-                                glow * .20,
-                          ),
-                          blurRadius:
-                              10 + glow * 8,
+                      decoration: BoxDecoration(
+                        color: Colors.white.withValues(alpha: .08),
+                        borderRadius: BorderRadius.circular(5),
+                        border: Border.all(
+                          color: Colors.white.withValues(alpha: .10),
                         ),
-                    ],
-                  ),
-                  child: Stack(
-                    alignment:
-                        Alignment.center,
-                    children: [
-                      if (_isPlaying)
-                        SizedBox(
-                          width: 36,
-                          height: 36,
-                          child:
-                              CircularProgressIndicator(
-                            value:
-                                _progress(),
-                            strokeWidth: 1.8,
-                            valueColor:
-                                const AlwaysStoppedAnimation<
-                                    Color>(
-                              Color(
-                                0xffC99BFF,
-                              ),
-                            ),
-                          ),
-                        ),
-                      Icon(
-                        _isPlaying
-                            ? Icons.pause_rounded
-                            : Icons
-                                .play_arrow_rounded,
-                        color: Colors.white,
-                        size: 23,
                       ),
-                    ],
-                  ),
-                );
-              },
-            ),
-          ),
-          const SizedBox(width: 4),
-          _buildWaveform(),
-          const SizedBox(width: 5),
-          Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment:
-                CrossAxisAlignment.end,
-            children: [
-              Row(
-                mainAxisSize:
-                    MainAxisSize.min,
-                children: [
-                  Text(
-                    _voiceTime(),
-                    style:
-                        const TextStyle(
-                      color: Colors.white70,
-                      fontSize: 11,
-                    ),
-                  ),
-                  if (_hasPlayed) ...[
-                    const SizedBox(width: 5),
-                    GestureDetector(
-                      onTap: _changeSpeed,
-                      child: Container(
-                        padding:
-                            const EdgeInsets
-                                .symmetric(
-                          horizontal: 5,
-                          vertical: 2,
-                        ),
-                        decoration:
-                            BoxDecoration(
-                          color: Colors.white
-                              .withValues(
-                            alpha: .10,
-                          ),
-                          borderRadius:
-                              BorderRadius
-                                  .circular(5),
-                        ),
-                        child: Text(
-                          '${_speed.toStringAsFixed(1)}×',
-                          style:
-                              const TextStyle(
-                            color:
-                                Colors.white70,
-                            fontSize: 9,
-                          ),
+                      child: Text(
+                        '${_speed.toStringAsFixed(1)}×',
+                        style: const TextStyle(
+                          color: Colors.white60,
+                          fontSize: 8,
+                          fontWeight: FontWeight.w600,
                         ),
                       ),
                     ),
-                  ],
+                  ),
                 ],
-              ),
-              const SizedBox(height: 2),
-              _buildTimeRow(),
-            ],
+              ],
+            ),
           ),
         ],
       ),
-    );
-  }
+    ),
+  );
+}
 
   // ============================================================
   // LOCATION
@@ -1924,75 +2722,112 @@ class _MessageBubbleState extends State<MessageBubble>
   }
 
   Widget _buildLocationBubble() {
-    final bool isLive =
-        widget.type == 'live_location';
+  final bool isLive =
+      widget.type == 'live_location';
 
-    final bool hasLocation =
-        widget.latitude != null &&
-        widget.longitude != null;
+  final bool hasLocation =
+      widget.latitude != null &&
+      widget.longitude != null;
 
-    final LatLng? position = hasLocation
-        ? LatLng(
-            widget.latitude!,
-            widget.longitude!,
-          )
-        : null;
+  final LatLng? position = hasLocation
+      ? LatLng(
+          widget.latitude!,
+          widget.longitude!,
+        )
+      : null;
 
-    if (isLive && position != null) {
-      _updateLiveMapPosition();
-    }
+  if (isLive && position != null) {
+    _updateLiveMapPosition();
+  }
 
-    return Container(
-      constraints:
-          const BoxConstraints(maxWidth: 300),
-      decoration: BoxDecoration(
-        color: const Color(0xff080D1C),
-        borderRadius:
-            BorderRadius.circular(18),
-        border: Border.all(
-          color: const Color(0xff7A2CFF)
-              .withValues(alpha: .85),
-          width: 1.1,
-        ),
-        boxShadow: [
-          BoxShadow(
-            color: const Color(0xff6E20FF)
-                .withValues(alpha: .22),
-            blurRadius: 20,
-          ),
-          BoxShadow(
-            color: const Color(0xff8D42FF)
-                .withValues(alpha: .10),
-            blurRadius: 35,
-          ),
-        ],
-      ),
-      clipBehavior: Clip.antiAlias,
-      child: Column(
-        children: [
-          SizedBox(
-            height: 155,
-            width: double.infinity,
+  return Container(
+    constraints:
+        const BoxConstraints(maxWidth: 300),
+    decoration: BoxDecoration(
+      color: const Color(0xff080D1C),
+      borderRadius:
+          BorderRadius.circular(18),
+      border: Border.all(
+  color: _messageBorderColor().withValues(alpha: .85),
+  width: 1.1,
+),
+boxShadow: [
+  BoxShadow(
+    color: _messageAccentColor().withValues(alpha: .22),
+    blurRadius: 20,
+  ),
+  BoxShadow(
+    color: _messageSecondaryAccentColor().withValues(alpha: .10),
+    blurRadius: 35,
+  ),
+],
+    ),
+    clipBehavior: Clip.antiAlias,
+    child: Column(
+      children: [
+        // ============================================================
+        // LOCATION MAP
+        // ============================================================
+
+        SizedBox(
+          height: 155,
+          width: double.infinity,
+          child: Container(
+            // IMPORTANT:
+            // Prevents the white flash while map tiles initialize.
+            color: const Color(0xff070B18),
+
             child: hasLocation
                 ? FlutterMap(
                     mapController:
                         _mapController,
+
                     options: MapOptions(
-                      initialCenter: position!,
+                      initialCenter:
+                          position!,
                       initialZoom: 15.5,
+
                       interactionOptions:
                           const InteractionOptions(
                         flags:
                             InteractiveFlag.none,
                       ),
                     ),
+
                     children: [
+                      // ==================================================
+                      // MAP TILES
+                      // ==================================================
+
                       TileLayer(
                         urlTemplate:
                             'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
                         userAgentPackageName:
                             'com.chattax.app',
+
+                        // Keeps the map background dark while
+                        // individual tiles are loading.
+                        tileBuilder:
+                            (
+                          context,
+                          tileWidget,
+                          tile,
+                        ) {
+                          return Container(
+                            color:
+                                const Color(
+                              0xff070B18,
+                            ),
+                            child:
+                                tileWidget,
+                          );
+                        },
                       ),
+
+                      // ==================================================
+                      // LOCATION MARKER
+                      // ==================================================
+
                       MarkerLayer(
                         markers: [
                           Marker(
@@ -2025,8 +2860,10 @@ class _MessageBubbleState extends State<MessageBubble>
                                         ).withValues(
                                           alpha: .30,
                                         ),
-                                        blurRadius: 18,
-                                        spreadRadius: 3,
+                                        blurRadius:
+                                            18,
+                                        spreadRadius:
+                                            3,
                                       ),
                                     ],
                                   ),
@@ -2051,96 +2888,98 @@ class _MessageBubbleState extends State<MessageBubble>
                     child: Icon(
                       Icons
                           .location_off_rounded,
-                      color: Colors.white38,
+                      color:
+                          Colors.white38,
                       size: 35,
                     ),
                   ),
           ),
-          Container(
-            width: double.infinity,
-            padding:
-                const EdgeInsets.fromLTRB(
-              13,
-              11,
-              10,
-              9,
-            ),
-            decoration: BoxDecoration(
-              gradient:
-                  const LinearGradient(
-                colors: [
-                  Color(0xff151535),
-                  Color(0xff0B1025),
-                ],
-              ),
-              border: Border(
-                top: BorderSide(
-                  color: const Color(
-                    0xff8C35FF,
-                  ).withValues(alpha: .75),
-                ),
-              ),
-            ),
-            child: Row(
-              children: [
-                Container(
-                  width: 34,
-                  height: 34,
-                  decoration: BoxDecoration(
-                    shape: BoxShape.circle,
-                    color: const Color(
-                      0xff7A2CFF,
-                    ).withValues(alpha: .14),
-                  ),
-                  child: const Icon(
-                    Icons.location_on_rounded,
-                    color:
-                        Color(0xffD0A0FF),
-                    size: 19,
-                  ),
-                ),
-                const SizedBox(width: 9),
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment:
-                        CrossAxisAlignment.start,
-                    children: [
-                      const Text(
-                        'Current location',
-                        style: TextStyle(
-                          color: Colors.white,
-                          fontSize: 14,
-                          fontWeight:
-                              FontWeight.w800,
-                        ),
-                      ),
-                      const SizedBox(height: 2),
-                      Text(
-                        hasLocation
-                            ? '${widget.latitude!.toStringAsFixed(5)}, '
-                              '${widget.longitude!.toStringAsFixed(5)}'
-                            : 'Location unavailable',
-                        maxLines: 1,
-                        overflow:
-                            TextOverflow.ellipsis,
-                        style:
-                            const TextStyle(
-                          color:
-                              Color(0xff9293B5),
-                          fontSize: 10,
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-                _buildTimeRow(),
-              ],
-            ),
-          ),
-        ],
+        ),
+
+        // ============================================================
+        // LOCATION INFORMATION
+        // ============================================================
+
+        Container(
+  width: double.infinity,
+  padding: const EdgeInsets.fromLTRB(
+    13,
+    11,
+    10,
+    9,
+  ),
+  decoration: BoxDecoration(
+    gradient: _messageGradient(),
+    border: Border(
+      top: BorderSide(
+        color: _messageAccentColor().withValues(alpha: .75),
       ),
-    );
-  }
+    ),
+  ),
+  child: Row(
+            children: [
+              Container(
+                width: 34,
+                height: 34,
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  color: _messageAccentColor().withValues(alpha: .14),
+                ),
+                child: Icon(
+  Icons.location_on_rounded,
+  color: _messageAccentColor(),
+  size: 19,
+),
+              ),
+
+              const SizedBox(width: 9),
+
+              Expanded(
+                child: Column(
+                  crossAxisAlignment:
+                      CrossAxisAlignment
+                          .start,
+                  children: [
+                    const Text(
+                      'Current location',
+                      style: TextStyle(
+                        color: Colors.white,
+                        fontSize: 14,
+                        fontWeight:
+                            FontWeight.w800,
+                      ),
+                    ),
+
+                    const SizedBox(height: 2),
+
+                    Text(
+                      hasLocation
+                          ? '${widget.latitude!.toStringAsFixed(5)}, '
+                            '${widget.longitude!.toStringAsFixed(5)}'
+                          : 'Location unavailable',
+                      maxLines: 1,
+                      overflow:
+                          TextOverflow
+                              .ellipsis,
+                      style:
+                          const TextStyle(
+                        color:
+                            Color(0xff9293B5),
+                        fontSize: 10,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+
+              _buildTimeRow(),
+            ],
+          ),
+        ),
+      ],
+    ),
+  );
+}
 
   // ============================================================
   // FROZEN HOLD
@@ -2293,281 +3132,386 @@ class _MessageBubbleState extends State<MessageBubble>
   // FROZEN TEXT
   // ============================================================
 
-  Widget _buildFrozenTextBubble() {
-    final revealed =
-        widget.isMelted ||
-        _revealedFrozenMessage;
+Widget _buildFrozenTextBubble() {
+  final revealed =
+      widget.isMelted ||
+      _revealedFrozenMessage;
 
-    if (revealed && !_showFrozenFlame) {
-      return _buildTextBubble();
-    }
+  // ==========================================================================
+  // DEFROSTED MESSAGE
+  // ==========================================================================
+  // Keep the REAL message exactly the same size.
+  // No "DEFROSTED" label.
+  // No extra widget above the bubble.
+  //
+  // The message simply gets a subtle icy border/glow so it remains visually
+  // unique while keeping the exact normal message footprint.
+  // ==========================================================================
 
-    return GestureDetector(
-      behavior: HitTestBehavior.opaque,
-      onLongPressStart: (_) {
-        if (!widget.isMe) {
-          _startFrozenHold();
-        }
-      },
-      onLongPressEnd: (_) {
-        _cancelFrozenHold();
-      },
-      onLongPressCancel:
-          _cancelFrozenHold,
-      child: Container(
-        constraints:
-            const BoxConstraints(
-          maxWidth: 290,
-        ),
-        padding: const EdgeInsets.all(12),
-        decoration: BoxDecoration(
-          gradient:
-              const LinearGradient(
-            colors: [
-              Color(0xff30486A),
-              Color(0xff17263D),
-              Color(0xff0E1B2E),
-            ],
+  if (revealed && !_showFrozenFlame) {
+    return Container(
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(16),
+        boxShadow: [
+          BoxShadow(
+            color: const Color(0xff9CCFFF)
+                .withValues(alpha: .14),
+            blurRadius: 12,
+            spreadRadius: .5,
           ),
-          borderRadius:
-              BorderRadius.circular(18),
-          border: Border.all(
-            color: const Color(
-              0xffB9D9FF,
-            ).withValues(alpha: .82),
-          ),
-          boxShadow: [
-            BoxShadow(
-              color: const Color(
-                0xffA8D5FF,
-              ).withValues(alpha: .20),
-              blurRadius: 22,
-            ),
+        ],
+      ),
+      child: _buildTextBubble(),
+    );
+  }
+
+  // ==========================================================================
+  // FROZEN MESSAGE
+  // ==========================================================================
+
+  return GestureDetector(
+    behavior: HitTestBehavior.opaque,
+
+    onLongPressStart: (_) {
+      if (!widget.isMe) {
+        _startFrozenHold();
+      }
+    },
+
+    onLongPressEnd: (_) {
+      _cancelFrozenHold();
+    },
+
+    onLongPressCancel: _cancelFrozenHold,
+
+    child: Container(
+      width: 285,
+      constraints: const BoxConstraints(
+        minHeight: 78,
+        maxHeight: 96,
+      ),
+      padding: const EdgeInsets.symmetric(
+        horizontal: 10,
+        vertical: 9,
+      ),
+      decoration: BoxDecoration(
+        gradient: const LinearGradient(
+          colors: [
+            Color(0xff30486A),
+            Color(0xff17263D),
+            Color(0xff0E1B2E),
           ],
         ),
-        child: Column(
-          crossAxisAlignment:
-              CrossAxisAlignment.start,
-          children: [
-            const Row(
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(
+          color: const Color(0xffB9D9FF)
+              .withValues(alpha: .82),
+          width: 1.1,
+        ),
+        boxShadow: [
+          BoxShadow(
+            color: const Color(0xffA8D5FF)
+                .withValues(alpha: .16),
+            blurRadius: 14,
+            spreadRadius: .5,
+          ),
+        ],
+      ),
+
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.center,
+        children: [
+
+          // ------------------------------------------------------------------
+          // FROZEN ICON
+          // ------------------------------------------------------------------
+
+          Container(
+            width: 48,
+            height: 58,
+            decoration: BoxDecoration(
+              color: const Color(0xff101C30),
+              borderRadius: BorderRadius.circular(10),
+              border: Border.all(
+                color: const Color(0xffB9D9FF)
+                    .withValues(alpha: .35),
+              ),
+            ),
+            child: const Center(
+              child: Icon(
+                Icons.ac_unit_rounded,
+                color: Color(0xffD9EAFF),
+                size: 27,
+              ),
+            ),
+          ),
+
+          const SizedBox(width: 10),
+
+          // ------------------------------------------------------------------
+          // FROZEN DETAILS
+          // ------------------------------------------------------------------
+
+          Expanded(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment:
+                  CrossAxisAlignment.start,
               children: [
-                Icon(
-                  Icons.ac_unit_rounded,
-                  color:
-                      Color(0xffD9EAFF),
-                  size: 32,
+
+                const Text(
+                  'FROZEN MESSAGE',
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    color: Color(0xffD9EAFF),
+                    fontSize: 11,
+                    fontWeight: FontWeight.w800,
+                    letterSpacing: .25,
+                  ),
                 ),
-                SizedBox(width: 10),
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment:
-                        CrossAxisAlignment
-                            .start,
+
+                const SizedBox(height: 5),
+
+                if (!_showFrozenFlame)
+                  const Row(
                     children: [
-                      Text(
-                        'FROZEN MESSAGE',
-                        style: TextStyle(
-                          color:
-                              Color(0xffD9EAFF),
-                          fontSize: 12,
-                          fontWeight:
-                              FontWeight.w800,
-                        ),
+                      Icon(
+                        Icons.lock_rounded,
+                        color: Color(0xffC8E1FF),
+                        size: 15,
                       ),
-                      SizedBox(height: 4),
-                      Text(
-                        'This message is frozen',
-                        style: TextStyle(
-                          color:
-                              Color(0xffB9D4F5),
-                          fontSize: 11,
+                      SizedBox(width: 5),
+                      Expanded(
+                        child: Text(
+                          'Hold for 3 seconds to reveal',
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            color: Color(0xffC8DFFF),
+                            fontSize: 9.5,
+                          ),
                         ),
                       ),
                     ],
                   ),
-                ),
+
+                if (_showFrozenFlame)
+                  SizedBox(
+                    height: 42,
+                    child: _buildFrozenFlame(),
+                  ),
               ],
             ),
-            const SizedBox(height: 10),
-            if (!_showFrozenFlame)
-              const Row(
-                children: [
-                  Icon(
-                    Icons.lock_rounded,
-                    color:
-                        Color(0xffC8E1FF),
-                    size: 18,
-                  ),
-                  SizedBox(width: 7),
-                  Expanded(
-                    child: Text(
-                      'Hold for 3 seconds to reveal',
-                      style: TextStyle(
-                        color:
-                            Color(0xffC8DFFF),
-                        fontSize: 12,
-                      ),
-                    ),
-                  ),
-                ],
-              ),
-            if (_showFrozenFlame)
-              SizedBox(
-                width: double.infinity,
-                child:
-                    _buildFrozenFlame(),
-              ),
-            const SizedBox(height: 5),
-            Align(
-              alignment:
-                  Alignment.centerRight,
-              child: _buildTimeRow(),
-            ),
-          ],
-        ),
+          ),
+
+          const SizedBox(width: 7),
+
+          // ------------------------------------------------------------------
+          // TIME
+          // ------------------------------------------------------------------
+
+          Align(
+            alignment: Alignment.bottomCenter,
+            child: _buildTimeRow(),
+          ),
+        ],
       ),
-    );
-  }
+    ),
+  );
+}
+
 
   // ============================================================
   // FROZEN VOICE
-  // ============================================================
+  // ============================================================ 
+Widget _buildFrozenVoiceBubble() {
+  final revealed =
+      widget.isMelted ||
+      _revealedFrozenMessage;
 
-  Widget _buildFrozenVoiceBubble() {
-    final revealed =
-        widget.isMelted ||
-        _revealedFrozenMessage;
+  // ==========================================================================
+  // DEFROSTED VOICE
+  // ==========================================================================
+  // The REAL voice bubble keeps its exact existing size.
+  // There is NO "DEFROSTED" label.
+  //
+  // Only a very subtle icy glow is added around the existing voice bubble.
+  // ==========================================================================
 
-    if (revealed && !_showFrozenFlame) {
-      return _buildVoiceBubble();
-    }
-
-    return GestureDetector(
-      behavior: HitTestBehavior.opaque,
-      onLongPressStart: (_) {
-        if (!widget.isMe) {
-          _startFrozenHold();
-        }
-      },
-      onLongPressEnd: (_) {
-        _cancelFrozenHold();
-      },
-      onLongPressCancel:
-          _cancelFrozenHold,
-      child: Container(
-        constraints:
-            const BoxConstraints(
-          maxWidth: 290,
-        ),
-        padding: const EdgeInsets.all(13),
-        decoration: BoxDecoration(
-          gradient:
-              const LinearGradient(
-            colors: [
-              Color(0xff30486A),
-              Color(0xff17263D),
-              Color(0xff0E1B2E),
-            ],
+  if (revealed && !_showFrozenFlame) {
+    return Container(
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(19),
+        boxShadow: [
+          BoxShadow(
+            color: const Color(0xff9CCFFF)
+                .withValues(alpha: .14),
+            blurRadius: 12,
+            spreadRadius: .5,
           ),
-          borderRadius:
-              BorderRadius.circular(18),
-          border: Border.all(
-            color: const Color(
-              0xffB9D9FF,
-            ).withValues(alpha: .82),
-          ),
-          boxShadow: [
-            BoxShadow(
-              color: const Color(
-                0xffA8D5FF,
-              ).withValues(alpha: .20),
-              blurRadius: 22,
-            ),
+        ],
+      ),
+      child: _buildVoiceBubble(),
+    );
+  }
+
+  // ==========================================================================
+  // FROZEN VOICE
+  // ==========================================================================
+
+  return GestureDetector(
+    behavior: HitTestBehavior.opaque,
+
+    onLongPressStart: (_) {
+      if (!widget.isMe) {
+        _startFrozenHold();
+      }
+    },
+
+    onLongPressEnd: (_) {
+      _cancelFrozenHold();
+    },
+
+    onLongPressCancel: _cancelFrozenHold,
+
+    child: Container(
+      width: 285,
+      constraints: const BoxConstraints(
+        minHeight: 78,
+        maxHeight: 96,
+      ),
+      padding: const EdgeInsets.symmetric(
+        horizontal: 10,
+        vertical: 9,
+      ),
+      decoration: BoxDecoration(
+        gradient: const LinearGradient(
+          colors: [
+            Color(0xff30486A),
+            Color(0xff17263D),
+            Color(0xff0E1B2E),
           ],
         ),
-        child: Column(
-          crossAxisAlignment:
-              CrossAxisAlignment.start,
-          children: [
-            const Row(
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(
+          color: const Color(0xffB9D9FF)
+              .withValues(alpha: .82),
+          width: 1.1,
+        ),
+        boxShadow: [
+          BoxShadow(
+            color: const Color(0xffA8D5FF)
+                .withValues(alpha: .16),
+            blurRadius: 14,
+            spreadRadius: .5,
+          ),
+        ],
+      ),
+
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.center,
+        children: [
+
+          // ------------------------------------------------------------------
+          // VOICE FROZEN ICON
+          // ------------------------------------------------------------------
+
+          Container(
+            width: 48,
+            height: 58,
+            decoration: BoxDecoration(
+              color: const Color(0xff101C30),
+              borderRadius: BorderRadius.circular(10),
+              border: Border.all(
+                color: const Color(0xffB9D9FF)
+                    .withValues(alpha: .35),
+              ),
+            ),
+            child: const Center(
+              child: Icon(
+                Icons.mic_rounded,
+                color: Color(0xffD9EAFF),
+                size: 25,
+              ),
+            ),
+          ),
+
+          const SizedBox(width: 10),
+
+          // ------------------------------------------------------------------
+          // FROZEN VOICE DETAILS
+          // ------------------------------------------------------------------
+
+          Expanded(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment:
+                  CrossAxisAlignment.start,
               children: [
-                Icon(
-                  Icons.ac_unit_rounded,
-                  color:
-                      Color(0xffD9EAFF),
-                  size: 34,
+
+                const Text(
+                  'FROZEN VOICE NOTE',
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    color: Color(0xffD9EAFF),
+                    fontSize: 11,
+                    fontWeight: FontWeight.w800,
+                    letterSpacing: .25,
+                  ),
                 ),
-                SizedBox(width: 10),
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment:
-                        CrossAxisAlignment
-                            .start,
+
+                const SizedBox(height: 5),
+
+                if (!_showFrozenFlame)
+                  const Row(
                     children: [
-                      Text(
-                        'FROZEN VOICE NOTE',
-                        style: TextStyle(
-                          color:
-                              Color(0xffD9EAFF),
-                          fontSize: 12,
-                          fontWeight:
-                              FontWeight.w800,
-                        ),
+                      Icon(
+                        Icons.lock_rounded,
+                        color: Color(0xffC8E1FF),
+                        size: 15,
                       ),
-                      SizedBox(height: 4),
-                      Text(
-                        'Hold to reveal the voice note',
-                        style: TextStyle(
-                          color:
-                              Color(0xffB9D4F5),
-                          fontSize: 11,
+                      SizedBox(width: 5),
+                      Expanded(
+                        child: Text(
+                          'Hold for 3 seconds to reveal',
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            color: Color(0xffC8DFFF),
+                            fontSize: 9.5,
+                          ),
                         ),
                       ),
                     ],
                   ),
-                ),
+
+                if (_showFrozenFlame)
+                  SizedBox(
+                    height: 42,
+                    child: _buildFrozenFlame(),
+                  ),
               ],
             ),
-            const SizedBox(height: 10),
-            if (!_showFrozenFlame)
-              const Row(
-                children: [
-                  Icon(
-                    Icons.lock_rounded,
-                    color:
-                        Color(0xffC8E1FF),
-                    size: 18,
-                  ),
-                  SizedBox(width: 7),
-                  Expanded(
-                    child: Text(
-                      'Hold for 3 seconds to reveal',
-                      style: TextStyle(
-                        color:
-                            Color(0xffC8DFFF),
-                        fontSize: 12,
-                      ),
-                    ),
-                  ),
-                ],
-              ),
-            if (_showFrozenFlame)
-              SizedBox(
-                width: double.infinity,
-                child:
-                    _buildFrozenFlame(),
-              ),
-            const SizedBox(height: 5),
-            Align(
-              alignment:
-                  Alignment.centerRight,
-              child: _buildTimeRow(),
-            ),
-          ],
-        ),
+          ),
+
+          const SizedBox(width: 7),
+
+          // ------------------------------------------------------------------
+          // TIME
+          // ------------------------------------------------------------------
+
+          Align(
+            alignment: Alignment.bottomCenter,
+            child: _buildTimeRow(),
+          ),
+        ],
       ),
-    );
-  }
+    ),
+  );
+}
+
 
   // ============================================================
   // REACTIONS
@@ -2790,15 +3734,11 @@ class _MessageBubbleState extends State<MessageBubble>
 
     // ==========================================================
     // SINGLE EMOJI
-    //
-    // IMPORTANT:
-    // This comes BEFORE normal text.
-    //
-    // One emoji = no background/bubble.
     // ==========================================================
 
     else if (_isSingleEmojiMessage()) {
-      bubble = _buildSingleEmojiMessage();
+      bubble =
+          _buildSingleEmojiMessage();
     }
 
     // ==========================================================
@@ -2813,13 +3753,22 @@ class _MessageBubbleState extends State<MessageBubble>
     }
 
     // ==========================================================
+    // VIDEO
+    // ==========================================================
+
+else if (widget.type == 'video') {
+  bubble = _buildVideoBubble();
+}
+
+    // ==========================================================
     // DOCUMENT
     // ==========================================================
 
     else if (widget.type == 'document' ||
         widget.type == 'file' ||
         widget.type == 'pdf') {
-      bubble = _buildDocumentBubble();
+      bubble =
+          _buildDocumentBubble();
     }
 
     // ==========================================================
@@ -2828,7 +3777,8 @@ class _MessageBubbleState extends State<MessageBubble>
 
     else if (widget.type == 'music' ||
         widget.type == 'audio') {
-      bubble = _buildMusicBubble();
+      bubble =
+          _buildMusicBubble();
     }
 
     // ==========================================================
@@ -2845,16 +3795,20 @@ class _MessageBubbleState extends State<MessageBubble>
 
     else if (widget.type == 'location' ||
         widget.type == 'live_location') {
-      bubble = _buildLocationBubble();
+      bubble =
+          _buildLocationBubble();
     }
 
     // ==========================================================
     // VOICE
     // ==========================================================
 
-    else if (widget.type == 'voice') {
-      bubble = _buildVoiceBubble();
-    }
+    else if (widget.type == 'voice_call') {
+  bubble = _buildVoiceCallBubble();
+}
+else if (widget.type == 'voice') {
+  bubble = _buildVoiceBubble();
+}
 
     // ==========================================================
     // TEXT
@@ -2865,43 +3819,169 @@ class _MessageBubbleState extends State<MessageBubble>
     }
 
     return Padding(
-      padding: const EdgeInsets.symmetric(
-        horizontal: 10,
-        vertical: 2,
-      ),
-      child: Align(
-        alignment: widget.isMe
-            ? Alignment.centerRight
-            : Alignment.centerLeft,
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment:
-              widget.isMe
-                  ? CrossAxisAlignment.end
-                  : CrossAxisAlignment.start,
-          children: [
-            bubble,
-            _buildReactionPreview(),
-          ],
-        ),
-      ),
-    );
+  padding: const EdgeInsets.symmetric(
+    horizontal: 10,
+    vertical: 2,
+  ),
+  child: Align(
+    alignment: widget.isMe
+        ? Alignment.centerRight
+        : Alignment.centerLeft,
+    child: Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment:
+          widget.isMe
+              ? CrossAxisAlignment.end
+              : CrossAxisAlignment.start,
+      children: [
+        // ============================================================
+        // FROZEN FIRE EFFECT
+        // ============================================================
+
+        if (widget.isFrozen && _showFrozenFlame)
+          _FrozenFireOverlay(
+            animation: _flameController,
+            borderRadius: _bubbleRadius(),
+            child: bubble,
+          )
+        else
+          bubble,
+
+        _buildReactionPreview(),
+      ],
+    ),
+  ),
+);
   }
 }
 
 // ============================================================================
-// REAL WAVEFORM
+// DOCUMENT PAPER — CHATTªX
 // ============================================================================
 
-class _RealWaveformPainter
+class _DocumentPaperPainter
     extends CustomPainter {
+  @override
+  void paint(
+    Canvas canvas,
+    Size size,
+  ) {
+    final paint = Paint()
+      ..color = const Color(0xff050816)
+      ..style = PaintingStyle.fill;
+
+    final borderPaint = Paint()
+      ..color = const Color(0xff00D9FF)
+          .withValues(alpha: 0.55)
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 1.2;
+
+    final path = ui.Path();
+
+    final double w = size.width;
+    final double h = size.height;
+    const double fold = 10;
+
+    path.moveTo(4, 2);
+    path.lineTo(w - fold - 2, 2);
+    path.lineTo(w - 2, fold + 2);
+    path.lineTo(w - 2, h - 2);
+    path.lineTo(4, h - 2);
+    path.close();
+
+    canvas.drawPath(
+      path,
+      paint,
+    );
+
+    canvas.drawPath(
+      path,
+      borderPaint,
+    );
+
+    // Folded corner
+    final foldPath = ui.Path();
+
+    foldPath.moveTo(
+      w - fold - 2,
+      2,
+    );
+
+    foldPath.lineTo(
+      w - fold - 2,
+      fold + 2,
+    );
+
+    foldPath.lineTo(
+      w - 2,
+      fold + 2,
+    );
+
+    canvas.drawPath(
+      foldPath,
+      borderPaint,
+    );
+
+    // Document lines
+    final linePaint = Paint()
+      ..color = const Color(0xff00D9FF)
+          .withValues(alpha: 0.22)
+      ..strokeWidth = 1;
+
+    for (int i = 0; i < 3; i++) {
+      final double y =
+          h * 0.55 + (i * 6);
+
+      canvas.drawLine(
+        Offset(10, y),
+        Offset(w - 10, y),
+        linePaint,
+      );
+    }
+  }
+
+  @override
+  bool shouldRepaint(
+    covariant _DocumentPaperPainter
+        oldDelegate,
+  ) {
+    return false;
+  }
+}
+
+// ============================================================================
+// REAL VOICE WAVEFORM — CHATTªX
+// Uses ONLY the real microphone amplitude samples.
+// Quiet sections remain visually quiet.
+// ============================================================================
+
+class _RealWaveformPainter extends CustomPainter {
   final List<double> waveform;
   final double progress;
 
-  _RealWaveformPainter({
+  const _RealWaveformPainter({
     required this.waveform,
     required this.progress,
   });
+
+  // --------------------------------------------------------------------------
+  // CHATTªX WAVEFORM COLORS
+  // --------------------------------------------------------------------------
+
+  static const List<Color> _waveColors = [
+    Color(0xff00D9FF),
+    Color(0xff08C8FF),
+    Color(0xff168CFF),
+    Color(0xff4E72FF),
+    Color(0xff7B2FF7),
+    Color(0xffA02CFF),
+    Color(0xffB026FF),
+    Color(0xffE42CFF),
+  ];
+
+  // --------------------------------------------------------------------------
+  // PAINT
+  // --------------------------------------------------------------------------
 
   @override
   void paint(
@@ -2909,153 +3989,431 @@ class _RealWaveformPainter
     Size size,
   ) {
     if (waveform.isEmpty) {
-      final paint = Paint()
-        ..color = const Color(
-          0xffDCE1FF,
-        ).withValues(alpha: .30)
-        ..strokeWidth = 1.6
-        ..strokeCap = StrokeCap.round;
-
-      final y = size.height / 2;
-
-      canvas.drawLine(
-        Offset(0, y),
-        Offset(size.width, y),
-        paint,
-      );
-
+      _drawEmptyWaveform(canvas, size);
       return;
     }
 
-    final int bars = waveform.length;
+    final samples = _prepareSamples();
 
-    if (bars == 1) {
-      _drawBar(
-        canvas: canvas,
-        size: size,
-        value: waveform.first,
-        progress: progress,
-        paintWidth: 2.5,
-      );
-
+    if (samples.isEmpty) {
+      _drawEmptyWaveform(canvas, size);
       return;
     }
 
-    const double horizontalPadding = 1;
+    final int bars = samples.length;
 
-    final double availableWidth =
-        size.width -
-        horizontalPadding * 2;
+    final double centerY = size.height / 2;
 
-    final double spacing =
-        availableWidth / (bars - 1);
+    // Small side padding.
+    const double horizontalPadding = 4.0;
+
+    final double usableWidth =
+        math.max(
+          0,
+          size.width - (horizontalPadding * 2),
+        );
+
+    // ------------------------------------------------------------------------
+    // IMPORTANT:
+    //
+    // We deliberately leave MORE SPACE between waveform bars.
+    //
+    // The previous version used too many bars, making the waveform look like
+    // one solid block.
+    // ------------------------------------------------------------------------
+
+    final double spacing = bars <= 1
+        ? 0
+        : usableWidth / (bars - 1);
+
+    // ------------------------------------------------------------------------
+    // PLAYED GRADIENT
+    // ------------------------------------------------------------------------
+
+    final shader = const LinearGradient(
+      begin: Alignment.centerLeft,
+      end: Alignment.centerRight,
+      colors: _waveColors,
+    ).createShader(
+      Rect.fromLTWH(
+        0,
+        0,
+        size.width,
+        size.height,
+      ),
+    );
+
+    // ------------------------------------------------------------------------
+    // UNPLAYED GRADIENT
+    // ------------------------------------------------------------------------
+
+    final unplayedShader = const LinearGradient(
+      begin: Alignment.centerLeft,
+      end: Alignment.centerRight,
+      colors: [
+        Color(0x6600D9FF),
+        Color(0x664E72FF),
+        Color(0x667B2FF7),
+        Color(0x66B026FF),
+        Color(0x66E42CFF),
+      ],
+    ).createShader(
+      Rect.fromLTWH(
+        0,
+        0,
+        size.width,
+        size.height,
+      ),
+    );
+
+    // ------------------------------------------------------------------------
+    // START DOT
+    // ------------------------------------------------------------------------
+
+    final dotPaint = Paint()
+      ..color = const Color(0xff76C9FF)
+          .withValues(alpha: .95)
+      ..style = PaintingStyle.fill;
+
+    canvas.drawCircle(
+      Offset(
+        horizontalPadding,
+        centerY,
+      ),
+      2.6,
+      dotPaint,
+    );
+
+    // ------------------------------------------------------------------------
+    // DRAW REAL SAMPLES
+    // ------------------------------------------------------------------------
 
     for (int i = 0; i < bars; i++) {
-      final double value =
-          waveform[i].clamp(0.0, 1.0);
+      final double value = samples[i]
+          .clamp(0.0, 1.0)
+          .toDouble();
 
       final double x =
-          horizontalPadding +
-          spacing * i;
+          horizontalPadding + (spacing * i);
+
+      final double normalizedPosition =
+          bars <= 1
+              ? 0
+              : i / (bars - 1);
 
       final bool played =
-          (i / (bars - 1)) <= progress;
+          normalizedPosition <= progress;
 
-      final double height;
+      // ----------------------------------------------------------------------
+      // REAL AMPLITUDE
+      // ----------------------------------------------------------------------
+      //
+      // IMPORTANT:
+      //
+      // We do NOT give quiet samples a minimum visual height like:
+      //
+      // 4 + amplitude * 44
+      //
+      // because that makes silence look like speech.
+      //
+      // Instead:
+      //
+      // silence      -> tiny line
+      // quiet voice  -> small line
+      // normal voice -> medium line
+      // loud voice   -> large line
+      // ----------------------------------------------------------------------
 
-      if (value <= .025) {
-        height = 1.4;
-      } else if (value <= .05) {
-        height = 2.2;
+      double amplitude;
+
+      if (value <= 0.003) {
+        amplitude = 0.0;
       } else {
-        final scaled =
-            math.pow(value, .72).toDouble();
-
-        height =
-            2.5 + scaled * 25.0;
+        amplitude = math.pow(
+          value,
+          0.90,
+        ).toDouble();
       }
 
+      // ----------------------------------------------------------------------
+      // QUIET / SILENCE
+      // ----------------------------------------------------------------------
+
+      double barHeight;
+
+      if (value <= 0.003) {
+        // Almost complete silence.
+        barHeight = 1.5;
+      } else if (value <= 0.012) {
+        // Extremely quiet.
+        barHeight = 2.2;
+      } else if (value <= 0.03) {
+        // Very quiet speech / breathing.
+        barHeight = 3.5;
+      } else {
+        // Actual recorded amplitude.
+        barHeight =
+            3.0 + (amplitude * 39.0);
+      }
+
+      barHeight = barHeight.clamp(
+        1.5,
+        size.height - 5.0,
+      );
+
       final double top =
-          (size.height - height) / 2;
+          centerY - (barHeight / 2);
 
-      final paint = Paint()
-        ..strokeWidth = 2.35
-        ..strokeCap = StrokeCap.round;
+      final double bottom =
+          centerY + (barHeight / 2);
 
-      paint.color = played
-          ? const Color(0xffD59BFF)
-          : const Color(0xffE8E8FF)
-              .withValues(alpha: .58);
+      // ----------------------------------------------------------------------
+      // VERY QUIET SAMPLE
+      //
+      // Do NOT add a large glow here.
+      // This keeps silent sections visibly small.
+      // ----------------------------------------------------------------------
 
-      if (played && value > .08) {
+      if (value > 0.012) {
         final glowPaint = Paint()
-          ..color = const Color(
-            0xffB026FF,
-          ).withValues(alpha: .13)
-          ..strokeWidth = 5
+          ..shader = played
+              ? shader
+              : unplayedShader
+          ..strokeWidth = value > 0.04
+    ? 2.5
+    : 1.8
           ..strokeCap = StrokeCap.round;
 
         canvas.drawLine(
           Offset(x, top),
-          Offset(x, top + height),
+          Offset(x, bottom),
           glowPaint,
         );
       }
 
+      // ----------------------------------------------------------------------
+      // MAIN WAVEFORM BAR
+      // ----------------------------------------------------------------------
+
+      final mainPaint = Paint()
+        ..shader = played
+            ? shader
+            : unplayedShader
+        ..strokeWidth = 1.35
+        ..strokeCap = StrokeCap.round;
+
       canvas.drawLine(
         Offset(x, top),
-        Offset(x, top + height),
-        paint,
+        Offset(x, bottom),
+        mainPaint,
       );
+
+      // ----------------------------------------------------------------------
+      // BRIGHT PLAYED CORE
+      // ----------------------------------------------------------------------
+
+      if (played && value > 0.035) {
+        final corePaint = Paint()
+          ..shader = shader
+          ..strokeWidth = 0.65
+          ..strokeCap = StrokeCap.round;
+
+        canvas.drawLine(
+          Offset(x, top),
+          Offset(x, bottom),
+          corePaint,
+        );
+      }
     }
+
+    // ------------------------------------------------------------------------
+    // END DOT
+    // ------------------------------------------------------------------------
+
+    final endDotPaint = Paint()
+      ..shader = shader
+      ..style = PaintingStyle.fill;
+
+    canvas.drawCircle(
+      Offset(
+        size.width - horizontalPadding,
+        centerY,
+      ),
+      1.8,
+      endDotPaint,
+    );
   }
 
-  void _drawBar({
-    required Canvas canvas,
-    required Size size,
-    required double value,
-    required double progress,
-    required double paintWidth,
-  }) {
-    final double height =
-        value <= .025
-            ? 1.4
-            : 2.5 +
-                math.pow(
-                  value,
-                  .72,
-                ).toDouble() *
-                    25;
+  // ==========================================================================
+  // PREPARE REAL SAMPLES
+  // ==========================================================================
 
-    final double x =
-        size.width / 2;
+  List<double> _prepareSamples() {
+    if (waveform.isEmpty) {
+      return [];
+    }
 
-    final double top =
-        (size.height - height) / 2;
+    final cleaned = <double>[];
+
+    for (final raw in waveform) {
+      if (raw.isNaN || raw.isInfinite) {
+        continue;
+      }
+
+      cleaned.add(
+        raw.clamp(
+          0.0,
+          1.0,
+        ).toDouble(),
+      );
+    }
+
+    if (cleaned.isEmpty) {
+      return [];
+    }
+
+    // ------------------------------------------------------------------------
+    // FEWER BARS = MORE SPACE BETWEEN THEM
+    // ------------------------------------------------------------------------
+    //
+    // 80 gives the waveform breathing room.
+    // The amplitude itself is still based on the actual recording.
+    // ------------------------------------------------------------------------
+
+    const int targetSamples = 48;
+
+    if (cleaned.length <= targetSamples) {
+      return cleaned;
+    }
+
+    final result = <double>[];
+
+    final double bucketSize =
+        cleaned.length / targetSamples;
+
+    for (int i = 0; i < targetSamples; i++) {
+      final int start =
+          (i * bucketSize).floor();
+
+      final int end =
+          ((i + 1) * bucketSize)
+              .floor()
+              .clamp(
+                start + 1,
+                cleaned.length,
+              );
+
+      // ----------------------------------------------------------------------
+      // IMPORTANT:
+      //
+      // Do NOT use the maximum/peak anymore.
+      //
+      // The previous code did:
+      //
+      // if (cleaned[j] > peak) {
+      //   peak = cleaned[j];
+      // }
+      //
+      // One loud sample could therefore make an entire section look loud.
+      //
+      // We now use an RMS-like average of the real samples in the bucket.
+      // This preserves quiet sections much better.
+      // ----------------------------------------------------------------------
+
+      double sumSquares = 0.0;
+
+      int count = 0;
+
+      for (int j = start; j < end; j++) {
+        final double sample =
+            cleaned[j].clamp(
+          0.0,
+          1.0,
+        );
+
+        sumSquares +=
+            sample * sample;
+
+        count++;
+      }
+
+      if (count == 0) {
+        result.add(0.0);
+        continue;
+      }
+
+      final double rms =
+          math.sqrt(
+            sumSquares / count,
+          );
+
+      result.add(
+        rms.clamp(
+          0.0,
+          1.0,
+        ),
+      );
+    }
+
+    return result;
+  }
+
+  // ==========================================================================
+  // EMPTY WAVEFORM
+  // ==========================================================================
+
+  void _drawEmptyWaveform(
+    Canvas canvas,
+    Size size,
+  ) {
+    final double centerY =
+        size.height / 2;
 
     final paint = Paint()
-      ..color = progress >= 1
-          ? const Color(0xffD59BFF)
-          : const Color(0xffE8E8FF)
-              .withValues(alpha: .58)
-      ..strokeWidth = paintWidth
+      ..color = const Color(0xff00D9FF)
+          .withValues(alpha: .25)
+      ..strokeWidth = 1.4
       ..strokeCap = StrokeCap.round;
 
     canvas.drawLine(
-      Offset(x, top),
-      Offset(x, top + height),
+      Offset(4, centerY),
+      Offset(
+        size.width - 4,
+        centerY,
+      ),
       paint,
     );
   }
+
+  // ==========================================================================
+  // REPAINT
+  // ==========================================================================
 
   @override
   bool shouldRepaint(
     covariant _RealWaveformPainter oldDelegate,
   ) {
-    return oldDelegate.waveform !=
-            waveform ||
-        oldDelegate.progress !=
-            progress;
+    if (oldDelegate.progress != progress) {
+      return true;
+    }
+
+    if (oldDelegate.waveform.length !=
+        waveform.length) {
+      return true;
+    }
+
+    for (
+      int i = 0;
+      i < waveform.length;
+      i++
+    ) {
+      if (oldDelegate.waveform[i] !=
+          waveform[i]) {
+        return true;
+      }
+    }
+
+    return false;
   }
 }
 
@@ -3208,4 +4566,796 @@ class _FrozenSnowflakePainter
   ) {
     return false;
   }
+}
+class _ChattaxVideoBubble
+    extends StatefulWidget {
+  final String url;
+final String time;
+final bool isMe;
+
+  const _ChattaxVideoBubble({
+  required this.url,
+  required this.time,
+  required this.isMe,
+});
+
+  @override
+  State<_ChattaxVideoBubble> createState() =>
+      _ChattaxVideoBubbleState();
+}
+
+class _ChattaxVideoBubbleState
+    extends State<_ChattaxVideoBubble> {
+  late final VideoPlayerController
+      _controller;
+
+  bool _ready = false;
+
+  @override
+  void initState() {
+    super.initState();
+
+    _controller =
+        VideoPlayerController.networkUrl(
+      Uri.parse(widget.url),
+    );
+
+    _controller.initialize().then((_) {
+      if (!mounted) return;
+
+      setState(() {
+        _ready = true;
+      });
+    }).catchError((error) {
+      debugPrint(
+        'ChattªX VIDEO LOAD ERROR: $error',
+      );
+    });
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+Widget build(BuildContext context) {
+  final Color borderColor = widget.isMe
+      ? const Color(0xffA866FF)
+      : const Color(0xff416A9D);
+
+  final Color accentColor = widget.isMe
+      ? const Color(0xffB026FF)
+      : const Color(0xff00D9FF);
+
+  return GestureDetector(
+      onTap: () {
+        if (!_ready) return;
+
+        setState(() {
+          if (_controller.value.isPlaying) {
+            _controller.pause();
+          } else {
+            _controller.play();
+          }
+        });
+      },
+      child: Container(
+        width: 270,
+        height: 360,
+        decoration: BoxDecoration(
+          borderRadius:
+              BorderRadius.circular(18),
+          border: Border.all(
+  color: borderColor.withValues(alpha: 0.65),
+),
+        ),
+        clipBehavior:
+            Clip.antiAlias,
+        child: Stack(
+          fit: StackFit.expand,
+          children: [
+            if (_ready)
+              FittedBox(
+                fit: BoxFit.cover,
+                child: SizedBox(
+                  width:
+                      _controller.value.size.width,
+                  height:
+                      _controller.value.size.height,
+                  child:
+                      VideoPlayer(_controller),
+                ),
+              )
+            else
+              const Center(
+                child:
+                    CircularProgressIndicator(),
+              ),
+
+            if (_ready &&
+                !_controller.value.isPlaying)
+              Center(
+                child: Container(
+                  width: 64,
+                  height: 64,
+                  decoration:
+                      const BoxDecoration(
+                    color: Colors.black54,
+                    shape: BoxShape.circle,
+                  ),
+                  child: const Icon(
+                    Icons.play_arrow_rounded,
+                    color: Colors.white,
+                    size: 40,
+                  ),
+                ),
+              ),
+
+            Positioned(
+              right: 8,
+              bottom: 8,
+              child: Container(
+                padding:
+                    const EdgeInsets.symmetric(
+                  horizontal: 7,
+                  vertical: 4,
+                ),
+                decoration: BoxDecoration(
+                  color: Colors.black54,
+                  borderRadius:
+                      BorderRadius.circular(8),
+                ),
+                child: Text(
+                  widget.time,
+                  style:
+                      const TextStyle(
+                    color: Colors.white,
+                    fontSize: 11,
+                  ),
+                ),
+              ),
+            ),
+
+            if (_ready)
+              Positioned(
+                left: 0,
+                right: 0,
+                bottom: 0,
+                child:
+                    VideoProgressIndicator(
+                  _controller,
+                  allowScrubbing: true,
+                  padding:
+                      EdgeInsets.zero,
+                  colors: VideoProgressColors(
+  playedColor: accentColor,
+  bufferedColor: borderColor,
+  backgroundColor: Colors.white24,
+),
+                ),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+// ============================================================================
+// CHATTªX — REAL FROZEN FIRE OVERLAY
+// ============================================================================
+//
+// This is NOT an emoji.
+//
+// It draws animated flame tongues, glowing fire, embers and heat directly
+// over the frozen message bubble.
+//
+// The effect covers the ENTIRE bubble.
+// ============================================================================
+
+class _FrozenFireOverlay extends StatelessWidget {
+  final Widget child;
+  final Animation<double> animation;
+  final BorderRadius borderRadius;
+
+  const _FrozenFireOverlay({
+    required this.child,
+    required this.animation,
+    required this.borderRadius,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return ClipRRect(
+      borderRadius: borderRadius,
+      child: Stack(
+        fit: StackFit.passthrough,
+        children: [
+          child,
+
+          // ---------------------------------------------------------------
+          // FIRE OVER THE WHOLE BUBBLE
+          // ---------------------------------------------------------------
+
+          Positioned.fill(
+            child: IgnorePointer(
+              child: CustomPaint(
+                painter: _FrozenFirePainter(
+                  animation: animation,
+                ),
+              ),
+            ),
+          ),
+
+          // ---------------------------------------------------------------
+          // SUBTLE HOT GLOW
+          // ---------------------------------------------------------------
+
+          Positioned.fill(
+            child: IgnorePointer(
+              child: AnimatedBuilder(
+                animation: animation,
+                builder: (context, _) {
+                  final pulse =
+                      0.06 +
+                      (math.sin(animation.value * math.pi * 2) + 1) *
+                          0.025;
+
+                  return Container(
+                    decoration: BoxDecoration(
+                      borderRadius: borderRadius,
+                      boxShadow: [
+                        BoxShadow(
+                          color: const Color(0xffff5a00)
+                              .withValues(alpha: pulse),
+                          blurRadius: 22,
+                          spreadRadius: 2,
+                        ),
+                        BoxShadow(
+                          color: const Color(0xffffb300)
+                              .withValues(alpha: pulse * .55),
+                          blurRadius: 38,
+                          spreadRadius: 3,
+                        ),
+                      ],
+                    ),
+                  );
+                },
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// ============================================================================
+// REAL FIRE PAINTER
+// ============================================================================
+
+class _FrozenFirePainter extends CustomPainter {
+final Animation<double> animation;
+
+_FrozenFirePainter({
+required this.animation,
+}) : super(repaint: animation);
+
+@override
+void paint(
+Canvas canvas,
+Size size,
+) {
+if (size.width <= 0 || size.height <= 0) {
+return;
+}
+
+
+final double t = animation.value * math.pi * 2;
+
+// ------------------------------------------------------------------------
+// WHOLE-BUBBLE FIRE HAZE
+// ------------------------------------------------------------------------
+
+final Paint hazePaint = Paint()
+  ..shader = ui.Gradient.radial(
+    Offset(
+      size.width * .5,
+      size.height * .55,
+    ),
+    math.max(
+      size.width,
+      size.height,
+    ) * .72,
+    [
+      const Color(0xffff4500).withValues(alpha: .045),
+      const Color(0xffff8c00).withValues(alpha: .025),
+      Colors.transparent,
+    ],
+    [
+      0.0,
+      .48,
+      1.0,
+    ],
+  );
+
+canvas.drawRect(
+  Offset.zero & size,
+  hazePaint,
+);
+
+// ------------------------------------------------------------------------
+// FLAME HEIGHT
+// ------------------------------------------------------------------------
+
+final double baseHeight = math.min(
+  42.0,
+  math.max(
+    24.0,
+    size.height * .32,
+  ),
+);
+
+// ------------------------------------------------------------------------
+// TOP FLAMES
+// ------------------------------------------------------------------------
+
+for (int i = 0; i < 11; i++) {
+  final double x = size.width * (i / 10);
+
+  final double wave =
+      math.sin(t * 1.7 + i * 1.43);
+
+  final double wave2 =
+      math.sin(t * 2.4 + i * .91);
+
+  final double height =
+      baseHeight *
+      (.62 + (wave + 1) * .16) *
+      (.82 + (wave2 + 1) * .09);
+
+  _drawFlame(
+    canvas: canvas,
+    base: Offset(x, 2),
+    height: height,
+    width: 15 + (i % 3) * 4.0,
+    direction:
+        math.sin(t + i * .8) * 4.0,
+    outer: true,
+  );
+}
+
+// ------------------------------------------------------------------------
+// BOTTOM FLAMES
+// ------------------------------------------------------------------------
+
+for (int i = 0; i < 9; i++) {
+  final double x =
+      size.width * (i / 8);
+
+  final double wave =
+      math.sin(t * 1.5 + i * 1.21);
+
+  final double height =
+      baseHeight *
+      (.42 + (wave + 1) * .14);
+
+  _drawFlame(
+    canvas: canvas,
+    base: Offset(
+      x,
+      size.height - 2,
+    ),
+    height: height,
+    width: 14 + (i % 2) * 5.0,
+    direction:
+        math.sin(t * 1.2 + i) * 3.5,
+    outer: true,
+    upsideDown: true,
+  );
+}
+
+// ------------------------------------------------------------------------
+// LEFT-SIDE FLAMES
+// ------------------------------------------------------------------------
+
+for (int i = 0; i < 6; i++) {
+  final double y =
+      size.height * (i / 5);
+
+  final double wave =
+      math.sin(t * 1.9 + i * 1.6);
+
+  _drawSideFlame(
+    canvas,
+    Offset(2, y),
+    18 + (wave + 1) * 6,
+    true,
+    t + i,
+  );
+}
+
+// ------------------------------------------------------------------------
+// RIGHT-SIDE FLAMES
+// ------------------------------------------------------------------------
+
+for (int i = 0; i < 6; i++) {
+  final double y =
+      size.height * (i / 5);
+
+  final double wave =
+      math.sin(t * 1.7 + i * 1.35);
+
+  _drawSideFlame(
+    canvas,
+    Offset(
+      size.width - 2,
+      y,
+    ),
+    18 + (wave + 1) * 6,
+    false,
+    t + i,
+  );
+}
+
+// ------------------------------------------------------------------------
+// FLOATING EMBERS
+// ------------------------------------------------------------------------
+
+final Paint emberPaint = Paint()
+  ..style = PaintingStyle.fill;
+
+for (int i = 0; i < 24; i++) {
+  final double seed = i * 17.731;
+
+  final double phase =
+      (t * (.35 + (i % 5) * .07) + seed) %
+          (math.pi * 2);
+
+  final double normalized =
+      (math.sin(phase) + 1) / 2;
+
+  final double x =
+      (seed * 13.17) % size.width;
+
+  final double y =
+      size.height -
+      ((seed * 7.31 +
+              normalized *
+                  size.height *
+                  .9) %
+          (size.height + 15));
+
+  final double radius =
+      0.8 + ((i % 3) * .45);
+
+  if (i.isEven) {
+    emberPaint.color =
+        const Color(0xffffb300).withValues(
+      alpha:
+          .55 + normalized * .35,
+    );
+  } else {
+    emberPaint.color =
+        const Color(0xffff5722).withValues(
+      alpha:
+          .45 + normalized * .30,
+    );
+  }
+
+  canvas.drawCircle(
+    Offset(x, y),
+    radius,
+    emberPaint,
+  );
+}
+
+// ------------------------------------------------------------------------
+// HOT INNER GLOW
+// ------------------------------------------------------------------------
+
+final Paint glowPaint = Paint()
+  ..style = PaintingStyle.stroke
+  ..strokeWidth = 1.5
+  ..color =
+      const Color(0xffff8a00).withValues(
+    alpha:
+        .18 +
+        (math.sin(t * 2.0) + 1) * .06,
+  );
+
+final RRect glowRect =
+    RRect.fromRectAndRadius(
+  Rect.fromLTWH(
+    1.5,
+    1.5,
+    math.max(
+      0,
+      size.width - 3,
+    ),
+    math.max(
+      0,
+      size.height - 3,
+    ),
+  ),
+  const Radius.circular(17),
+);
+
+canvas.drawRRect(
+  glowRect,
+  glowPaint,
+);
+
+}
+
+// ==========================================================================
+// FLAME
+// ==========================================================================
+
+void _drawFlame({
+required Canvas canvas,
+required Offset base,
+required double height,
+required double width,
+required double direction,
+required bool outer,
+bool upsideDown = false,
+}) {
+final double sign =
+upsideDown ? -1.0 : 1.0;
+
+
+// IMPORTANT:
+// Explicitly use ui.Path so Flutter knows this is dart:ui Path.
+
+final ui.Path outerPath =
+    ui.Path();
+
+final Offset p0 = base;
+
+final Offset p1 = Offset(
+  base.dx - width * .55,
+  base.dy +
+      sign * height * .35,
+);
+
+final Offset p2 = Offset(
+  base.dx - width * .35,
+  base.dy +
+      sign * height * .72,
+);
+
+final Offset tip = Offset(
+  base.dx + direction,
+  base.dy +
+      sign * height,
+);
+
+final Offset p3 = Offset(
+  base.dx + width * .42,
+  base.dy +
+      sign * height * .55,
+);
+
+final Offset p4 = Offset(
+  base.dx + width * .55,
+  base.dy +
+      sign * height * .22,
+);
+
+outerPath.moveTo(
+  p0.dx,
+  p0.dy,
+);
+
+outerPath.cubicTo(
+  p1.dx,
+  p1.dy,
+  p2.dx,
+  p2.dy,
+  tip.dx,
+  tip.dy,
+);
+
+outerPath.cubicTo(
+  p3.dx,
+  p3.dy,
+  p4.dx,
+  p4.dy,
+  p0.dx,
+  p0.dy,
+);
+
+outerPath.close();
+
+final Paint outerPaint = Paint()
+  ..style = PaintingStyle.fill
+  ..shader = ui.Gradient.linear(
+    Offset(
+      base.dx,
+      base.dy,
+    ),
+    Offset(
+      tip.dx,
+      tip.dy,
+    ),
+    [
+      const Color(0xffff3d00)
+          .withValues(alpha: .82),
+      const Color(0xffff6d00)
+          .withValues(alpha: .70),
+      const Color(0xffffc107)
+          .withValues(alpha: .48),
+    ],
+  );
+
+canvas.drawPath(
+  outerPath,
+  outerPaint,
+);
+
+// ------------------------------------------------------------------------
+// HOT INNER CORE
+// ------------------------------------------------------------------------
+
+final double innerHeight =
+    height * .52;
+
+final double innerWidth =
+    width * .46;
+
+final ui.Path innerPath =
+    ui.Path();
+
+final Offset innerBase =
+    Offset(
+  base.dx,
+  base.dy + sign * 1.0,
+);
+
+final Offset innerTip =
+    Offset(
+  base.dx + direction * .35,
+  base.dy +
+      sign * innerHeight,
+);
+
+innerPath.moveTo(
+  innerBase.dx,
+  innerBase.dy,
+);
+
+innerPath.cubicTo(
+  base.dx -
+      innerWidth * .55,
+  base.dy +
+      sign *
+          innerHeight *
+          .30,
+  base.dx -
+      innerWidth * .25,
+  base.dy +
+      sign *
+          innerHeight *
+          .55,
+  innerTip.dx,
+  innerTip.dy,
+);
+
+innerPath.cubicTo(
+  base.dx +
+      innerWidth * .30,
+  base.dy +
+      sign *
+          innerHeight *
+          .55,
+  base.dx +
+      innerWidth * .55,
+  base.dy +
+      sign *
+          innerHeight *
+          .25,
+  innerBase.dx,
+  innerBase.dy,
+);
+
+innerPath.close();
+
+final Paint innerPaint = Paint()
+  ..style = PaintingStyle.fill
+  ..color =
+      const Color(0xfffff176)
+          .withValues(alpha: .72);
+
+canvas.drawPath(
+  innerPath,
+  innerPaint,
+);
+
+}
+
+// ==========================================================================
+// SIDE FLAME
+// ==========================================================================
+
+void _drawSideFlame(
+Canvas canvas,
+Offset base,
+double height,
+bool left,
+double phase,
+) {
+final double direction =
+math.sin(phase * 1.7) * 4;
+
+final double sign =
+    left ? 1.0 : -1.0;
+
+// IMPORTANT:
+// Explicitly use ui.Path.
+
+final ui.Path path =
+    ui.Path();
+
+path.moveTo(
+  base.dx,
+  base.dy,
+);
+
+path.cubicTo(
+  base.dx + sign * 3,
+  base.dy - height * .25,
+  base.dx + sign * 9,
+  base.dy - height * .50,
+  base.dx +
+      sign * 4 +
+      direction,
+  base.dy - height,
+);
+
+path.cubicTo(
+  base.dx - sign * 5,
+  base.dy - height * .58,
+  base.dx - sign * 3,
+  base.dy - height * .22,
+  base.dx,
+  base.dy,
+);
+
+path.close();
+
+final Paint paint = Paint()
+  ..shader = ui.Gradient.linear(
+    Offset(
+      base.dx,
+      base.dy,
+    ),
+    Offset(
+      base.dx + sign * 4,
+      base.dy - height,
+    ),
+    [
+      const Color(0xffff3d00)
+          .withValues(alpha: .72),
+      const Color(0xffffb300)
+          .withValues(alpha: .42),
+      Colors.transparent,
+    ],
+  );
+
+canvas.drawPath(
+  path,
+  paint,
+);
+
+}
+
+@override
+bool shouldRepaint(
+covariant _FrozenFirePainter oldDelegate,
+) {
+return oldDelegate.animation !=
+animation;
+}
 }

@@ -11,28 +11,40 @@ import 'privacy_settings_screen.dart';
 /// ============================================================================
 ///
 /// • Futuristic ChattªX profile
-/// • True edge-to-edge width
-/// • Uses the full available screen height
-/// • Bottom controls reach the bottom of the screen
-/// • Professional Dashboard stretches
-/// • Privacy Shield stretches
-/// • Save button stretches
-/// • Firebase profile information
-/// • Real profile editing
-/// • Real bio editing
-/// • Real @username editing
-/// • Real phone editing
+/// • Real-time Firebase profile
+/// • Real-time followers counter
+/// • Real-time following counter
+/// • Firestore follower/following collections
+/// • Transaction-safe follow counters
 /// • Firebase verification / blue tick
 /// • Uses VerifiedName
 /// • Privacy Shield
 /// • Professional Dashboard
+/// • Real profile editing
+/// • Real bio editing
+/// • Real @username editing
+/// • Real phone editing
 /// • Responsive
+/// • Edge-to-edge
 /// • No withOpacity()
 /// • No studio_rounded
 /// • No singleLine
 ///
+/// Firestore structure:
+///
+/// users/{uid}
+///   followersCount: number
+///   followingCount: number
+///
+/// users/{uid}/followers/{followerUid}
+///   uid: followerUid
+///   createdAt: timestamp
+///
+/// users/{uid}/following/{followingUid}
+///   uid: followingUid
+///   createdAt: timestamp
+///
 /// ============================================================================
-
 class ProfileScreen extends StatefulWidget {
   const ProfileScreen({super.key});
 
@@ -42,7 +54,9 @@ class ProfileScreen extends StatefulWidget {
 
 class _ProfileScreenState extends State<ProfileScreen>
     with SingleTickerProviderStateMixin {
-  late AnimationController _animationController;
+  // ==========================================================================
+  // COLORS
+  // ==========================================================================
 
   static const Color background = Color(0xFF03050D);
   static const Color surface = Color(0xFF080C19);
@@ -52,9 +66,18 @@ class _ProfileScreenState extends State<ProfileScreen>
   static const Color purple = Color(0xFF8A2EFF);
   static const Color deepPurple = Color(0xFF5D18D9);
 
+  // ==========================================================================
+  // STATE
+  // ==========================================================================
+
+  late AnimationController _animationController;
+
   bool _isSaving = false;
   bool _hasChanges = false;
   bool _isVerified = false;
+
+  int _fallbackFollowers = 0;
+  int _fallbackFollowing = 0;
 
   late TextEditingController _nameController;
   late TextEditingController _usernameController;
@@ -65,6 +88,10 @@ class _ProfileScreenState extends State<ProfileScreen>
   String _savedUsername = '';
   String _savedBio = '';
   String _savedPhone = '';
+
+  // ==========================================================================
+  // INIT
+  // ==========================================================================
 
   @override
   void initState() {
@@ -159,6 +186,12 @@ class _ProfileScreenState extends State<ProfileScreen>
       _savedBio = bio;
       _savedPhone = phone;
 
+      _fallbackFollowers =
+          _readCounter(data?['followersCount']);
+
+      _fallbackFollowing =
+          _readCounter(data?['followingCount']);
+
       _isVerified = _readVerificationState(data);
 
       _nameController.text = _savedName;
@@ -184,8 +217,12 @@ class _ProfileScreenState extends State<ProfileScreen>
           _emailUsername(currentUser);
 
       _savedBio = '';
+
       _savedPhone =
           currentUser?.phoneNumber ?? '';
+
+      _fallbackFollowers = 0;
+      _fallbackFollowing = 0;
 
       _isVerified = false;
 
@@ -200,6 +237,83 @@ class _ProfileScreenState extends State<ProfileScreen>
     }
   }
 
+  // ==========================================================================
+  // REAL-TIME USER PROFILE STREAM
+  // ==========================================================================
+
+  Stream<DocumentSnapshot<Map<String, dynamic>>> _profileStream(
+    String uid,
+  ) {
+    return FirebaseFirestore.instance
+        .collection('users')
+        .doc(uid)
+        .snapshots();
+  }
+
+  // ==========================================================================
+  // REAL-TIME FOLLOWER STREAM
+  // ==========================================================================
+
+  Stream<QuerySnapshot<Map<String, dynamic>>> _followersStream(
+    String uid,
+  ) {
+    return FirebaseFirestore.instance
+        .collection('users')
+        .doc(uid)
+        .collection('followers')
+        .snapshots();
+  }
+
+  // ==========================================================================
+  // REAL-TIME FOLLOWING STREAM
+  // ==========================================================================
+
+  Stream<QuerySnapshot<Map<String, dynamic>>> _followingStream(
+    String uid,
+  ) {
+    return FirebaseFirestore.instance
+        .collection('users')
+        .doc(uid)
+        .collection('following')
+        .snapshots();
+  }
+
+  // ==========================================================================
+  // COUNTER
+  // ==========================================================================
+
+  int _readCounter(dynamic value) {
+    if (value is int) {
+      return value;
+    }
+
+    if (value is num) {
+      return value.toInt();
+    }
+
+    return 0;
+  }
+
+  String _formatCount(int count) {
+    if (count >= 1000000000) {
+      return '${(count / 1000000000).toStringAsFixed(1)}B';
+    }
+
+    if (count >= 1000000) {
+      return '${(count / 1000000).toStringAsFixed(1)}M';
+    }
+
+    if (count >= 1000) {
+      return '${(count / 1000).toStringAsFixed(1)}K';
+    }
+
+    return count.toString();
+  }
+
+  // ==========================================================================
+  // VERIFICATION
+  // ==========================================================================
+
   bool _readVerificationState(
     Map<String, dynamic>? data,
   ) {
@@ -211,6 +325,10 @@ class _ProfileScreenState extends State<ProfileScreen>
         data['isVerified'] == true ||
         data['verificationStatus'] == 'verified';
   }
+
+  // ==========================================================================
+  // USERNAME
+  // ==========================================================================
 
   String _emailUsername(User? user) {
     final String? email =
@@ -226,6 +344,19 @@ class _ProfileScreenState extends State<ProfileScreen>
     }
 
     return 'chattax_user';
+  }
+
+  String _cleanUsername(String value) {
+    return value
+        .trim()
+        .replaceFirst('@', '')
+        .toLowerCase();
+  }
+
+  bool _validUsername(String username) {
+    return RegExp(
+      r'^[a-zA-Z0-9_]+$',
+    ).hasMatch(username);
   }
 
   // ==========================================================================
@@ -313,6 +444,12 @@ class _ProfileScreenState extends State<ProfileScreen>
           'phoneNumber': phone,
           'updatedAt':
               FieldValue.serverTimestamp(),
+
+          // Make sure these fields exist.
+          'followersCount':
+              FieldValue.increment(0),
+          'followingCount':
+              FieldValue.increment(0),
         },
         SetOptions(merge: true),
       );
@@ -347,17 +484,252 @@ class _ProfileScreenState extends State<ProfileScreen>
     }
   }
 
-  String _cleanUsername(String value) {
-    return value
-        .trim()
-        .replaceFirst('@', '')
-        .toLowerCase();
+  // ==========================================================================
+  // FOLLOW USER
+  // ==========================================================================
+
+  Future<void> followUser(
+    String targetUid,
+  ) async {
+    final User? currentUser =
+        FirebaseAuth.instance.currentUser;
+
+    if (currentUser == null) {
+      return;
+    }
+
+    final String myUid =
+        currentUser.uid;
+
+    if (myUid == targetUid) {
+      return;
+    }
+
+    final FirebaseFirestore firestore =
+        FirebaseFirestore.instance;
+
+    final DocumentReference<Map<String, dynamic>>
+        targetUserRef =
+        firestore.collection('users').doc(targetUid);
+
+    final DocumentReference<Map<String, dynamic>>
+        myUserRef =
+        firestore.collection('users').doc(myUid);
+
+    final DocumentReference<Map<String, dynamic>>
+        followerRef =
+        targetUserRef
+            .collection('followers')
+            .doc(myUid);
+
+    final DocumentReference<Map<String, dynamic>>
+        followingRef =
+        myUserRef
+            .collection('following')
+            .doc(targetUid);
+
+    try {
+      await firestore.runTransaction(
+        (transaction) async {
+          final DocumentSnapshot<Map<String, dynamic>>
+              followerSnapshot =
+              await transaction.get(
+            followerRef,
+          );
+
+          if (followerSnapshot.exists) {
+            return;
+          }
+
+          final DocumentSnapshot<Map<String, dynamic>>
+              targetSnapshot =
+              await transaction.get(
+            targetUserRef,
+          );
+
+          final DocumentSnapshot<Map<String, dynamic>>
+              mySnapshot =
+              await transaction.get(
+            myUserRef,
+          );
+
+          final int followers =
+              _readCounter(
+            targetSnapshot.data()?[
+              'followersCount'
+            ],
+          );
+
+          final int following =
+              _readCounter(
+            mySnapshot.data()?[
+              'followingCount'
+            ],
+          );
+
+          transaction.set(
+            followerRef,
+            {
+              'uid': myUid,
+              'createdAt':
+                  FieldValue.serverTimestamp(),
+            },
+          );
+
+          transaction.set(
+            followingRef,
+            {
+              'uid': targetUid,
+              'createdAt':
+                  FieldValue.serverTimestamp(),
+            },
+          );
+
+          transaction.set(
+            targetUserRef,
+            {
+              'followersCount':
+                  followers + 1,
+            },
+            SetOptions(merge: true),
+          );
+
+          transaction.set(
+            myUserRef,
+            {
+              'followingCount':
+                  following + 1,
+            },
+            SetOptions(merge: true),
+          );
+        },
+      );
+    } catch (_) {
+      _showMessage(
+        'Could not follow this user.',
+      );
+    }
   }
 
-  bool _validUsername(String username) {
-    return RegExp(
-      r'^[a-zA-Z0-9_]+$',
-    ).hasMatch(username);
+  // ==========================================================================
+  // UNFOLLOW USER
+  // ==========================================================================
+
+  Future<void> unfollowUser(
+    String targetUid,
+  ) async {
+    final User? currentUser =
+        FirebaseAuth.instance.currentUser;
+
+    if (currentUser == null) {
+      return;
+    }
+
+    final String myUid =
+        currentUser.uid;
+
+    if (myUid == targetUid) {
+      return;
+    }
+
+    final FirebaseFirestore firestore =
+        FirebaseFirestore.instance;
+
+    final DocumentReference<Map<String, dynamic>>
+        targetUserRef =
+        firestore.collection('users').doc(targetUid);
+
+    final DocumentReference<Map<String, dynamic>>
+        myUserRef =
+        firestore.collection('users').doc(myUid);
+
+    final DocumentReference<Map<String, dynamic>>
+        followerRef =
+        targetUserRef
+            .collection('followers')
+            .doc(myUid);
+
+    final DocumentReference<Map<String, dynamic>>
+        followingRef =
+        myUserRef
+            .collection('following')
+            .doc(targetUid);
+
+    try {
+      await firestore.runTransaction(
+        (transaction) async {
+          final DocumentSnapshot<Map<String, dynamic>>
+              followerSnapshot =
+              await transaction.get(
+            followerRef,
+          );
+
+          if (!followerSnapshot.exists) {
+            return;
+          }
+
+          final DocumentSnapshot<Map<String, dynamic>>
+              targetSnapshot =
+              await transaction.get(
+            targetUserRef,
+          );
+
+          final DocumentSnapshot<Map<String, dynamic>>
+              mySnapshot =
+              await transaction.get(
+            myUserRef,
+          );
+
+          final int followers =
+              _readCounter(
+            targetSnapshot.data()?[
+              'followersCount'
+            ],
+          );
+
+          final int following =
+              _readCounter(
+            mySnapshot.data()?[
+              'followingCount'
+            ],
+          );
+
+          transaction.delete(
+            followerRef,
+          );
+
+          transaction.delete(
+            followingRef,
+          );
+
+          transaction.set(
+            targetUserRef,
+            {
+              'followersCount':
+                  followers > 0
+                      ? followers - 1
+                      : 0,
+            },
+            SetOptions(merge: true),
+          );
+
+          transaction.set(
+            myUserRef,
+            {
+              'followingCount':
+                  following > 0
+                      ? following - 1
+                      : 0,
+            },
+            SetOptions(merge: true),
+          );
+        },
+      );
+    } catch (_) {
+      _showMessage(
+        'Could not unfollow this user.',
+      );
+    }
   }
 
   // ==========================================================================
@@ -379,14 +751,6 @@ class _ProfileScreenState extends State<ProfileScreen>
             context,
             constraints,
           ) {
-            // ================================================================
-            // IMPORTANT:
-            // Use the COMPLETE available height.
-            //
-            // Previously the screen was forced to 760px which could create
-            // empty space underneath the Save button.
-            // ================================================================
-
             final double availableHeight =
                 constraints.maxHeight;
 
@@ -425,13 +789,11 @@ class _ProfileScreenState extends State<ProfileScreen>
   // MAIN CONTENT
   // ==========================================================================
 
-  Widget _buildMainContent(User? user) {
+  Widget _buildMainContent(
+    User? user,
+  ) {
     return Column(
       children: [
-        // ====================================================================
-        // PROFILE HERO
-        // ====================================================================
-
         Expanded(
           flex: 24,
           child:
@@ -439,10 +801,6 @@ class _ProfileScreenState extends State<ProfileScreen>
         ),
 
         const SizedBox(height: 7),
-
-        // ====================================================================
-        // PROFILE INFORMATION
-        // ====================================================================
 
         Expanded(
           flex: 14,
@@ -452,218 +810,169 @@ class _ProfileScreenState extends State<ProfileScreen>
 
         const SizedBox(height: 7),
 
-        // ====================================================================
-        // MOMENTS
-        // ====================================================================
-
         Expanded(
-          flex: 15,
-          child:
-              _buildMoments(),
-        ),
+  flex: 14,
+  child: _buildMoments(),
+),
 
+const SizedBox(height: 7),
+
+Expanded(
+  flex: 11,
+  child: _buildActionButtons(),
+),
         const SizedBox(height: 7),
-
-        // ====================================================================
-        // ACTION BUTTONS
-        // ====================================================================
-
-        Expanded(
-          flex: 13,
-          child:
-              _buildActionButtons(),
-        ),
-
-        const SizedBox(height: 7),
-
-        // ====================================================================
-        // BOTTOM CONTROL AREA
-        //
-        // This entire section is anchored to the bottom.
-        //
-        // Professional Dashboard
-        // Privacy Shield
-        // Save
-        //
-        // The final Save card has NO widget underneath it, so it reaches the
-        // exact bottom edge of the available screen.
-        // ====================================================================
 
         Expanded(
           flex: 34,
-          child: _buildBottomControlArea(),
+          child:
+              _buildBottomControlArea(),
         ),
       ],
     );
   }
 
   // ==========================================================================
-  // BOTTOM CONTROL AREA
+  // REAL-TIME IDENTITY HERO
   // ==========================================================================
 
-  Widget _buildBottomControlArea() {
-    return Column(
-      children: [
-        // ====================================================================
-        // PROFESSIONAL DASHBOARD
-        // ====================================================================
+  Widget _buildIdentityHero(
+    User? user,
+  ) {
+    if (user == null) {
+      return _buildIdentityHeroContent(
+        user: null,
+        followers: 0,
+        following: 0,
+      );
+    }
 
-        Expanded(
-          child:
-              _buildProfessionalDashboard(),
-        ),
+    return StreamBuilder<
+        DocumentSnapshot<Map<String, dynamic>>>(
+      stream: _profileStream(user.uid),
+      builder: (
+        context,
+        snapshot,
+      ) {
+        final Map<String, dynamic>? data =
+            snapshot.data?.data();
 
-        const SizedBox(height: 4),
+        final bool hasFollowerCounter =
+            data?['followersCount'] != null;
 
-        // ====================================================================
-        // PRIVACY SHIELD
-        // ====================================================================
+        final bool hasFollowingCounter =
+            data?['followingCount'] != null;
 
-        Expanded(
-          child:
-              _buildIdentityControls(),
-        ),
+        final int followers =
+            hasFollowerCounter
+                ? _readCounter(
+                    data?['followersCount'],
+                  )
+                : _fallbackFollowers;
 
-        const SizedBox(height: 4),
+        final int following =
+            hasFollowingCounter
+                ? _readCounter(
+                    data?['followingCount'],
+                  )
+                : _fallbackFollowing;
 
-        // ====================================================================
-        // SAVE
-        //
-        // Nothing comes after this.
-        // It therefore reaches the exact bottom of the screen.
-        // ====================================================================
+        if (!hasFollowerCounter) {
+          return StreamBuilder<
+              QuerySnapshot<
+                  Map<String, dynamic>>>(
+            stream:
+                _followersStream(user.uid),
+            builder: (
+              context,
+              followerSnapshot,
+            ) {
+              final int liveFollowers =
+                  followerSnapshot
+                          .data
+                          ?.docs
+                          .length ??
+                      followers;
 
-        Expanded(
-          child:
-              _buildSaveCard(),
-        ),
-      ],
-    );
-  }
+              if (!hasFollowingCounter) {
+                return StreamBuilder<
+                    QuerySnapshot<
+                        Map<String, dynamic>>>(
+                  stream:
+                      _followingStream(user.uid),
+                  builder: (
+                    context,
+                    followingSnapshot,
+                  ) {
+                    final int liveFollowing =
+                        followingSnapshot
+                                .data
+                                ?.docs
+                                .length ??
+                            following;
 
-  // ==========================================================================
-  // HEADER
-  // ==========================================================================
+                    return _buildIdentityHeroContent(
+                      user: user,
+                      followers: liveFollowers,
+                      following: liveFollowing,
+                    );
+                  },
+                );
+              }
 
-  Widget _buildHeader() {
-    return SizedBox(
-      height: 55,
-      child: Row(
-        children: [
-          Expanded(
-            child: Column(
-              mainAxisAlignment:
-                  MainAxisAlignment.center,
-              crossAxisAlignment:
-                  CrossAxisAlignment.start,
-              children: [
-                Row(
-                  children: [
-                    const Text(
-                      'My Identity',
-                      style: TextStyle(
-                        color: Colors.white,
-                        fontSize: 25,
-                        fontWeight:
-                            FontWeight.w800,
-                        letterSpacing: -0.8,
-                      ),
-                    ),
-                    const SizedBox(width: 3),
-                    ShaderMask(
-                      shaderCallback:
-                          (bounds) {
-                        return const LinearGradient(
-                          colors: [
-                            cyan,
-                            purple,
-                          ],
-                        ).createShader(
-                          bounds,
-                        );
-                      },
-                      child: const Text(
-                        'X',
-                        style: TextStyle(
-                          color: Colors.white,
-                          fontSize: 27,
-                          fontWeight:
-                              FontWeight.w900,
-                          fontStyle:
-                              FontStyle.italic,
-                        ),
-                      ),
-                    ),
-                  ],
-                ),
-                const Text(
-                  'Your ChattªX universe',
-                  style: TextStyle(
-                    color: Colors.white54,
-                    fontSize: 11,
-                  ),
-                ),
-              ],
-            ),
-          ),
-
-          _headerButton(
-            icon:
-                Icons.qr_code_2_rounded,
-            iconColor: purple,
-            onTap: () {
-              _showMessage(
-                'ChattªX QR Identity',
+              return _buildIdentityHeroContent(
+                user: user,
+                followers: liveFollowers,
+                following: following,
               );
             },
-          ),
+          );
+        }
 
-          const SizedBox(width: 6),
+        if (!hasFollowingCounter) {
+          return StreamBuilder<
+              QuerySnapshot<
+                  Map<String, dynamic>>>(
+            stream:
+                _followingStream(user.uid),
+            builder: (
+              context,
+              followingSnapshot,
+            ) {
+              final int liveFollowing =
+                  followingSnapshot
+                          .data
+                          ?.docs
+                          .length ??
+                      following;
 
-          _headerButton(
-            icon: Icons.menu_rounded,
-            iconColor: Colors.white70,
-            onTap: _showMenu,
-          ),
-        ],
-      ),
+              return _buildIdentityHeroContent(
+                user: user,
+                followers: followers,
+                following: liveFollowing,
+              );
+            },
+          );
+        }
+
+        return _buildIdentityHeroContent(
+          user: user,
+          followers: followers,
+          following: following,
+        );
+      },
     );
   }
 
-  Widget _headerButton({
-    required IconData icon,
-    required Color iconColor,
-    required VoidCallback onTap,
+  // ==========================================================================
+  // IDENTITY HERO CONTENT
+  // ==========================================================================
+
+  Widget _buildIdentityHeroContent({
+    required User? user,
+    required int followers,
+    required int following,
   }) {
-    return GestureDetector(
-      onTap: onTap,
-      child: Container(
-        width: 48,
-        height: 48,
-        decoration: BoxDecoration(
-          color: surfaceTwo,
-          borderRadius:
-              BorderRadius.circular(15),
-          border: Border.all(
-            color: Colors.white.withValues(
-              alpha: 0.08,
-            ),
-          ),
-        ),
-        child: Icon(
-          icon,
-          color: iconColor,
-          size: 25,
-        ),
-      ),
-    );
-  }
-
-  // ==========================================================================
-  // IDENTITY HERO
-  // ==========================================================================
-
-  Widget _buildIdentityHero(User? user) {
     return Container(
       width: double.infinity,
       decoration: BoxDecoration(
@@ -761,8 +1070,9 @@ class _ProfileScreenState extends State<ProfileScreen>
 
                       Container(
                         height: 1,
-                        color: Colors.white
-                            .withValues(
+                        color:
+                            Colors.white
+                                .withValues(
                           alpha: 0.07,
                         ),
                       ),
@@ -772,15 +1082,23 @@ class _ProfileScreenState extends State<ProfileScreen>
                       Row(
                         children: [
                           _heroStat(
-                            '469',
+                            _formatCount(
+                              followers,
+                            ),
                             'Followers',
                           ),
+
                           _heroDivider(),
+
                           _heroStat(
-                            '192',
+                            _formatCount(
+                              following,
+                            ),
                             'Following',
                           ),
+
                           _heroDivider(),
+
                           _heroStat(
                             '98%',
                             'Trust',
@@ -802,7 +1120,9 @@ class _ProfileScreenState extends State<ProfileScreen>
   // AVATAR
   // ==========================================================================
 
-  Widget _buildAnimatedAvatar(User? user) {
+  Widget _buildAnimatedAvatar(
+    User? user,
+  ) {
     return AnimatedBuilder(
       animation:
           _animationController,
@@ -836,11 +1156,15 @@ class _ProfileScreenState extends State<ProfileScreen>
               angle: -angle,
               child: Container(
                 padding:
-                    const EdgeInsets.all(3.5),
+                    const EdgeInsets.all(
+                  3.5,
+                ),
                 decoration:
                     const BoxDecoration(
-                  shape: BoxShape.circle,
-                  color: background,
+                  shape:
+                      BoxShape.circle,
+                  color:
+                      background,
                 ),
                 child: child,
               ),
@@ -880,7 +1204,8 @@ class _ProfileScreenState extends State<ProfileScreen>
         horizontal: 10,
         vertical: 4,
       ),
-      decoration: BoxDecoration(
+      decoration:
+          BoxDecoration(
         color: purple.withValues(
           alpha: 0.09,
         ),
@@ -1001,24 +1326,23 @@ class _ProfileScreenState extends State<ProfileScreen>
                   CrossAxisAlignment.start,
               children: [
                 _compactInfo(
-                  Icons.grid_view_rounded,
-                  'Artist  🎹',
-                ),
-                _compactInfo(
-                  Icons.sports_tennis_rounded,
-                  'Padel Addict  🎾 📍',
-                ),
-                _compactInfo(
-                  Icons.phone_outlined,
-                  user?.phoneNumber
-                              ?.isNotEmpty ==
-                          true
-                      ? user!.phoneNumber!
-                      : (_savedPhone
-                              .isNotEmpty
-                          ? _savedPhone
-                          : 'Add phone number'),
-                ),
+  Icons.music_note_outlined,
+  'Artist',
+),
+
+_compactInfo(
+  Icons.sports_tennis_outlined,
+  'Padel Addict',
+),
+
+_compactInfo(
+  Icons.phone_outlined,
+  user?.phoneNumber?.isNotEmpty == true
+      ? user!.phoneNumber!
+      : (_savedPhone.isNotEmpty
+          ? _savedPhone
+          : 'Add phone number'),
+),
               ],
             ),
           ),
@@ -1047,14 +1371,11 @@ class _ProfileScreenState extends State<ProfileScreen>
                   Row(
                     children: [
                       const Icon(
-                        Icons
-                            .format_quote_rounded,
+                        Icons.format_quote_rounded,
                         color: cyan,
                         size: 17,
                       ),
-                      const SizedBox(
-                        width: 5,
-                      ),
+                      const SizedBox(width: 5),
                       const Text(
                         'Bio',
                         style:
@@ -1067,33 +1388,6 @@ class _ProfileScreenState extends State<ProfileScreen>
                         ),
                       ),
                       const Spacer(),
-                      Container(
-                        width: 32,
-                        height: 32,
-                        decoration:
-                            BoxDecoration(
-                          shape:
-                              BoxShape.circle,
-                          color:
-                              cyan.withValues(
-                            alpha: 0.06,
-                          ),
-                          border:
-                              Border.all(
-                            color:
-                                cyan.withValues(
-                              alpha: 0.35,
-                            ),
-                          ),
-                        ),
-                        child:
-                            const Icon(
-                          Icons
-                              .edit_outlined,
-                          color: cyan,
-                          size: 16,
-                        ),
-                      ),
                     ],
                   ),
 
@@ -1123,234 +1417,385 @@ class _ProfileScreenState extends State<ProfileScreen>
   }
 
   Widget _compactInfo(
-    IconData icon,
-    String text,
-  ) {
-    return SizedBox(
-      height: 25,
-      child: Row(
-        children: [
-          SizedBox(
-            width: 30,
-            child: Icon(
-              icon,
-              color: cyan,
-              size: 16,
-            ),
-          ),
-          Expanded(
-            child: Text(
-              text,
-              maxLines: 1,
-              overflow:
-                  TextOverflow.ellipsis,
-              style:
-                  const TextStyle(
-                color: Colors.white70,
-                fontSize: 11,
-              ),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  // ==========================================================================
-  // MOMENTS
-  // ==========================================================================
-
-  Widget _buildMoments() {
-    return Column(
+  IconData icon,
+  String text,
+) {
+  return SizedBox(
+    height: 25,
+    child: Row(
       children: [
         SizedBox(
-          height: 22,
-          child: Row(
-            children: [
-              ShaderMask(
-                shaderCallback:
-                    (bounds) {
-                  return const LinearGradient(
-                    colors: [
-                      purple,
-                      cyan,
-                    ],
-                  ).createShader(
-                    bounds,
-                  );
-                },
-                child: const Text(
-                  'X',
-                  style: TextStyle(
-                    color: Colors.white,
-                    fontSize: 19,
-                    fontWeight:
-                        FontWeight.w900,
-                    fontStyle:
-                        FontStyle.italic,
-                  ),
-                ),
-              ),
-
-              const SizedBox(width: 4),
-
-              const Text(
-                'Moments',
-                style: TextStyle(
-                  color: Colors.white,
-                  fontSize: 16,
-                  fontWeight:
-                      FontWeight.w700,
-                ),
-              ),
-
-              const Spacer(),
-
-              GestureDetector(
-                onTap: () {
-                  _showMessage(
-                    'All Moments',
-                  );
-                },
-                child: const Row(
-                  children: [
-                    Text(
-                      'View All',
-                      style:
-                          TextStyle(
-                        color: purple,
-                        fontSize: 11,
-                        fontWeight:
-                            FontWeight.w600,
-                      ),
-                    ),
-                    Icon(
-                      Icons
-                          .chevron_right_rounded,
-                      color: purple,
-                      size: 17,
-                    ),
+          width: 30,
+          child: Center(
+            child: ShaderMask(
+              shaderCallback: (bounds) {
+                return const LinearGradient(
+                  begin: Alignment.topLeft,
+                  end: Alignment.bottomRight,
+                  colors: [
+                    cyan,
+                    purple,
                   ],
-                ),
+                ).createShader(bounds);
+              },
+              child: Icon(
+                icon,
+                color: Colors.white,
+                size: 18,
               ),
-            ],
+            ),
           ),
         ),
 
-        const SizedBox(height: 4),
+        const SizedBox(width: 5),
 
         Expanded(
-          child: Row(
-            children: [
-              _moment(
-                'New',
-                Icons.add_rounded,
-                true,
-              ),
-              _moment(
-                'Qhaghazela 🇿🇦',
-                Icons.music_note_rounded,
-                false,
-              ),
-              _moment(
-                'Izono',
-                Icons.auto_awesome_rounded,
-                false,
-              ),
-              _moment(
-                'WhistleEffects',
-                Icons.graphic_eq_rounded,
-                false,
-              ),
-              _moment(
-                'Studio Life',
-                Icons.music_video_rounded,
-                false,
-              ),
-            ],
+          child: Text(
+            text,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(
+              color: Colors.white70,
+              fontSize: 11,
+              fontWeight: FontWeight.w500,
+            ),
           ),
         ),
       ],
-    );
-  }
+    ),
+  );
+}
 
-  Widget _moment(
-    String label,
-    IconData icon,
-    bool isNew,
-  ) {
-    return Expanded(
-      child: Column(
+  // ==========================================================================
+// MOMENTS
+// ==========================================================================
+
+Widget _buildMoments() {
+  return LayoutBuilder(
+    builder: (context, constraints) {
+      final double width = constraints.maxWidth;
+
+      // Five circles with small gaps.
+      // The maximum keeps the circles close to the screenshot size,
+      // while the calculation prevents overflow on smaller devices.
+      const double maxCircleSize = 146.0;
+      const double gap = 4.0;
+
+      final double calculatedSize =
+          (width - (gap * 4)) / 5;
+
+      final double circleSize = calculatedSize
+          .clamp(58.0, maxCircleSize);
+
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Expanded(
-            child: Container(
-              margin:
-                  const EdgeInsets.symmetric(
-                horizontal: 3,
-              ),
-              padding:
-                  const EdgeInsets.all(2.5),
-              decoration:
-                  const BoxDecoration(
-                shape: BoxShape.circle,
-                gradient:
-                    SweepGradient(
-                  colors: [
-                    purple,
-                    cyan,
-                    deepPurple,
-                    purple,
-                  ],
-                ),
-              ),
-              child: Container(
-                decoration:
-                    BoxDecoration(
-                  shape: BoxShape.circle,
-                  color: surface,
-                  border: Border.all(
-                    color: background,
-                    width: 2,
+          SizedBox(
+            height: 24,
+            child: Row(
+              children: [
+                ShaderMask(
+                  shaderCallback: (bounds) {
+                    return const LinearGradient(
+                      colors: [
+                        purple,
+                        cyan,
+                      ],
+                    ).createShader(bounds);
+                  },
+                  child: const Text(
+                    'X',
+                    style: TextStyle(
+                      color: Colors.white,
+                      fontSize: 20,
+                      fontWeight: FontWeight.w900,
+                      fontStyle: FontStyle.italic,
+                    ),
                   ),
                 ),
-                child: Icon(
-                  icon,
-                  color: isNew
-                      ? Colors.white
-                      : cyan,
-                  size:
-                      isNew ? 27 : 22,
+
+                const SizedBox(width: 5),
+
+                const Text(
+                  'Moments',
+                  style: TextStyle(
+                    color: Colors.white,
+                    fontSize: 17,
+                    fontWeight: FontWeight.w700,
+                  ),
                 ),
-              ),
+
+                const Spacer(),
+
+                GestureDetector(
+                  onTap: () {
+                    _showMessage('All Moments');
+                  },
+                  child: const Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text(
+                        'View All',
+                        style: TextStyle(
+                          color: purple,
+                          fontSize: 11,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                      Icon(
+                        Icons.chevron_right_rounded,
+                        color: purple,
+                        size: 18,
+                      ),
+                    ],
+                  ),
+                ),
+              ],
             ),
           ),
 
-          const SizedBox(height: 2),
+          const SizedBox(height: 5),
 
-          Text(
-            label,
-            maxLines: 1,
-            overflow:
-                TextOverflow.ellipsis,
-            textAlign:
-                TextAlign.center,
-            style:
-                const TextStyle(
-              color: Colors.white70,
-              fontSize: 8,
+          Expanded(
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                _moment(
+  'New',
+  'https://images.unsplash.com/photo-1516321318423-f06f85e504b3?auto=format&fit=crop&w=500&q=80',
+  true,
+  circleSize,
+),
+
+_moment(
+  'Qhaqhazela 🇿🇦',
+  'https://images.unsplash.com/photo-1500534623283-312aade485b7?auto=format&fit=crop&w=500&q=80',
+  false,
+  circleSize,
+),
+
+_moment(
+  'Izono',
+  'https://images.unsplash.com/photo-1519608487953-e999c86e7455?auto=format&fit=crop&w=500&q=80',
+  false,
+  circleSize,
+),
+
+_moment(
+  'WhistleEffects',
+  'https://images.unsplash.com/photo-1511379938547-c1f69419868d?auto=format&fit=crop&w=500&q=80',
+  false,
+  circleSize,
+),
+
+_moment(
+  'Studio Life',
+  'https://images.unsplash.com/photo-1493225457124-a3eb161ffa5f?auto=format&fit=crop&w=500&q=80',
+  false,
+  circleSize,
+),
+              ],
             ),
           ),
         ],
+      );
+    },
+  );
+}
+
+  Widget _moment(
+  String label,
+  String imageUrl,
+  bool isNew,
+  double circleSize,
+) {
+  return SizedBox(
+    width: circleSize,
+    child: Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        SizedBox(
+          width: circleSize,
+          height: circleSize,
+          child: Stack(
+            clipBehavior: Clip.none,
+            children: [
+              // ============================================================
+              // OUTER GRADIENT RING
+              // ============================================================
+
+              Container(
+                width: circleSize,
+                height: circleSize,
+                padding: const EdgeInsets.all(3.5),
+                decoration: const BoxDecoration(
+                  shape: BoxShape.circle,
+                  gradient: SweepGradient(
+                    startAngle: -1.5708,
+                    endAngle: 4.7124,
+                    colors: [
+                      cyan,
+                      purple,
+                      deepPurple,
+                      cyan,
+                    ],
+                  ),
+                ),
+
+                // ==========================================================
+                // INNER DARK CIRCLE
+                // ==========================================================
+
+                child: Container(
+                  width: double.infinity,
+                  height: double.infinity,
+                  padding: const EdgeInsets.all(2),
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    color: background,
+                    border: Border.all(
+                      color: const Color(0xFF03050D),
+                      width: 2,
+                    ),
+                  ),
+
+                  // ========================================================
+                  // CONTENT
+                  // ========================================================
+
+                  child: ClipOval(
+                    child: Container(
+                      width: double.infinity,
+                      height: double.infinity,
+                      decoration: BoxDecoration(
+                        shape: BoxShape.circle,
+                        gradient: isNew
+                            ? const LinearGradient(
+                                begin: Alignment.topLeft,
+                                end: Alignment.bottomRight,
+                                colors: [
+                                  Color(0xFF10152A),
+                                  Color(0xFF070A14),
+                                ],
+                              )
+                            : const LinearGradient(
+                                begin: Alignment.topLeft,
+                                end: Alignment.bottomRight,
+                                colors: [
+                                  Color(0xFF15152A),
+                                  Color(0xFF080A15),
+                                ],
+                              ),
+                      ),
+                      child: Image.network(
+  imageUrl,
+  width: double.infinity,
+  height: double.infinity,
+  fit: BoxFit.cover,
+  errorBuilder: (
+    context,
+    error,
+    stackTrace,
+  ) {
+    return Container(
+      decoration: const BoxDecoration(
+        gradient: LinearGradient(
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+          colors: [
+            Color(0xFF15152A),
+            Color(0xFF080A15),
+          ],
+        ),
+      ),
+      child: Center(
+        child: Icon(
+          Icons.image_outlined,
+          color: cyan,
+          size: circleSize * 0.22,
+        ),
       ),
     );
-  }
+  },
+),
+                    ),
+                  ),
+                ),
+              ),
+
+              // ============================================================
+              // NEW MOMENT CAMERA BADGE
+              // ============================================================
+
+              if (isNew)
+                Positioned(
+                  right: circleSize * 0.075,
+                  bottom: circleSize * 0.075,
+                  child: Container(
+                    width: circleSize * 0.19,
+                    height: circleSize * 0.19,
+                    decoration: BoxDecoration(
+                      shape: BoxShape.circle,
+                      gradient: const LinearGradient(
+                        colors: [
+                          purple,
+                          cyan,
+                        ],
+                      ),
+                      border: Border.all(
+                        color: background,
+                        width: 2,
+                      ),
+                    ),
+                    child: Icon(
+                      Icons.add_rounded,
+                      color: Colors.white,
+                      size: circleSize * 0.115,
+                    ),
+                  ),
+                ),
+            ],
+          ),
+        ),
+
+        const SizedBox(height: 5),
+
+        // ================================================================
+        // MOMENT LABEL
+        // ================================================================
+
+        SizedBox(
+          width: circleSize,
+          height: 16,
+          child: Text(
+            label,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            textAlign: TextAlign.center,
+            style: const TextStyle(
+              color: Colors.white70,
+              fontSize: 8,
+              fontWeight: FontWeight.w500,
+            ),
+          ),
+        ),
+      ],
+    ),
+  );
+}
 
   // ==========================================================================
   // ACTION BUTTONS
   // ==========================================================================
 
   Widget _buildActionButtons() {
-    return Row(
+  return Padding(
+    padding: const EdgeInsets.only(
+      top: 14,
+      bottom: 1,
+    ),
+    child: Row(
       children: [
         Expanded(
           child: _actionButton(
@@ -1388,8 +1833,9 @@ class _ProfileScreenState extends State<ProfileScreen>
           ),
         ),
       ],
-    );
-  }
+    ),
+  );
+}
 
   Widget _actionButton(
     IconData icon,
@@ -1404,7 +1850,7 @@ class _ProfileScreenState extends State<ProfileScreen>
         padding:
             const EdgeInsets.symmetric(
           horizontal: 4,
-          vertical: 6,
+          vertical: 3,
         ),
         decoration: BoxDecoration(
           gradient:
@@ -1459,7 +1905,8 @@ class _ProfileScreenState extends State<ProfileScreen>
             const Text(
               'Open',
               maxLines: 1,
-              style: TextStyle(
+              style:
+                  TextStyle(
                 color: Colors.white38,
                 fontSize: 7,
               ),
@@ -1467,6 +1914,35 @@ class _ProfileScreenState extends State<ProfileScreen>
           ],
         ),
       ),
+    );
+  }
+
+  // ==========================================================================
+  // BOTTOM CONTROL AREA
+  // ==========================================================================
+
+  Widget _buildBottomControlArea() {
+    return Column(
+      children: [
+        Expanded(
+          child:
+              _buildProfessionalDashboard(),
+        ),
+
+        const SizedBox(height: 4),
+
+        Expanded(
+          child:
+              _buildIdentityControls(),
+        ),
+
+        const SizedBox(height: 4),
+
+        Expanded(
+          child:
+              _buildSaveCard(),
+        ),
+      ],
     );
   }
 
@@ -1484,7 +1960,9 @@ class _ProfileScreenState extends State<ProfileScreen>
             decoration:
                 BoxDecoration(
               borderRadius:
-                  BorderRadius.circular(12),
+                  BorderRadius.circular(
+                12,
+              ),
               gradient:
                   const LinearGradient(
                 colors: [
@@ -1499,8 +1977,7 @@ class _ProfileScreenState extends State<ProfileScreen>
               ),
             ),
             child: const Icon(
-              Icons
-                  .workspace_premium_rounded,
+              Icons.workspace_premium_rounded,
               color: cyan,
               size: 23,
             ),
@@ -1520,8 +1997,10 @@ class _ProfileScreenState extends State<ProfileScreen>
                   maxLines: 1,
                   overflow:
                       TextOverflow.ellipsis,
-                  style: TextStyle(
-                    color: Colors.white,
+                  style:
+                      TextStyle(
+                    color:
+                        Colors.white,
                     fontSize: 12,
                     fontWeight:
                         FontWeight.w700,
@@ -1533,8 +2012,10 @@ class _ProfileScreenState extends State<ProfileScreen>
                   maxLines: 1,
                   overflow:
                       TextOverflow.ellipsis,
-                  style: TextStyle(
-                    color: Colors.white54,
+                  style:
+                      TextStyle(
+                    color:
+                        Colors.white54,
                     fontSize: 8,
                   ),
                 ),
@@ -1580,7 +2061,9 @@ class _ProfileScreenState extends State<ProfileScreen>
               decoration:
                   BoxDecoration(
                 borderRadius:
-                    BorderRadius.circular(12),
+                    BorderRadius.circular(
+                  12,
+                ),
                 gradient:
                     const LinearGradient(
                   colors: [
@@ -1617,7 +2100,8 @@ class _ProfileScreenState extends State<ProfileScreen>
                         TextOverflow.ellipsis,
                     style:
                         TextStyle(
-                      color: Colors.white,
+                      color:
+                          Colors.white,
                       fontSize: 12,
                       fontWeight:
                           FontWeight.w700,
@@ -1737,9 +2221,7 @@ class _ProfileScreenState extends State<ProfileScreen>
                       size: 20,
                     ),
 
-                    const SizedBox(
-                      width: 7,
-                    ),
+                    const SizedBox(width: 7),
 
                     Text(
                       _hasChanges
@@ -1832,7 +2314,8 @@ class _ProfileScreenState extends State<ProfileScreen>
           children: [
             Text(
               'Open',
-              style: TextStyle(
+              style:
+                  TextStyle(
                 color: Colors.white,
                 fontSize: 8,
                 fontWeight:
@@ -1841,12 +2324,166 @@ class _ProfileScreenState extends State<ProfileScreen>
             ),
             SizedBox(width: 2),
             Icon(
-              Icons
-                  .chevron_right_rounded,
+              Icons.chevron_right_rounded,
               color: purple,
               size: 14,
             ),
           ],
+        ),
+      ),
+    );
+  }
+
+  // ==========================================================================
+  // HEADER
+  // ==========================================================================
+
+  Widget _buildHeader() {
+  return SizedBox(
+    height: 55,
+    child: Row(
+      children: [
+        // ================================================================
+        // BACK BUTTON
+        // ================================================================
+
+        GestureDetector(
+          onTap: () {
+            Navigator.maybePop(context);
+          },
+          child: Container(
+            width: 44,
+            height: 44,
+            decoration: BoxDecoration(
+              color: surfaceTwo,
+              borderRadius: BorderRadius.circular(14),
+              border: Border.all(
+                color: Colors.white.withValues(
+                  alpha: 0.08,
+                ),
+              ),
+            ),
+            child: const Icon(
+              Icons.arrow_back_rounded,
+              color: Colors.white70,
+              size: 24,
+            ),
+          ),
+        ),
+
+        const SizedBox(width: 10),
+
+        // ================================================================
+        // MY IDENTITY TITLE
+        // ================================================================
+
+        Expanded(
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  const Text(
+                    'My Identity',
+                    style: TextStyle(
+                      color: Colors.white,
+                      fontSize: 25,
+                      fontWeight: FontWeight.w800,
+                      letterSpacing: -0.8,
+                    ),
+                  ),
+
+                  const SizedBox(width: 3),
+
+                  ShaderMask(
+                    shaderCallback: (bounds) {
+                      return const LinearGradient(
+                        colors: [
+                          cyan,
+                          purple,
+                        ],
+                      ).createShader(bounds);
+                    },
+                    child: const Text(
+                      'X',
+                      style: TextStyle(
+                        color: Colors.white,
+                        fontSize: 27,
+                        fontWeight: FontWeight.w900,
+                        fontStyle: FontStyle.italic,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+
+              const Text(
+                'Your ChattªX universe',
+                style: TextStyle(
+                  color: Colors.white54,
+                  fontSize: 11,
+                ),
+              ),
+            ],
+          ),
+        ),
+
+        // ================================================================
+        // QR BUTTON
+        // ================================================================
+
+        _headerButton(
+          icon: Icons.qr_code_2_rounded,
+          iconColor: purple,
+          onTap: () {
+            _showMessage(
+              'ChattªX QR Identity',
+            );
+          },
+        ),
+
+        const SizedBox(width: 6),
+
+        // ================================================================
+        // MENU BUTTON
+        // ================================================================
+
+        _headerButton(
+          icon: Icons.menu_rounded,
+          iconColor: Colors.white70,
+          onTap: _showMenu,
+        ),
+      ],
+    ),
+  );
+}
+
+  Widget _headerButton({
+    required IconData icon,
+    required Color iconColor,
+    required VoidCallback onTap,
+  }) {
+    return GestureDetector(
+      onTap: onTap,
+      child: Container(
+        width: 48,
+        height: 48,
+        decoration:
+            BoxDecoration(
+          color: surfaceTwo,
+          borderRadius:
+              BorderRadius.circular(15),
+          border: Border.all(
+            color: Colors.white.withValues(
+              alpha: 0.08,
+            ),
+          ),
+        ),
+        child: Icon(
+          icon,
+          color: iconColor,
+          size: 25,
         ),
       ),
     );
@@ -1954,8 +2591,7 @@ class _ProfileScreenState extends State<ProfileScreen>
           borderRadius:
               BorderRadius.circular(15),
           border: Border.all(
-            color: Colors.white
-                .withValues(
+            color: Colors.white.withValues(
               alpha: 0.07,
             ),
           ),
@@ -1975,7 +2611,8 @@ class _ProfileScreenState extends State<ProfileScreen>
                 title,
                 style:
                     const TextStyle(
-                  color: Colors.white,
+                  color:
+                      Colors.white,
                   fontSize: 14,
                   fontWeight:
                       FontWeight.w600,
@@ -1984,8 +2621,7 @@ class _ProfileScreenState extends State<ProfileScreen>
             ),
 
             const Icon(
-              Icons
-                  .chevron_right_rounded,
+              Icons.chevron_right_rounded,
               color: Colors.white38,
             ),
           ],
@@ -2085,12 +2721,15 @@ class _ProfileScreenState extends State<ProfileScreen>
     );
   }
 
-  void _showMessage(String message) {
+  void _showMessage(
+    String message,
+  ) {
     ScaffoldMessenger.of(context)
       ..hideCurrentSnackBar()
       ..showSnackBar(
         SnackBar(
-          content: Text(message),
+          content:
+              Text(message),
           backgroundColor:
               surfaceTwo,
           behavior:
@@ -2102,7 +2741,9 @@ class _ProfileScreenState extends State<ProfileScreen>
           shape:
               RoundedRectangleBorder(
             borderRadius:
-                BorderRadius.circular(14),
+                BorderRadius.circular(
+              14,
+            ),
           ),
         ),
       );
@@ -2362,7 +3003,9 @@ class _RealProfileEditorState
     }
   }
 
-  void _message(String text) {
+  void _message(
+    String text,
+  ) {
     ScaffoldMessenger.of(context)
       ..hideCurrentSnackBar()
       ..showSnackBar(
@@ -2379,15 +3022,13 @@ class _RealProfileEditorState
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: background,
-      resizeToAvoidBottomInset: true,
+      backgroundColor:
+          background,
+      resizeToAvoidBottomInset:
+          true,
       body: SafeArea(
         child: Column(
           children: [
-            // ================================================================
-            // EDITOR HEADER
-            // ================================================================
-
             Padding(
               padding:
                   const EdgeInsets.fromLTRB(
@@ -2411,7 +3052,8 @@ class _RealProfileEditorState
                       height: 47,
                       decoration:
                           BoxDecoration(
-                        color: surfaceTwo,
+                        color:
+                            surfaceTwo,
                         borderRadius:
                             BorderRadius.circular(
                           15,
@@ -2425,7 +3067,8 @@ class _RealProfileEditorState
                           ),
                         ),
                       ),
-                      child: const Icon(
+                      child:
+                          const Icon(
                         Icons
                             .arrow_back_rounded,
                         color:
@@ -2434,7 +3077,9 @@ class _RealProfileEditorState
                     ),
                   ),
 
-                  const SizedBox(width: 12),
+                  const SizedBox(
+                    width: 12,
+                  ),
 
                   const Expanded(
                     child: Column(
@@ -2477,7 +3122,8 @@ class _RealProfileEditorState
                         AnimatedContainer(
                       duration:
                           const Duration(
-                        milliseconds: 200,
+                        milliseconds:
+                            200,
                       ),
                       padding:
                           const EdgeInsets
@@ -2537,12 +3183,11 @@ class _RealProfileEditorState
                               'SAVE',
                               style:
                                   TextStyle(
-                                color:
-                                    _hasChanges
-                                        ? Colors
-                                            .white
-                                        : Colors
-                                            .white30,
+                                color: _hasChanges
+                                    ? Colors
+                                        .white
+                                    : Colors
+                                        .white30,
                                 fontSize: 11,
                                 fontWeight:
                                     FontWeight
@@ -2556,10 +3201,6 @@ class _RealProfileEditorState
                 ],
               ),
             ),
-
-            // ================================================================
-            // EDITOR BODY
-            // ================================================================
 
             Expanded(
               child:
@@ -2833,8 +3474,7 @@ class _RealProfileEditorState
         borderRadius:
             BorderRadius.circular(19),
         border: Border.all(
-          color: Colors.white
-              .withValues(
+          color: Colors.white.withValues(
             alpha: 0.08,
           ),
         ),
@@ -2857,7 +3497,8 @@ class _RealProfileEditorState
                 title,
                 style:
                     const TextStyle(
-                  color: Colors.white,
+                  color:
+                      Colors.white,
                   fontSize: 13,
                   fontWeight:
                       FontWeight.w700,
@@ -2901,8 +3542,8 @@ class _RealProfileEditorState
             BorderRadius.circular(13),
         borderSide:
             BorderSide(
-          color: Colors.white
-              .withValues(
+          color:
+              Colors.white.withValues(
             alpha: 0.06,
           ),
         ),
@@ -2913,8 +3554,8 @@ class _RealProfileEditorState
             BorderRadius.circular(13),
         borderSide:
             BorderSide(
-          color: Colors.white
-              .withValues(
+          color:
+              Colors.white.withValues(
             alpha: 0.06,
           ),
         ),

@@ -53,6 +53,10 @@ class _HomeScreenState extends State<HomeScreen>
   final UserCacheService _userCache =
       UserCacheService();
 
+  final Map<String, Map<String, dynamic>> _freshUsers = {};
+
+  final Set<String> _loadingUserProfiles = <String>{};
+
   // ============================================================
   // SEARCH
   // ============================================================
@@ -92,17 +96,26 @@ class _HomeScreenState extends State<HomeScreen>
   // ============================================================
 
   @override
-  void initState() {
-    super.initState();
+void initState() {
+  super.initState();
 
-    WidgetsBinding.instance.addObserver(this);
+  WidgetsBinding.instance.addObserver(this);
 
-    _setOnlineStatus(true);
+  _setOnlineStatus(true);
 
-    _loadCachedChats();
+  _initializeHome();
+}
 
-    _loadUserCache();
-  }
+Future<void> _initializeHome() async {
+  await Future.wait([
+    _loadCachedChats(),
+    _loadUserCache(),
+  ]);
+
+  if (!mounted) return;
+
+  setState(() {});
+}
 
   // ============================================================
   // USER CACHE
@@ -117,6 +130,131 @@ class _HomeScreenState extends State<HomeScreen>
       );
     }
   }
+  // ============================================================
+// REFRESH CHAT USERS
+// ============================================================
+//
+// Loads ALL chat participants in parallel instead of one-by-one.
+//
+// This is important for the HomeScreen chat list because the
+// user's name, profile photo, online status and verification
+// status should become available together.
+//
+// ChattªX does NOT animate or delay the verification badge.
+// ============================================================
+
+Future<void> _refreshChatUsers(
+  List<QueryDocumentSnapshot> chats,
+) async {
+  final Set<String> userIds = <String>{};
+
+  // ------------------------------------------------------------
+  // COLLECT RECEIVER IDS
+  // ------------------------------------------------------------
+
+  for (final chat in chats) {
+    try {
+      final data =
+          chat.data() as Map<String, dynamic>;
+
+      final participants =
+          List<String>.from(
+        data["participants"] ?? const [],
+      );
+
+      final receiverId =
+          participants.firstWhere(
+        (id) => id != myUid,
+        orElse: () => "",
+      );
+
+      if (receiverId.isNotEmpty) {
+        userIds.add(receiverId);
+      }
+    } catch (e) {
+      debugPrint(
+        "ChattªX chat participant error: $e",
+      );
+    }
+  }
+
+  if (userIds.isEmpty) {
+    return;
+  }
+
+  // ------------------------------------------------------------
+  // LOAD ONLY PROFILES WE DON'T ALREADY HAVE
+  // ------------------------------------------------------------
+
+  final List<String> usersToLoad = userIds
+      .where(
+        (uid) => !_freshUsers.containsKey(uid),
+      )
+      .toList();
+
+  if (usersToLoad.isEmpty) {
+    return;
+  }
+
+  _loadingUserProfiles.addAll(usersToLoad);
+
+  try {
+    await Future.wait(
+      usersToLoad.map(
+        (uid) async {
+          try {
+            final snapshot =
+                await _firestore
+                    .collection("users")
+                    .doc(uid)
+                    .get();
+
+            if (!snapshot.exists) {
+              return;
+            }
+
+            final userData =
+                snapshot.data();
+
+            if (userData == null) {
+              return;
+            }
+
+            final Map<String, dynamic> profile =
+                Map<String, dynamic>.from(
+              userData,
+            );
+
+            _freshUsers[uid] = profile;
+
+            // Keep the local cache synchronized
+            // with the real Firestore profile.
+            _userCache.saveUserFast(
+  uid,
+  profile,
+);
+          } catch (e) {
+            debugPrint(
+              "ChattªX profile refresh error for $uid: $e",
+            );
+          } finally {
+            _loadingUserProfiles.remove(uid);
+          }
+        },
+      ),
+    );
+  } finally {
+    for (final uid in usersToLoad) {
+      _loadingUserProfiles.remove(uid);
+    }
+  }
+
+  if (!mounted) {
+    return;
+  }
+
+  setState(() {});
+}
 
   // ============================================================
   // CHAT CACHE
@@ -623,16 +761,15 @@ class _HomeScreenState extends State<HomeScreen>
                     children: [
                       _buildHeader(),
 
-                      const SizedBox(height: 4),
+const SizedBox(height: 6),
 
-                      _buildSearchBar(),
+_buildSearchBar(),
 
-                      const SizedBox(height: 8),
+const SizedBox(height: 6),
 
-                      Expanded(
-                        child:
-                            _buildActivityBar(),
-                      ),
+Expanded(
+  child: _buildActivityBar(),
+),
                     ],
                   ),
                 ),
@@ -797,97 +934,107 @@ class _HomeScreenState extends State<HomeScreen>
       },
     );
   }
+  
+// ============================================================
+// SEARCH BAR
+// ============================================================
 
-  // ============================================================
-  // SEARCH BAR
-  // ============================================================
-
-  Widget _buildSearchBar() {
-    return SizedBox(
-      height: 48,
-      child: Container(
-        decoration:
-            BoxDecoration(
-          color:
-              const Color(0xFF111827),
-          borderRadius:
-              BorderRadius.circular(26),
-          border: Border.all(
-            color: Colors.white10,
-          ),
+Widget _buildSearchBar() {
+  return SizedBox(
+    height: 48,
+    child: Container(
+      decoration: BoxDecoration(
+        color: const Color(0xFF111827),
+        borderRadius: BorderRadius.circular(26),
+        border: Border.all(
+          color: Colors.white10,
         ),
-        child: TextField(
-          controller:
-              _searchController,
-          onChanged:
-              _onSearchChanged,
-          style:
-              const TextStyle(
-            color: Colors.white,
+      ),
+      child: TextField(
+        controller: _searchController,
+        onChanged: _onSearchChanged,
+        style: const TextStyle(
+          color: Colors.white,
+          fontSize: 14,
+          height: 1.0,
+        ),
+        textInputAction: TextInputAction.search,
+
+        // Keeps the text and hint perfectly centered vertically.
+        textAlignVertical: TextAlignVertical.center,
+
+        decoration: InputDecoration(
+          border: InputBorder.none,
+
+          // Remove Flutter's default vertical spacing.
+          isDense: true,
+
+          // Balanced internal spacing.
+          contentPadding: const EdgeInsets.symmetric(
+            vertical: 0,
+            horizontal: 0,
           ),
-          textInputAction:
-              TextInputAction.search,
-          decoration:
-              InputDecoration(
-            border:
-                InputBorder.none,
-            hintText:
-                "Search people or conversations",
-            hintStyle:
-                const TextStyle(
-              color:
-                  Colors.white54,
-            ),
-            prefixIcon:
-                const Icon(
-              Icons.search,
-              color:
-                  Colors.white54,
-            ),
-            suffixIcon:
-                _searchController
-                        .text
-                        .isNotEmpty
-                    ? IconButton(
-                        onPressed:
-                            _clearSearch,
-                        icon:
-                            const Icon(
-                          Icons
-                              .close_rounded,
-                          color:
-                              Colors.white54,
-                        ),
-                      )
-                    : const Row(
-                        mainAxisSize:
-                            MainAxisSize.min,
+
+          hintText: "Search people or conversations",
+
+          hintStyle: const TextStyle(
+            color: Colors.white54,
+            fontSize: 14,
+            height: 1.0,
+          ),
+
+          prefixIcon: const Icon(
+            Icons.search,
+            color: Colors.white54,
+            size: 21,
+          ),
+
+          prefixIconConstraints: const BoxConstraints(
+            minWidth: 48,
+            minHeight: 48,
+          ),
+
+          suffixIcon:
+              _searchController.text.isNotEmpty
+                  ? IconButton(
+                      padding: EdgeInsets.zero,
+                      constraints: const BoxConstraints(
+                        minWidth: 48,
+                        minHeight: 48,
+                      ),
+                      onPressed: _clearSearch,
+                      icon: const Icon(
+                        Icons.close_rounded,
+                        color: Colors.white54,
+                        size: 20,
+                      ),
+                    )
+                  : const SizedBox(
+                      width: 82,
+                      height: 48,
+                      child: Row(
+                        mainAxisAlignment:
+                            MainAxisAlignment.center,
                         children: [
                           Icon(
-                            Icons
-                                .mic_none_rounded,
-                            color:
-                                Colors.white54,
+                            Icons.mic_none_rounded,
+                            color: Colors.white54,
+                            size: 20,
                           ),
-                          SizedBox(
-                            width: 10,
-                          ),
+                          SizedBox(width: 10),
                           Icon(
-                            Icons
-                                .tune_rounded,
-                            color:
-                                Colors.white54,
-                          ),
-                          SizedBox(
-                            width: 14,
+                            Icons.tune_rounded,
+                            color: Colors.white54,
+                            size: 20,
                           ),
                         ],
                       ),
-          ),
+                    ),
         ),
       ),
-    );
-  }
+    ),
+  );
+}
 
   // ============================================================
   // SEARCH RESULTS
@@ -1703,7 +1850,7 @@ class _HomeScreenState extends State<HomeScreen>
     return Padding(
       padding:
           const EdgeInsets.only(
-        top: 0,
+        top: 6,
       ),
       child: InkWell(
         borderRadius:
@@ -1861,454 +2008,405 @@ class _HomeScreenState extends State<HomeScreen>
     int allChatsCount,
   ) {
     final items = [
-      {
-        "title": "All",
-        "count": allChatsCount,
-      },
-      {
-        "title": "Unread",
-        "count": unreadChatsCount,
-      },
-      {
-        "title": "Groups",
-        "count": 2,
-      },
-    ];
+  {
+    "title": "All",
+    "count": allChatsCount,
+  },
+  {
+    "title": "Unread",
+    "count": unreadChatsCount,
+  },
+  {
+    "title": "Groups",
+    "count": 2,
+  },
+  {
+    "title": "Requests",
+    "count": 3,
+  },
+];
 
     return Container(
-      height: 46,
-      padding:
-          const EdgeInsets.symmetric(
-        horizontal: 6,
-        vertical: 3,
-      ),
-      decoration:
-          BoxDecoration(
-        borderRadius:
-            BorderRadius.circular(28),
-        border: Border.all(
-          color: Colors.white10,
-        ),
-      ),
-      child: Row(
-        mainAxisAlignment:
-            MainAxisAlignment
-                .spaceEvenly,
-        children:
-            items.map((item) {
-          final title =
-              item["title"]
-                  as String;
+  height: 46,
+  padding: const EdgeInsets.symmetric(
+    horizontal: 4,
+    vertical: 3,
+  ),
+  decoration: BoxDecoration(
+    borderRadius: BorderRadius.circular(28),
+    border: Border.all(
+      color: Colors.white10,
+    ),
+  ),
+  child: Row(
+    children: items.map((item) {
+      final title = item["title"] as String;
+      final count = item["count"] as int;
+      final selected = selectedFilter == title;
 
-          final count =
-              item["count"]
-                  as int;
-
-          final selected =
-              selectedFilter ==
-                  title;
-
-          return Expanded(
-            child: GestureDetector(
-              onTap: () {
-                setState(() {
-                  selectedFilter =
-                      title;
-                });
-              },
-              child:
-                  AnimatedContainer(
-                duration:
-                    const Duration(
-                  milliseconds: 180,
-                ),
-                margin:
-                    const EdgeInsets
-                        .symmetric(
-                  horizontal: 5,
-                ),
-                padding:
-                    const EdgeInsets
-                        .symmetric(
-                  horizontal: 4,
-                  vertical: 5,
-                ),
-                decoration:
-                    BoxDecoration(
-                  borderRadius:
-                      BorderRadius
-                          .circular(
-                    22,
+      return Expanded(
+        child: GestureDetector(
+          onTap: () {
+            setState(() {
+              selectedFilter = title;
+            });
+          },
+          child: AnimatedContainer(
+            duration: const Duration(milliseconds: 180),
+            margin: const EdgeInsets.symmetric(horizontal: 2),
+            padding: const EdgeInsets.symmetric(
+              horizontal: 2,
+              vertical: 5,
+            ),
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(22),
+              gradient: selected
+                  ? const LinearGradient(
+                      colors: [
+                        Color(0xFF8B2CF8),
+                        Color(0xFFD946EF),
+                      ],
+                    )
+                  : null,
+            ),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Flexible(
+                  child: Text(
+                    title,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    textAlign: TextAlign.center,
+                    style: TextStyle(
+                      color: selected
+                          ? Colors.white
+                          : Colors.white70,
+                      fontWeight: FontWeight.bold,
+                      fontSize: 13,
+                    ),
                   ),
-                  gradient:
-                      selected
-                          ? const LinearGradient(
-                              colors: [
-                                Color(
-                                    0xFF8B2CF8),
-                                Color(
-                                    0xFFD946EF),
-                              ],
-                            )
-                          : null,
                 ),
-                child: Row(
-                  mainAxisAlignment:
-                      MainAxisAlignment
-                          .center,
-                  children: [
-                    Flexible(
-                      child:
-                          Text(
-                        title,
-                        maxLines: 1,
-                        overflow:
-                            TextOverflow
-                                .ellipsis,
-                        style:
-                            TextStyle(
-                          color: selected
-                              ? Colors
-                                  .white
-                              : Colors
-                                  .white70,
-                          fontWeight:
-                              FontWeight
-                                  .bold,
-                          fontSize:
-                              14,
-                        ),
+
+                if (count > 0) ...[
+                  const SizedBox(width: 4),
+
+                  Container(
+                    width: 18,
+                    height: 18,
+                    alignment: Alignment.center,
+                    decoration: const BoxDecoration(
+                      color: Colors.white24,
+                      shape: BoxShape.circle,
+                    ),
+                    child: Text(
+                      "$count",
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 9,
+                        fontWeight: FontWeight.bold,
                       ),
                     ),
-
-                    if (count > 0) ...[
-                      const SizedBox(
-                        width: 5,
-                      ),
-
-                      Container(
-                        width: 18,
-                        height: 18,
-                        alignment:
-                            Alignment
-                                .center,
-                        decoration:
-                            const BoxDecoration(
-                          color:
-                              Colors
-                                  .white24,
-                          shape:
-                              BoxShape
-                                  .circle,
-                        ),
-                        child:
-                            Text(
-                          "$count",
-                          style:
-                              const TextStyle(
-                            color:
-                                Colors
-                                    .white,
-                            fontSize:
-                                9,
-                            fontWeight:
-                                FontWeight
-                                    .bold,
-                          ),
-                        ),
-                      ),
-                    ],
-                  ],
-                ),
-              ),
+                  ),
+                ],
+              ],
             ),
-          );
-        }).toList(),
-      ),
-    );
+          ),
+        ),
+      );
+    }).toList(),
+  ),
+);
   }
+
+  // ============================================================
+// EXTRACT USER PROFILE PHOTO
+// ============================================================
+
+String _extractUserPhoto(
+  Map<String, dynamic>? data,
+) {
+  if (data == null) {
+    return "";
+  }
+
+  const List<String> photoFields = [
+    "photoUrl",
+    "profilePhoto",
+    "profileImage",
+    "profileImageUrl",
+    "photoURL",
+    "avatarUrl",
+    "avatar",
+  ];
+
+  for (final field in photoFields) {
+    final value = data[field]?.toString().trim();
+
+    if (value != null &&
+        value.isNotEmpty &&
+        value != "null") {
+      return value;
+    }
+  }
+
+  return "";
+}
 
   // ============================================================
   // CHAT LIST
   // ============================================================
 
   Widget _buildChatList() {
-    if (myUid.isEmpty) {
-      return const SizedBox.shrink();
-    }
-
-    return StreamBuilder<
-        QuerySnapshot>(
-      stream: _firestore
-          .collection("chat_rooms")
-          .where(
-            "participants",
-            arrayContains:
-                myUid,
-          )
-          .orderBy(
-            "lastMessageTime",
-            descending: true,
-          )
-          .snapshots(),
-      builder:
-          (context, snapshot) {
-        if (!snapshot.hasData) {
-          if (cachedChats
-              .isNotEmpty) {
-            return _buildCachedChatList();
-          }
-
-          return const Padding(
-            padding:
-                EdgeInsets.all(30),
-            child: Center(
-              child:
-                  CircularProgressIndicator(),
-            ),
-          );
-        }
-
-        final chats =
-            snapshot.data!.docs;
-
-        allChatsCount =
-            chats.length;
-
-        int unreadTotal = 0;
-
-        for (final chat
-            in chats) {
-          final data =
-              chat.data()
-                  as Map<String,
-                      dynamic>;
-
-          unreadTotal +=
-              _readInt(
-            data[
-                "unread_$myUid"],
-          );
-        }
-
-        unreadChatsCount =
-            unreadTotal;
-
-        _saveChatsToCache(chats);
-
-        if (chats.isEmpty) {
-          return const Padding(
-            padding:
-                EdgeInsets.all(40),
-            child: Center(
-              child: Text(
-                "No conversations yet",
-                style:
-                    TextStyle(
-                  color:
-                      Colors.white54,
-                  fontSize: 15,
-                ),
-              ),
-            ),
-          );
-        }
-
-        List<QueryDocumentSnapshot>
-            visibleChats =
-            List<
-                    QueryDocumentSnapshot>.from(
-                chats);
-
-        if (selectedFilter ==
-            "Unread") {
-          visibleChats =
-              chats.where(
-            (chat) {
-              final data =
-                  chat.data()
-                      as Map<String,
-                          dynamic>;
-
-              return _readInt(
-                    data[
-                        "unread_$myUid"],
-                  ) >
-                  0;
-            },
-          ).toList();
-        }
-
-        return ListView.builder(
-          shrinkWrap: true,
-          physics:
-              const NeverScrollableScrollPhysics(),
-          itemCount:
-              visibleChats.length,
-          itemBuilder:
-              (context, index) {
-            final data =
-                visibleChats[index]
-                        .data()
-                    as Map<String,
-                        dynamic>;
-
-            final participants =
-                List<String>.from(
-              data[
-                      "participants"] ??
-                  [],
-            );
-
-            final receiverId =
-                participants.firstWhere(
-              (id) =>
-                  id != myUid,
-              orElse: () =>
-                  "",
-            );
-
-            if (receiverId.isEmpty) {
-              return const SizedBox
-                  .shrink();
-            }
-
-            final String status =
-                data[
-                        "lastMessageStatus"] ??
-                    data[
-                        "lastInfinity"] ??
-                    "sent";
-
-            final int unread =
-                _readInt(
-              data[
-                  "unread_$myUid"],
-            );
-
-            final String message =
-                (data[
-                            "lastMessage"] ??
-                        "Start chatting...")
-                    .toString();
-
-            String time = "";
-
-            if (data[
-                    "lastMessageTime"]
-                is Timestamp) {
-              time =
-                  _formatTime(
-                data[
-                    "lastMessageTime"],
-              );
-            }
-
-            return FutureBuilder<
-                DocumentSnapshot>(
-              future:
-                  _firestore
-                      .collection(
-                          "users")
-                      .doc(
-                          receiverId)
-                      .get(),
-              builder:
-                  (
-                context,
-                userSnapshot,
-              ) {
-                String name =
-                    (data[
-                                "receiverName"] ??
-                            "User")
-                        .toString();
-
-                String photo =
-                    (data[
-                                "receiverPhoto"] ??
-                            "")
-                        .toString();
-
-                bool online =
-                    false;
-
-                bool verified =
-                    false;
-
-                if (userSnapshot
-                    .hasData) {
-                  final userData =
-                      userSnapshot
-                          .data;
-
-                  if (userData !=
-                          null &&
-                      userData
-                          .exists) {
-                    final user =
-                        userData.data()
-                            as Map<
-                                String,
-                                dynamic>;
-
-                    name =
-                        (user[
-                                    "name"] ??
-                                name)
-                            .toString();
-
-                    photo =
-                        (user[
-                                    "photoUrl"] ??
-                                photo)
-                            .toString();
-
-                    online =
-                        user[
-                                "isOnline"] ==
-                            true;
-
-                    verified =
-                        user[
-                                "verified"] ==
-                            true;
-                  }
-                }
-
-                return _chatTile(
-                  receiverId,
-                  name,
-                  message,
-                  time,
-                  photo,
-                  online:
-                      online,
-                  verified:
-                      verified,
-                  unread:
-                      unread,
-                  isLastMessageMine:
-                      data[
-                              "lastSenderId"] ==
-                          myUid,
-                  delivered:
-                      status ==
-                              "delivered" ||
-                          status ==
-                              "seen",
-                  seen:
-                      status ==
-                          "seen",
-                );
-              },
-            );
-          },
-        );
-      },
-    );
+  if (myUid.isEmpty) {
+    return const SizedBox.shrink();
   }
 
+  return StreamBuilder<QuerySnapshot>(
+    stream: _firestore
+        .collection("chat_rooms")
+        .where(
+          "participants",
+          arrayContains: myUid,
+        )
+        .orderBy(
+          "lastMessageTime",
+          descending: true,
+        )
+        .snapshots(),
+    builder: (context, snapshot) {
+      // ----------------------------------------------------------
+      // FIRESTORE HAS NOT ARRIVED YET
+      // ----------------------------------------------------------
+
+      if (!snapshot.hasData) {
+        if (cachedChats.isNotEmpty) {
+          return _buildCachedChatList();
+        }
+
+        return const Padding(
+          padding: EdgeInsets.all(30),
+          child: Center(
+            child: CircularProgressIndicator(),
+          ),
+        );
+      }
+
+      final chats = snapshot.data!.docs;
+
+      allChatsCount = chats.length;
+
+      int unreadTotal = 0;
+
+      for (final chat in chats) {
+        final data =
+            chat.data() as Map<String, dynamic>;
+
+        unreadTotal += _readInt(
+          data["unread_$myUid"],
+        );
+      }
+
+      unreadChatsCount = unreadTotal;
+
+      // Save latest chat information in cache.
+      _saveChatsToCache(chats);
+
+_refreshChatUsers(chats);
+
+      // ----------------------------------------------------------
+      // NO CHATS
+      // ----------------------------------------------------------
+
+      if (chats.isEmpty) {
+        return const Padding(
+          padding: EdgeInsets.all(40),
+          child: Center(
+            child: Text(
+              "No conversations yet",
+              style: TextStyle(
+                color: Colors.white54,
+                fontSize: 15,
+              ),
+            ),
+          ),
+        );
+      }
+
+      // ----------------------------------------------------------
+      // FILTER
+      // ----------------------------------------------------------
+
+      List<QueryDocumentSnapshot> visibleChats =
+          List<QueryDocumentSnapshot>.from(chats);
+
+      if (selectedFilter == "Unread") {
+        visibleChats = chats.where((chat) {
+          final data =
+              chat.data() as Map<String, dynamic>;
+
+          return _readInt(
+                data["unread_$myUid"],
+              ) >
+              0;
+        }).toList();
+      }
+
+      // ----------------------------------------------------------
+      // BUILD CHAT LIST
+      // ----------------------------------------------------------
+
+      return ListView.builder(
+        shrinkWrap: true,
+        physics:
+            const NeverScrollableScrollPhysics(),
+        itemCount: visibleChats.length,
+        itemBuilder: (context, index) {
+          final data =
+              visibleChats[index].data()
+                  as Map<String, dynamic>;
+
+          final participants =
+              List<String>.from(
+            data["participants"] ?? [],
+          );
+
+          final receiverId =
+              participants.firstWhere(
+            (id) => id != myUid,
+            orElse: () => "",
+          );
+
+          if (receiverId.isEmpty) {
+            return const SizedBox.shrink();
+          }
+
+          // ------------------------------------------------------
+          // MESSAGE DATA
+          // ------------------------------------------------------
+
+          final String status =
+              (data["lastMessageStatus"] ??
+                      data["lastInfinity"] ??
+                      "sent")
+                  .toString();
+
+          final int unread = _readInt(
+            data["unread_$myUid"],
+          );
+
+          // ------------------------------------------------------
+// LAST MESSAGE PREVIEW
+// ------------------------------------------------------
+//
+// Frozen messages must NOT reveal their contents on the
+// HomeScreen chat preview.
+//
+
+final bool lastMessageIsFrozen =
+    data["lastMessageIsFrozen"] == true ||
+    data["isFrozen"] == true ||
+    data["lastMessageType"] == "frozen";
+
+final String message =
+    lastMessageIsFrozen
+        ? "🔒 Frozen message"
+        : (data["lastMessage"] ??
+                "Start chatting...")
+            .toString();
+
+          String time = "";
+
+          if (data["lastMessageTime"] is Timestamp) {
+            time = _formatTime(
+              data["lastMessageTime"],
+            );
+          }
+
+// ------------------------------------------------------
+// USER DATA
+// ------------------------------------------------------
+//
+// IMPORTANT:
+// The chat-room profile fields are used FIRST.
+// This means the HomeScreen can display the user's
+// name, photo, online status and verification badge
+// immediately from the chat-room snapshot.
+//
+// The local cache is only a fallback.
+//
+// Do NOT use FutureBuilder for VerifiedName.
+// Do NOT show a loading indicator for the badge.
+// ------------------------------------------------------
+
+final cachedUser =
+    _userCache.getUser(receiverId);
+
+// ======================================================
+// USER PROFILE DATA
+// ======================================================
+
+final freshUser =
+    _freshUsers[receiverId];
+
+final String name =
+    (freshUser?["name"] ??
+            cachedUser?["name"] ??
+            data["receiverName"] ??
+            "User")
+        .toString()
+        .trim();
+
+final String freshPhoto = _extractUserPhoto(freshUser);
+final String cachedPhoto = _extractUserPhoto(cachedUser);
+
+final String photo = freshPhoto.isNotEmpty
+    ? freshPhoto
+    : cachedPhoto;
+
+final bool online =
+    freshUser?["isOnline"] == true ||
+    cachedUser?["isOnline"] == true ||
+    data["receiverIsOnline"] == true;
+
+// ======================================================
+// VERIFICATION — FIRESTORE USER PROFILE ONLY
+// ======================================================
+//
+// NEVER use receiverVerified from chat_rooms.
+// NEVER assume a user is verified.
+// Only users/{receiverId}.verified == true
+// can receive the blue tick.
+//
+
+final bool verified =
+    freshUser?["verified"] == true;
+
+          // ------------------------------------------------------
+          // CHAT TILE
+          // ------------------------------------------------------
+
+          return _chatTile(
+            receiverId,
+            name,
+            message,
+            time,
+            photo,
+            online: online,
+            verified: verified,
+            unread: unread,
+            isLastMessageMine:
+                data["lastSenderId"] == myUid,
+            delivered:
+                status == "delivered" ||
+                status == "seen",
+            seen: status == "seen",
+          );
+        },
+      );
+    },
+  );
+}
   // ============================================================
   // CACHED CHAT LIST
   // ============================================================
@@ -2366,37 +2464,78 @@ class _HomeScreenState extends State<HomeScreen>
               "unread_$myUid"],
         );
 
-        tiles.add(
-          _chatTile(
-            receiverId,
-            (data[
-                        "receiverName"] ??
-                    "User")
-                .toString(),
-            (data[
-                        "lastMessage"] ??
-                    "Start chatting...")
-                .toString(),
-            time,
-            (data[
-                        "receiverPhoto"] ??
-                    "")
-                .toString(),
-            unread: unread,
-            isLastMessageMine:
-                data[
-                        "lastSenderId"] ==
-                    myUid,
-            delivered:
-                status ==
-                        "delivered" ||
-                    status ==
-                        "seen",
-            seen:
-                status ==
-                    "seen",
-          ),
-        );
+// ------------------------------------------------------
+// CACHED USER DATA
+// ------------------------------------------------------
+//
+// Chat-room data is preferred because it is already
+// available with the cached conversation.
+//
+// Local user cache is only the fallback.
+// ------------------------------------------------------
+
+final cachedUser =
+    _userCache.getUser(receiverId);
+
+// NAME
+final String name =
+    (data["receiverName"] ??
+            cachedUser?["name"] ??
+            "User")
+        .toString()
+        .trim();
+
+// PHOTO
+final String freshPhoto =
+    _extractUserPhoto(_freshUsers[receiverId]);
+
+final String cachedPhoto =
+    _extractUserPhoto(cachedUser);
+
+final String photo = freshPhoto.isNotEmpty
+    ? freshPhoto
+    : cachedPhoto;
+
+// ONLINE
+final bool online =
+    data["receiverIsOnline"] == true ||
+    cachedUser?["isOnline"] == true;
+
+// VERIFIED
+final bool verified =
+    _freshUsers[receiverId]?["verified"] == true;
+
+final bool lastMessageIsFrozen =
+    data["lastMessageIsFrozen"] == true ||
+    data["isFrozen"] == true ||
+    data["lastMessageType"] == "frozen";
+
+final String previewMessage =
+    lastMessageIsFrozen
+        ? "🔒 Frozen message"
+        : (data["lastMessage"] ??
+                "Start chatting...")
+            .toString();
+
+tiles.add(
+  _chatTile(
+    receiverId,
+    name,
+    previewMessage,
+    time,
+    photo,
+    online: online,
+    verified: verified,
+    unread: unread,
+    isLastMessageMine:
+        data["lastSenderId"] == myUid,
+    delivered:
+        status == "delivered" ||
+        status == "seen",
+    seen:
+        status == "seen",
+  ),
+);
       } catch (e) {
         debugPrint(
           "ChattªX cached chat error: $e",

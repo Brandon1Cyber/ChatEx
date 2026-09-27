@@ -2,92 +2,23 @@ import 'dart:async';
 
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:uuid/uuid.dart';
 
 /// ============================================================================
-/// CHATTªX CALL SERVICE
-/// ============================================================================
-///
-/// FIRESTORE
-///
-/// calls/{callId}
-///   callerId
-///   receiverId
-///   type
-///   status
-///   createdAt
-///   clientCreatedAt
-///   answeredAt
-///   connectedAt
-///   endedAt
-///   offer
-///   answer
-///
-/// calls/{callId}/callerCandidates/{candidateId}
-/// calls/{callId}/receiverCandidates/{candidateId}
-///
-/// IMPORTANT:
-///
-/// The service automatically watches FirebaseAuth.authStateChanges().
-/// Once a user is authenticated, the incoming-call Firestore listener starts.
-///
-/// CALLER:
-///   startCall()
-///      ↓
-///   create PeerConnection
-///      ↓
-///   create local media
-///      ↓
-///   create OFFER
-///      ↓
-///   setLocalDescription
-///      ↓
-///   create Firestore call
-///      ↓
-///   status = ringing
-///      ↓
-///   receiver detects call
-///
-/// RECEIVER:
-///   incoming listener
-///      ↓
-///   IncomingVoiceCallScreen
-///      ↓
-///   acceptCall()
-///      ↓
-///   status = connecting
-///      ↓
-///   create PeerConnection
-///      ↓
-///   get local media
-///      ↓
-///   apply OFFER
-///      ↓
-///   create ANSWER
-///      ↓
-///   write ANSWER
-///
-/// CALLER:
-///   receives ANSWER
-///      ↓
-///   setRemoteDescription
-///      ↓
-///   ICE connection
-///      ↓
-///   connected
-///
-/// Navigation is intentionally NOT performed inside this service.
-/// The IncomingVoiceCallScreen must navigate to VoiceCallScreen after
-/// acceptCall(callId) completes successfully.
-///
+/// CHATTªX CALL TYPES
 /// ============================================================================
 
 enum ChattaxCallType {
   audio,
   video,
 }
+
+/// ============================================================================
+/// CHATTªX CALL STATUS
+/// ============================================================================
 
 enum ChattaxCallStatus {
   calling,
@@ -100,7 +31,21 @@ enum ChattaxCallStatus {
 }
 
 /// ============================================================================
-/// CALL MODEL
+/// CALL STATUS EVENT
+/// ============================================================================
+
+class ChattaxCallStatusEvent {
+  final String callId;
+  final ChattaxCallStatus status;
+
+  const ChattaxCallStatusEvent({
+    required this.callId,
+    required this.status,
+  });
+}
+
+/// ============================================================================
+/// CHATTªX CALL MODEL
 /// ============================================================================
 
 class ChattaxCall {
@@ -128,23 +73,23 @@ class ChattaxCall {
     String callId,
     Map<String, dynamic> data,
   ) {
-    final typeValue =
+    final typeString =
         (data['type'] ?? 'audio').toString().toLowerCase();
 
-    final statusValue =
+    final statusString =
         (data['status'] ?? 'calling').toString().toLowerCase();
 
     DateTime? createdAt;
 
-    final timestamp = data['createdAt'];
+    final createdValue = data['createdAt'];
 
-    if (timestamp is Timestamp) {
-      createdAt = timestamp.toDate();
+    if (createdValue is Timestamp) {
+      createdAt = createdValue.toDate();
     } else {
-      final clientTimestamp = data['clientCreatedAt'];
+      final clientCreatedValue = data['clientCreatedAt'];
 
-      if (clientTimestamp is Timestamp) {
-        createdAt = clientTimestamp.toDate();
+      if (clientCreatedValue is Timestamp) {
+        createdAt = clientCreatedValue.toDate();
       }
     }
 
@@ -152,19 +97,18 @@ class ChattaxCall {
       callId: callId,
       callerId: (data['callerId'] ?? '').toString(),
       receiverId: (data['receiverId'] ?? '').toString(),
-      type: typeValue == 'video'
+      type: typeString == 'video'
           ? ChattaxCallType.video
           : ChattaxCallType.audio,
-      status: _statusFromString(statusValue),
+      status: _statusFromString(statusString),
       createdAt: createdAt,
     );
   }
 
-  static ChattaxCallStatus _statusFromString(String value) {
+  static ChattaxCallStatus _statusFromString(
+    String value,
+  ) {
     switch (value) {
-      case 'calling':
-        return ChattaxCallStatus.calling;
-
       case 'ringing':
         return ChattaxCallStatus.ringing;
 
@@ -183,6 +127,7 @@ class ChattaxCall {
       case 'failed':
         return ChattaxCallStatus.failed;
 
+      case 'calling':
       default:
         return ChattaxCallStatus.calling;
     }
@@ -214,13 +159,32 @@ class ChattaxTurnConfig {
 }
 
 /// ============================================================================
-/// CALL SERVICE
+/// CHATTªX CALL SERVICE
+///
+/// Firestore signaling:
+///
+/// CALLER
+///   calling
+///      ↓
+/// RECEIVER DETECTS
+///   ringing
+///      ↓
+/// RECEIVER ACCEPTS
+///   connecting
+///      ↓
+/// BOTH PEERS NEGOTIATE
+///      ↓
+///   connected
+///
+/// WebRTC peer connections are owned ONLY by this singleton.
+/// UI screens never create their own peer connection.
 /// ============================================================================
 
 class ChattaxCallService {
   ChattaxCallService._() {
-    _startAuthListener();
-  }
+  _configureMeteredTurn();
+  _startAuthListener();
+}
 
   static final ChattaxCallService instance =
       ChattaxCallService._();
@@ -229,29 +193,51 @@ class ChattaxCallService {
       FirebaseFirestore.instance;
 
   final FirebaseAuth _auth =
-      FirebaseAuth.instance;
+    FirebaseAuth.instance;
 
-  final Uuid _uuid =
-      const Uuid();
+/// ==========================================================================
+/// CURRENT USER
+/// ==========================================================================
 
-  /// Optional TURN configuration.
-  ChattaxTurnConfig? turnConfig;
+String get currentUserId {
+  return _auth.currentUser?.uid ?? '';
+}
 
-  /// Outgoing call timeout.
+void _configureMeteredTurn() {
+  configureTurn(
+    username: '078a4ea70c8bf425cc275690',
+    credential: 'qPiPTZcJrzOAevMm',
+    urls: <String>[
+      'turn:global.relay.metered.ca:80',
+      'turn:global.relay.metered.ca:80?transport=tcp',
+      'turn:global.relay.metered.ca:443',
+      'turns:global.relay.metered.ca:443?transport=tcp',
+    ],
+  );
+}
+
+final Uuid _uuid =
+    const Uuid();
+
+  /// ==========================================================================
+  /// TIMING
+  /// ==========================================================================
+
   static const Duration outgoingCallTimeout =
-      Duration(seconds: 45);
+      Duration(seconds: 60);
 
-  /// Incoming calls older than this are automatically expired.
   static const Duration incomingCallMaxAge =
       Duration(seconds: 60);
 
-  /// Temporary WebRTC disconnect tolerance.
+  static const Duration connectionTimeout =
+      Duration(seconds: 45);
+
   static const Duration disconnectGracePeriod =
       Duration(seconds: 12);
 
-  /// ========================================================================
-  /// WEBRTC STATE
-  /// ========================================================================
+  /// ==========================================================================
+  /// WEBRTC
+  /// ==========================================================================
 
   RTCPeerConnection? _peerConnection;
 
@@ -259,9 +245,22 @@ class ChattaxCallService {
 
   MediaStream? _remoteStream;
 
-  /// ========================================================================
-  /// ACTIVE CALL
-  /// ========================================================================
+// ==========================================================================
+// GROUP CALL STATE
+// ==========================================================================
+
+final Map<String, RTCPeerConnection> _groupPeerConnections =
+    <String, RTCPeerConnection>{};
+
+final Map<String, MediaStream> _groupRemoteStreams =
+    <String, MediaStream>{};
+
+final Set<String> _groupParticipantIds =
+    <String>{};
+
+String? _groupCallId;
+
+bool _isGroupCall = false;
 
   String? _activeCallId;
 
@@ -295,34 +294,64 @@ class ChattaxCallService {
 
   bool _acceptInProgress = false;
 
-  /// ========================================================================
+  bool _connectionTimerStarted = false;
+
+  /// ==========================================================================
+  /// TURN
+  /// ==========================================================================
+
+  ChattaxTurnConfig? turnConfig;
+
+  /// ==========================================================================
   /// TIMERS
-  /// ========================================================================
+  /// ==========================================================================
 
   Timer? _outgoingCallTimer;
 
+  Timer? _connectionTimer;
+
   Timer? _disconnectTimer;
 
-  /// ========================================================================
-  /// AUTH LISTENER
-  /// ========================================================================
+  /// ==========================================================================
+  /// AUTH
+  /// ==========================================================================
 
   StreamSubscription<User?>? _authSubscription;
 
-  /// ========================================================================
-  /// INCOMING CALL STATE
-  /// ========================================================================
+  /// ==========================================================================
+  /// INCOMING CALL
+  /// ==========================================================================
 
-  final Set<String> _announcedIncomingCalls =
-      <String>{};
+  StreamSubscription<
+      QuerySnapshot<Map<String, dynamic>>>?
+      _incomingCallsSubscription;
 
   bool _incomingListenerStarted = false;
 
   String? _incomingListenerUid;
 
-  /// ========================================================================
-  /// ICE STATE
-  /// ========================================================================
+  final Set<String> _announcedIncomingCalls =
+      <String>{};
+
+  /// ==========================================================================
+  /// FIRESTORE SIGNALING LISTENERS
+  /// ==========================================================================
+
+  StreamSubscription<
+      DocumentSnapshot<Map<String, dynamic>>>?
+      _callSubscription;
+
+  StreamSubscription<
+      QuerySnapshot<Map<String, dynamic>>>?
+      _callerCandidatesSubscription;
+
+  StreamSubscription<
+      QuerySnapshot<Map<String, dynamic>>>?
+      _receiverCandidatesSubscription;
+
+  /// ==========================================================================
+  /// ICE
+  /// ==========================================================================
 
   final List<RTCIceCandidate>
       _pendingLocalCandidates =
@@ -340,29 +369,9 @@ class ChattaxCallService {
       _sentLocalCandidateKeys =
       <String>{};
 
-  /// ========================================================================
-  /// FIRESTORE LISTENERS
-  /// ========================================================================
-
-  StreamSubscription<
-          DocumentSnapshot<Map<String, dynamic>>>?
-      _callSubscription;
-
-  StreamSubscription<
-          QuerySnapshot<Map<String, dynamic>>>?
-      _callerCandidatesSubscription;
-
-  StreamSubscription<
-          QuerySnapshot<Map<String, dynamic>>>?
-      _receiverCandidatesSubscription;
-
-  StreamSubscription<
-          QuerySnapshot<Map<String, dynamic>>>?
-      _incomingCallsSubscription;
-
-  /// ========================================================================
+  /// ==========================================================================
   /// STREAM CONTROLLERS
-  /// ========================================================================
+  /// ==========================================================================
 
   final StreamController<ChattaxCall>
       _incomingCallController =
@@ -372,6 +381,10 @@ class ChattaxCallService {
       _callStatusController =
       StreamController<ChattaxCallStatus>.broadcast();
 
+  final StreamController<ChattaxCallStatusEvent>
+      _callStatusEventController =
+      StreamController<ChattaxCallStatusEvent>.broadcast();
+
   final StreamController<MediaStream?>
       _remoteStreamController =
       StreamController<MediaStream?>.broadcast();
@@ -380,11 +393,13 @@ class ChattaxCallService {
       _localStreamController =
       StreamController<MediaStream?>.broadcast();
 
-  /// ========================================================================
+  /// ==========================================================================
   /// PUBLIC STREAMS
-  /// ========================================================================
+  /// ==========================================================================
 
   Stream<ChattaxCall> get incomingCalls {
+    _ensureNotDisposed();
+
     _ensureIncomingListener();
 
     return _incomingCallController.stream;
@@ -396,18 +411,19 @@ class ChattaxCallService {
   Stream<ChattaxCallStatus> get callStatus =>
       _callStatusController.stream;
 
+  Stream<ChattaxCallStatusEvent>
+      get callStatusEvents =>
+          _callStatusEventController.stream;
+
   Stream<MediaStream?> get remoteStream =>
       _remoteStreamController.stream;
 
   Stream<MediaStream?> get localStream =>
       _localStreamController.stream;
 
-  /// ========================================================================
+  /// ==========================================================================
   /// PUBLIC STATE
-  /// ========================================================================
-
-  String? get callId =>
-      _activeCallId;
+  /// ==========================================================================
 
   String? get activeCallId =>
       _activeCallId;
@@ -415,47 +431,52 @@ class ChattaxCallService {
   ChattaxCallType? get activeCallType =>
       _activeCallType;
 
-  MediaStream? get currentLocalStream =>
-      _localStream;
+  bool get isInCall =>
+      _activeCallId != null;
 
-  MediaStream? get currentRemoteStream =>
-      _remoteStream;
+bool get isGroupCall =>
+    _isGroupCall;
 
-  bool get isMicrophoneMuted =>
-      _microphoneMuted;
+String? get groupCallId =>
+    _groupCallId;
 
-  bool get isCameraEnabled =>
-      _cameraEnabled;
-
-  bool get isSpeakerEnabled =>
-      _speakerEnabled;
+Map<String, MediaStream> get groupRemoteStreams =>
+    Map.unmodifiable(
+      _groupRemoteStreams,
+    );
 
   bool get isCaller =>
       _isCaller;
 
-  bool get hasActiveCall =>
-      _activeCallId != null;
+  bool get isMicrophoneMuted =>
+      _microphoneMuted;
 
-  String? get currentUserId =>
-      _auth.currentUser?.uid;
+  bool get isSpeakerEnabled =>
+      _speakerEnabled;
 
-  /// ========================================================================
-  /// AUTHENTICATION LISTENER
-  /// ========================================================================
+  bool get isCameraEnabled =>
+      _cameraEnabled;
+
+  MediaStream? get currentRemoteStream =>
+      _remoteStream;
+
+  MediaStream? get currentLocalStream =>
+      _localStream;
+
+  RTCPeerConnection? get peerConnection =>
+      _peerConnection;
+
+  /// ==========================================================================
+  /// AUTH LISTENER
+  /// ==========================================================================
 
   void _startAuthListener() {
     _authSubscription =
         _auth.authStateChanges().listen(
       (User? user) {
-        if (_isDisposed) {
-          return;
-        }
+        final uid = user?.uid;
 
-        if (user == null) {
-          _log(
-            'AUTH: user signed out',
-          );
-
+        if (uid == null || uid.isEmpty) {
           unawaited(
             _stopIncomingListener(),
           );
@@ -463,459 +484,59 @@ class ChattaxCallService {
           return;
         }
 
-        _log(
-          'AUTH: user authenticated UID=${user.uid}',
-        );
+        if (_incomingListenerUid == uid &&
+            _incomingListenerStarted) {
+          return;
+        }
 
-        unawaited(
-          initializeIncomingCallListener(),
-        );
+        _incomingListenerUid = uid;
+
+        _ensureIncomingListener();
       },
       onError: (
         Object error,
         StackTrace stackTrace,
       ) {
         _logError(
-          'AUTH STATE LISTENER ERROR',
+          'AUTH LISTENER ERROR',
           error,
           stackTrace,
         );
       },
     );
-
-    final existingUser =
-        _auth.currentUser;
-
-    if (existingUser != null) {
-      unawaited(
-        initializeIncomingCallListener(),
-      );
-    }
   }
 
-  /// ========================================================================
-  /// PUBLIC INITIALIZATION
-  /// ========================================================================
-
-  Future<void>
-      initializeIncomingCallListener() async {
-    _ensureNotDisposed();
-
-    final uid =
-        currentUserId;
-
-    if (uid == null) {
-      _log(
-        'INCOMING INIT: no authenticated user.',
-      );
-
-      return;
-    }
-
-    _log(
-      'INCOMING INIT: UID=$uid',
-    );
-
-    await _startIncomingListener(
-      uid,
-    );
-  }
-
-  /// ========================================================================
-  /// START AUDIO CALL
-  /// ========================================================================
-
-  Future<ChattaxCall?> startAudioCall(
-    String receiverId,
-  ) {
-    return startCall(
-      receiverId: receiverId,
-      type: ChattaxCallType.audio,
-    );
-  }
-
-  /// ========================================================================
-  /// START VIDEO CALL
-  /// ========================================================================
-
-  Future<ChattaxCall?> startVideoCall(
-    String receiverId,
-  ) {
-    return startCall(
-      receiverId: receiverId,
-      type: ChattaxCallType.video,
-    );
-  }
-
-  /// ========================================================================
-  /// START CALL
-  /// ========================================================================
-
-  Future<ChattaxCall?> startCall({
-    required String receiverId,
-    required ChattaxCallType type,
-  }) async {
-    _ensureNotDisposed();
-
-    final callerId =
-        currentUserId;
-
-    _log(
-      '==================================================',
-    );
-
-    _log(
-      'START CALL',
-    );
-
-    _log(
-      'caller=$callerId',
-    );
-
-    _log(
-      'receiver=$receiverId',
-    );
-
-    _log(
-      'type=$type',
-    );
-
-    _log(
-      '==================================================',
-    );
-
-    if (callerId == null) {
-      throw Exception(
-        'You must be signed in to make a call.',
-      );
-    }
-
-    final cleanedReceiverId =
-        receiverId.trim();
-
-    if (cleanedReceiverId.isEmpty) {
-      throw Exception(
-        'Receiver ID cannot be empty.',
-      );
-    }
-
-    if (callerId == cleanedReceiverId) {
-      throw Exception(
-        'You cannot call yourself.',
-      );
-    }
-
-    if (hasActiveCall) {
-      throw Exception(
-        'You are already in a call.',
-      );
-    }
-
-    await _requestPermissions(
-      type,
-    );
-
-    await _prepareForNewCall();
-
-    final newCallId =
-        _uuid.v4();
-
-    _activeCallId =
-        newCallId;
-
-    _activeCallType =
-        type;
-
-    _isCaller =
-        true;
-
-    final callRef =
-        _firestore
-            .collection('calls')
-            .doc(newCallId);
-
-    try {
-      /// --------------------------------------------------------------------
-      /// PEER CONNECTION
-      /// --------------------------------------------------------------------
-
-      _log(
-        'CALLER: creating PeerConnection...',
-      );
-
-      await _createPeerConnection();
-
-      /// --------------------------------------------------------------------
-      /// LOCAL MEDIA
-      /// --------------------------------------------------------------------
-
-      _log(
-        'CALLER: creating local media...',
-      );
-
-      await _createLocalStream(
-        type,
-      );
-
-      final peerConnection =
-          _peerConnection;
-
-      if (peerConnection == null) {
-        throw Exception(
-          'Unable to create peer connection.',
-        );
-      }
-
-      /// --------------------------------------------------------------------
-      /// OFFER
-      /// --------------------------------------------------------------------
-
-      _log(
-        'CALLER: creating OFFER...',
-      );
-
-      final offer =
-          await peerConnection.createOffer(
-        <String, dynamic>{
-          'offerToReceiveAudio': true,
-          'offerToReceiveVideo':
-              type == ChattaxCallType.video,
-        },
-      );
-
-      _log(
-        'CALLER: OFFER CREATED '
-        'type=${offer.type} '
-        'sdpLength=${offer.sdp?.length ?? 0}',
-      );
-
-      await peerConnection.setLocalDescription(
-        offer,
-      );
-
-      _log(
-        'CALLER: LOCAL OFFER SET',
-      );
-
-      /// --------------------------------------------------------------------
-      /// FIRESTORE CALL
-      /// --------------------------------------------------------------------
-
-      final now =
-          Timestamp.now();
-
-      await callRef.set(
-        <String, dynamic>{
-          'callerId':
-              callerId,
-          'receiverId':
-              cleanedReceiverId,
-          'type':
-              type == ChattaxCallType.video
-                  ? 'video'
-                  : 'audio',
-          'status':
-              'ringing',
-          'createdAt':
-              FieldValue.serverTimestamp(),
-          'clientCreatedAt':
-              now,
-          'offer':
-              <String, dynamic>{
-            'type':
-                offer.type,
-            'sdp':
-                offer.sdp,
-          },
-        },
-      );
-
-      _log(
-        'CALLER: FIRESTORE CALL CREATED',
-      );
-
-      _log(
-        'CALLER: callId=$newCallId',
-      );
-
-      /// Signaling is now ready because the call document exists.
-      _signalingReady =
-          true;
-
-      await _flushPendingLocalCandidates();
-
-      /// --------------------------------------------------------------------
-      /// LISTEN FOR CALL DOCUMENT
-      /// --------------------------------------------------------------------
-
-      _listenToCallDocument(
-        newCallId,
-      );
-
-      /// --------------------------------------------------------------------
-      /// LISTEN FOR RECEIVER ICE
-      /// --------------------------------------------------------------------
-
-      _listenForReceiverCandidates(
-        newCallId,
-      );
-
-      /// --------------------------------------------------------------------
-      /// TIMEOUT
-      /// --------------------------------------------------------------------
-
-      _startOutgoingCallTimeout(
-        newCallId,
-      );
-
-      _emitStatus(
-        ChattaxCallStatus.ringing,
-      );
-
-      _log(
-        '==================================================',
-      );
-
-      _log(
-        '📞 CALL IS NOW RINGING',
-      );
-
-      _log(
-        'callId=$newCallId',
-      );
-
-      _log(
-        'receiver=$cleanedReceiverId',
-      );
-
-      _log(
-        '==================================================',
-      );
-
-      return ChattaxCall(
-        callId:
-            newCallId,
-        callerId:
-            callerId,
-        receiverId:
-            cleanedReceiverId,
-        type:
-            type,
-        status:
-            ChattaxCallStatus.ringing,
-        createdAt:
-            now.toDate(),
-      );
-    } catch (error, stackTrace) {
-      _logError(
-        'START CALL FAILED',
-        error,
-        stackTrace,
-      );
-
-      await _safeMarkCallFailed(
-        newCallId,
-      );
-
-      await _cleanupCall();
-
-      rethrow;
-    }
-  }
-
-  /// ========================================================================
-  /// PREPARE NEW CALL
-  /// ========================================================================
-
-  Future<void> _prepareForNewCall() async {
-    if (_activeCallId != null ||
-        _peerConnection != null ||
-        _localStream != null) {
-      _log(
-        'Preparing for new call: cleaning old state.',
-      );
-
-      await _cleanupCall();
-    }
-
-    _resetCallState();
-  }
-
-  /// ========================================================================
-  /// INCOMING CALL LISTENER
-  /// ========================================================================
+  /// ==========================================================================
+  /// INCOMING LISTENER
+  /// ==========================================================================
 
   void _ensureIncomingListener() {
     if (_isDisposed) {
       return;
     }
 
-    final uid =
-        currentUserId;
+    final user = _auth.currentUser;
 
-    if (uid == null) {
-      _log(
-        'INCOMING: waiting for authentication.',
-      );
-
+    if (user == null) {
       return;
     }
 
+    final uid = user.uid;
+
     if (_incomingListenerStarted &&
-        _incomingListenerUid == uid &&
-        _incomingCallsSubscription != null) {
+        _incomingListenerUid == uid) {
       return;
     }
 
     unawaited(
-      _startIncomingListener(
-        uid,
-      ),
-    );
-  }
-
-  Future<void> _startIncomingListener(
-    String uid,
-  ) async {
-    if (_isDisposed) {
-      return;
-    }
-
-    if (_incomingListenerStarted &&
-        _incomingListenerUid == uid &&
-        _incomingCallsSubscription != null) {
-      _log(
-        'INCOMING: listener already active.',
-      );
-
-      return;
-    }
-
-    await _incomingCallsSubscription?.cancel();
-
-    _incomingCallsSubscription =
-        null;
-
-    _incomingListenerStarted =
-        true;
-
-    _incomingListenerUid =
-        uid;
-
-    _log(
-      '==================================================',
+      _stopIncomingListener(),
     );
 
-    _log(
-      '📲 INCOMING CALL LISTENER ACTIVE',
-    );
+    _incomingListenerUid = uid;
+    _incomingListenerStarted = true;
 
     _log(
-      'UID=$uid',
-    );
-
-    _log(
-      '==================================================',
+      'INCOMING LISTENER STARTED | uid=$uid',
     );
 
     _incomingCallsSubscription =
@@ -927,21 +548,15 @@ class ChattaxCallService {
             )
             .where(
               'status',
-              isEqualTo: 'ringing',
+              isEqualTo: 'calling',
             )
             .snapshots()
             .listen(
       (snapshot) {
-        _log(
-          'INCOMING: Firestore snapshot '
-          '${snapshot.docs.length} ringing call(s)',
-        );
-
         for (final doc in snapshot.docs) {
           unawaited(
-            _processIncomingCallDocument(
+            _handleIncomingCallDocument(
               doc,
-              uid,
             ),
           );
         }
@@ -951,19 +566,10 @@ class ChattaxCallService {
         StackTrace stackTrace,
       ) {
         _logError(
-          'INCOMING LISTENER ERROR',
+          'INCOMING CALL LISTENER ERROR',
           error,
           stackTrace,
         );
-
-        _incomingListenerStarted =
-            false;
-
-        _incomingListenerUid =
-            null;
-
-        _incomingCallsSubscription =
-            null;
       },
     );
   }
@@ -971,313 +577,342 @@ class ChattaxCallService {
   Future<void> _stopIncomingListener() async {
     await _incomingCallsSubscription?.cancel();
 
-    _incomingCallsSubscription =
-        null;
+    _incomingCallsSubscription = null;
 
-    _incomingListenerStarted =
-        false;
+    _incomingListenerStarted = false;
 
-    _incomingListenerUid =
-        null;
-
-    _announcedIncomingCalls.clear();
-
-    _log(
-      'INCOMING: listener stopped.',
-    );
+    _incomingListenerUid = null;
   }
 
-  /// ========================================================================
-  /// PROCESS INCOMING CALL
-  /// ========================================================================
-
-  Future<void> _processIncomingCallDocument(
-    QueryDocumentSnapshot<Map<String, dynamic>> doc,
-    String uid,
-  ) async {
-    try {
-      final data =
-          doc.data();
-
-      final callerId =
-          (data['callerId'] ?? '').toString();
-
-      final receiverId =
-          (data['receiverId'] ?? '').toString();
-
-      final status =
-          (data['status'] ?? '')
-              .toString()
-              .toLowerCase();
-
-      _log(
-        'INCOMING CHECK | '
-        'id=${doc.id} '
-        'caller=$callerId '
-        'receiver=$receiverId '
-        'status=$status',
-      );
-
-      if (receiverId != uid) {
-        return;
-      }
-
-      if (callerId.isEmpty) {
-        _log(
-          'INCOMING IGNORE: empty caller ID',
-        );
-
-        return;
-      }
-
-      if (callerId == uid) {
-        _log(
-          'INCOMING IGNORE: caller is current user',
-        );
-
-        return;
-      }
-
-      if (status != 'ringing') {
-        return;
-      }
-
-      /// --------------------------------------------------------------------
-      /// VALIDATE OFFER
-      /// --------------------------------------------------------------------
-
-      final offer =
-          data['offer'];
-
-      if (offer is! Map) {
-        _log(
-          'INCOMING IGNORE: no WebRTC offer.',
-        );
-
-        return;
-      }
-
-      final offerSdp =
-          offer['sdp']?.toString();
-
-      if (offerSdp == null ||
-          offerSdp.isEmpty) {
-        _log(
-          'INCOMING IGNORE: offer SDP empty.',
-        );
-
-        return;
-      }
-
-      /// --------------------------------------------------------------------
-      /// STALE CALL
-      /// --------------------------------------------------------------------
-
-      final createdTime =
-          _getCallCreatedTime(
-        data,
-      );
-
-      if (createdTime == null) {
-        _log(
-          'INCOMING IGNORE: no creation timestamp.',
-        );
-
-        return;
-      }
-
-      final age =
-          DateTime.now().difference(
-        createdTime,
-      );
-
-      if (age.isNegative &&
-          age.abs() >
-              const Duration(seconds: 10)) {
-        _log(
-          'INCOMING IGNORE: future timestamp.',
-        );
-
-        return;
-      }
-
-      if (age >
-          incomingCallMaxAge) {
-        _log(
-          'INCOMING: stale call ${doc.id}',
-        );
-
-        await _safeUpdateCallStatus(
-          doc.reference,
-          'ended',
-          includeEndedAt: true,
-        );
-
-        _announcedIncomingCalls.remove(
-          doc.id,
-        );
-
-        return;
-      }
-
-      /// --------------------------------------------------------------------
-      /// ACTIVE CALL
-      /// --------------------------------------------------------------------
-
-      if (hasActiveCall) {
-        _log(
-          'INCOMING IGNORE: already active '
-          'call=$_activeCallId',
-        );
-
-        return;
-      }
-
-      /// --------------------------------------------------------------------
-      /// DUPLICATE PROTECTION
-      /// --------------------------------------------------------------------
-
-      if (_announcedIncomingCalls.contains(
-        doc.id,
-      )) {
-        return;
-      }
-
-      _announcedIncomingCalls.add(
-        doc.id,
-      );
-
-      final call =
-          ChattaxCall.fromFirestore(
-        doc.id,
-        data,
-      );
-
-      _log(
-        '==================================================',
-      );
-
-      _log(
-        '📲 REAL INCOMING CALL',
-      );
-
-      _log(
-        'callId=${call.callId}',
-      );
-
-      _log(
-        'caller=${call.callerId}',
-      );
-
-      _log(
-        'receiver=${call.receiverId}',
-      );
-
-      _log(
-        'type=${call.type}',
-      );
-
-      _log(
-        '==================================================',
-      );
-
-      if (!_incomingCallController.isClosed) {
-        _incomingCallController.add(
-          call,
-        );
-      }
-    } catch (error, stackTrace) {
-      _logError(
-        'PROCESS INCOMING CALL FAILED',
-        error,
-        stackTrace,
-      );
-    }
-  }
-
-  /// ========================================================================
-  /// CALL CREATION TIME
-  /// ========================================================================
-
-  DateTime? _getCallCreatedTime(
-    Map<String, dynamic> data,
-  ) {
-    final clientCreatedAt =
-        data['clientCreatedAt'];
-
-    if (clientCreatedAt is Timestamp) {
-      return clientCreatedAt.toDate();
-    }
-
-    final serverCreatedAt =
-        data['createdAt'];
-
-    if (serverCreatedAt is Timestamp) {
-      return serverCreatedAt.toDate();
-    }
-
-    return null;
-  }
-
-  /// ========================================================================
+  /// ==========================================================================
   /// PUBLIC INCOMING LISTENER
-  /// ========================================================================
+  /// ==========================================================================
 
   StreamSubscription<
-          QuerySnapshot<Map<String, dynamic>>>
+      QuerySnapshot<Map<String, dynamic>>>?
       listenForIncomingCalls() {
-    _ensureNotDisposed();
-
     _ensureIncomingListener();
 
-    final subscription =
-        _incomingCallsSubscription;
-
-    if (subscription == null) {
-      throw Exception(
-        'Incoming call listener is not ready yet.',
-      );
-    }
-
-    return subscription;
+    return _incomingCallsSubscription;
   }
 
-  /// ========================================================================
-  /// ACCEPT CALL
-  /// ========================================================================
+  /// ==========================================================================
+  /// HANDLE INCOMING CALL
+  /// ==========================================================================
 
-  Future<void> acceptCall(
-    String callId,
+  Future<void> _handleIncomingCallDocument(
+    QueryDocumentSnapshot<Map<String, dynamic>> doc,
   ) async {
-    _ensureNotDisposed();
+    if (_isDisposed) {
+      return;
+    }
 
-    if (_acceptInProgress) {
+    final user = _auth.currentUser;
+
+    if (user == null) {
+      return;
+    }
+
+    final data = doc.data();
+
+    final callId = doc.id;
+
+    final receiverId =
+        (data['receiverId'] ?? '').toString();
+
+    final callerId =
+        (data['callerId'] ?? '').toString();
+
+    final status =
+        (data['status'] ?? '')
+            .toString()
+            .toLowerCase();
+
+    if (receiverId != user.uid) {
+      return;
+    }
+
+    if (callerId.isEmpty ||
+        callerId == user.uid) {
+      return;
+    }
+
+    if (status != 'calling') {
+      return;
+    }
+
+    if (_activeCallId != null &&
+        _activeCallId != callId) {
       _log(
-        'ACCEPT: already processing.',
+        'INCOMING CALL IGNORED | active call exists | $callId',
       );
 
       return;
     }
 
-    _acceptInProgress =
+    if (_announcedIncomingCalls.contains(callId)) {
+      return;
+    }
+
+    final offer = data['offer'];
+
+    if (offer is! Map) {
+      _log(
+        'INCOMING CALL IGNORED | missing offer | $callId',
+      );
+
+      return;
+    }
+
+    final offerSdp =
+        offer['sdp']?.toString();
+
+    if (offerSdp == null ||
+        offerSdp.isEmpty) {
+      _log(
+        'INCOMING CALL IGNORED | empty offer | $callId',
+      );
+
+      return;
+    }
+
+    final createdAt =
+        _getCallCreatedTime(data);
+
+    if (createdAt != null) {
+      final age =
+          DateTime.now().difference(
+        createdAt,
+      );
+
+      if (age > incomingCallMaxAge) {
+        await _safeMarkCallEnded(
+          callId,
+        );
+
+        return;
+      }
+    }
+
+    final acknowledged =
+        await _acknowledgeIncomingCall(
+      doc.reference,
+      user.uid,
+    );
+
+    if (!acknowledged) {
+      return;
+    }
+
+    _announcedIncomingCalls.add(
+      callId,
+    );
+
+    final call =
+        ChattaxCall.fromFirestore(
+      callId,
+      <String, dynamic>{
+        ...data,
+        'status': 'ringing',
+      },
+    );
+
+    _emitStatus(
+      ChattaxCallStatus.ringing,
+      callId: callId,
+    );
+
+    if (!_incomingCallController.isClosed) {
+      _incomingCallController.add(
+        call,
+      );
+    }
+
+    _log(
+      'INCOMING CALL READY | $callId',
+    );
+  }
+
+  /// ==========================================================================
+  /// ACKNOWLEDGE INCOMING CALL
+  /// ==========================================================================
+
+  Future<bool> _acknowledgeIncomingCall(
+    DocumentReference<Map<String, dynamic>>
+        callRef,
+    String receiverId,
+  ) async {
+    try {
+      return await _firestore.runTransaction(
+        (transaction) async {
+          final snapshot =
+              await transaction.get(
+            callRef,
+          );
+
+          if (!snapshot.exists) {
+            return false;
+          }
+
+          final data =
+              snapshot.data();
+
+          if (data == null) {
+            return false;
+          }
+
+          final currentReceiver =
+              (data['receiverId'] ?? '')
+                  .toString();
+
+          final currentStatus =
+              (data['status'] ?? '')
+                  .toString()
+                  .toLowerCase();
+
+          if (currentReceiver != receiverId) {
+            return false;
+          }
+
+          if (currentStatus != 'calling') {
+            return false;
+          }
+
+          transaction.update(
+            callRef,
+            <String, dynamic>{
+              'status': 'ringing',
+              'ringingAt':
+                  FieldValue.serverTimestamp(),
+            },
+          );
+
+          return true;
+        },
+      );
+    } catch (error, stackTrace) {
+      _logError(
+        'ACKNOWLEDGE INCOMING CALL FAILED',
+        error,
+        stackTrace,
+      );
+
+      return false;
+    }
+  }
+
+  /// ==========================================================================
+  /// START AUDIO CALL
+  /// ==========================================================================
+
+  Future<ChattaxCall?> startAudioCall(
+    String receiverId,
+  ) {
+    return startCall(
+      receiverId,
+      type: ChattaxCallType.audio,
+    );
+  }
+
+  /// ==========================================================================
+  /// START VIDEO CALL
+  /// ==========================================================================
+
+  Future<ChattaxCall?> startVideoCall(
+    String receiverId,
+  ) {
+    return startCall(
+      receiverId,
+      type: ChattaxCallType.video,
+    );
+  }
+
+  /// ==========================================================================
+  /// START CALL
+  /// ==========================================================================
+
+  Future<ChattaxCall?> startCall(
+    String receiverId, {
+    ChattaxCallType type =
+        ChattaxCallType.audio,
+  }) async {
+    _ensureNotDisposed();
+
+    final user =
+        _auth.currentUser;
+
+    if (user == null) {
+      throw Exception(
+        'You must be logged in to make a call.',
+      );
+    }
+
+    final callerId =
+        user.uid;
+
+    final cleanedReceiverId =
+        receiverId.trim();
+
+    if (cleanedReceiverId.isEmpty) {
+      throw Exception(
+        'Receiver ID is empty.',
+      );
+    }
+
+    if (cleanedReceiverId == callerId) {
+      throw Exception(
+        'You cannot call yourself.',
+      );
+    }
+
+    if (_activeCallId != null) {
+      throw Exception(
+        'You already have an active call.',
+      );
+    }
+
+    await _requestPermissions(
+      type,
+    );
+
+    await _prepareForNewCall();
+
+    final callId =
+        _uuid.v4();
+
+    _activeCallId =
+        callId;
+
+    _activeCallType =
+        type;
+
+    _isCaller =
         true;
 
+    _connectedReported =
+        false;
+
+    _signalingReady =
+        false;
+
+    _answerApplied =
+        false;
+
+    _remoteDescriptionSet =
+        false;
+
+    final callRef =
+        _firestore
+            .collection('calls')
+            .doc(callId);
+
     try {
-      final uid =
-          currentUserId;
-
-      if (uid == null) {
-        throw Exception(
-          'You must be signed in.',
-        );
-      }
-
       _log(
         '==================================================',
       );
 
       _log(
-        '📞 ACCEPT CALL',
+        '📞 STARTING CHATTªX CALL',
       );
 
       _log(
@@ -1285,27 +920,380 @@ class ChattaxCallService {
       );
 
       _log(
-        'receiver=$uid',
+        'caller=$callerId',
+      );
+
+      _log(
+        'receiver=$cleanedReceiverId',
+      );
+
+      _log(
+        'type=$type',
       );
 
       _log(
         '==================================================',
       );
 
-      if (hasActiveCall) {
+      /// ----------------------------------------------------------------------
+      /// PEER CONNECTION
+      /// ----------------------------------------------------------------------
+
+      await _createPeerConnection();
+
+      /// ----------------------------------------------------------------------
+      /// MICROPHONE
+      /// ----------------------------------------------------------------------
+
+      await _createLocalStream(
+        type,
+      );
+
+      final pc =
+          _peerConnection;
+
+      if (pc == null) {
         throw Exception(
-          'You are already in a call.',
+          'PeerConnection unavailable.',
+        );
+      }
+
+      /// ----------------------------------------------------------------------
+      /// OFFER
+      /// ----------------------------------------------------------------------
+
+      _log(
+        'CALLER: creating offer',
+      );
+
+      final offer =
+          await pc.createOffer(
+        <String, dynamic>{
+          'offerToReceiveAudio': true,
+          'offerToReceiveVideo':
+              type == ChattaxCallType.video,
+        },
+      );
+
+      await pc.setLocalDescription(
+        offer,
+      );
+
+      _log(
+        'CALLER: local offer applied',
+      );
+
+      /// ----------------------------------------------------------------------
+      /// CREATE FIRESTORE CALL
+      /// ----------------------------------------------------------------------
+
+      await callRef.set(
+        <String, dynamic>{
+          'callerId': callerId,
+          'receiverId': cleanedReceiverId,
+          'type': type ==
+                  ChattaxCallType.video
+              ? 'video'
+              : 'audio',
+          'status': 'calling',
+          'createdAt':
+              FieldValue.serverTimestamp(),
+          'clientCreatedAt':
+              Timestamp.now(),
+          'offer': <String, dynamic>{
+            'type': offer.type,
+            'sdp': offer.sdp,
+          },
+        },
+      );
+
+      try {
+  await _createCallHistoryMessage(
+    callId: callId,
+    callerId: callerId,
+    receiverId: cleanedReceiverId,
+    type: type,
+  );
+} catch (e) {
+  debugPrint(
+    'CHATTªX call history create failed: $e',
+  );
+}
+
+      _log(
+        'CALL DOCUMENT CREATED',
+      );
+
+      /// ----------------------------------------------------------------------
+      /// SIGNALING
+      /// ----------------------------------------------------------------------
+
+      _signalingReady =
+          true;
+
+      await _flushPendingLocalCandidates();
+
+      _listenToCallDocument(
+        callId,
+      );
+
+      _listenForReceiverCandidates(
+        callId,
+      );
+
+      _startOutgoingCallTimeout(
+        callId,
+      );
+
+      _startConnectionTimeout(
+        callId,
+      );
+
+      _emitStatus(
+        ChattaxCallStatus.calling,
+        callId: callId,
+      );
+
+      return ChattaxCall(
+        callId: callId,
+        callerId: callerId,
+        receiverId: cleanedReceiverId,
+        type: type,
+        status: ChattaxCallStatus.calling,
+        createdAt: DateTime.now(),
+      );
+    } catch (error, stackTrace) {
+      _logError(
+        'START CALL FAILED',
+        error,
+        stackTrace,
+      );
+
+      await _safeMarkCallFailed(
+  callId,
+);
+
+try {
+  await _updateCallHistoryMessage(
+    callId: callId,
+    callStatus: 'unanswered',
+  );
+} catch (e) {
+  debugPrint(
+    'CHATTªX call history failure update failed: $e',
+  );
+}
+
+_emitStatus(
+  ChattaxCallStatus.failed,
+  callId: callId,
+);
+
+      await _cleanupCall();
+
+      rethrow;
+    }
+  }
+
+/// ==========================================================================
+/// ADD PARTICIPANTS TO CURRENT CALL
+/// ==========================================================================
+///
+/// Adds one or more people to the existing call.
+///
+/// IMPORTANT:
+/// This is separate from startCall(), so the existing 1-to-1
+/// calling system remains untouched.
+///
+
+Future<void> addParticipantsToCall(
+  List<String> participantIds,
+) async {
+  _ensureNotDisposed();
+
+  final user = _auth.currentUser;
+
+  if (user == null) {
+    throw Exception(
+      'You must be logged in to add people to a call.',
+    );
+  }
+
+  if (_activeCallId == null) {
+    throw Exception(
+      'There is no active call to add people to.',
+    );
+  }
+
+  final cleanIds = participantIds
+      .map((String id) => id.trim())
+      .where((String id) => id.isNotEmpty)
+      .where((String id) => id != user.uid)
+      .toSet()
+      .toList();
+
+  if (cleanIds.isEmpty) {
+    return;
+  }
+
+  final callId = _activeCallId!;
+
+  _log(
+    '==================================================',
+  );
+
+  _log(
+    '👥 CHATTªX ADDING PEOPLE TO CALL',
+  );
+
+  _log(
+    'callId=$callId',
+  );
+
+  _log(
+    'participants=$cleanIds',
+  );
+
+  _log(
+    '==================================================',
+  );
+
+  // Mark this as a group call.
+  _isGroupCall = true;
+  _groupCallId = callId;
+
+  // Add the selected people to our local participant set.
+  _groupParticipantIds.addAll(cleanIds);
+
+  final callRef =
+      _firestore
+          .collection('calls')
+          .doc(callId);
+
+  try {
+    await callRef.update(
+      <String, dynamic>{
+        'isGroupCall': true,
+        'type': _activeCallType ==
+                ChattaxCallType.video
+            ? 'group_video'
+            : 'group_audio',
+        'participants':
+            FieldValue.arrayUnion(cleanIds),
+      },
+    );
+
+    for (final participantId in cleanIds) {
+      await callRef
+          .collection('participants')
+          .doc(participantId)
+          .set(
+        <String, dynamic>{
+          'userId': participantId,
+          'status': 'invited',
+          'invitedBy': user.uid,
+          'invitedAt':
+              FieldValue.serverTimestamp(),
+        },
+      );
+    }
+
+    // ==========================================================================
+// CREATE WEBRTC PEER + OFFER FOR EACH NEW PARTICIPANT
+// ==========================================================================
+
+for (final participantId in cleanIds) {
+  try {
+    await _createGroupPeerConnection(
+      participantId,
+    );
+
+    await _createGroupOffer(
+      participantId,
+    );
+
+    _log(
+      'GROUP INVITATION READY | '
+      'participant=$participantId',
+    );
+  } catch (error, stackTrace) {
+    _logError(
+      'GROUP PEER/OFFER CREATION FAILED | '
+      'participant=$participantId',
+      error,
+      stackTrace,
+    );
+
+    rethrow;
+  }
+}
+
+    _log(
+      'GROUP PARTICIPANTS ADDED SUCCESSFULLY',
+    );
+  } catch (error, stackTrace) {
+    _logError(
+      'ADDING GROUP PARTICIPANTS FAILED',
+      error,
+      stackTrace,
+    );
+
+    rethrow;
+  }
+}
+
+  /// ==========================================================================
+  /// ACCEPT CALL
+  /// ==========================================================================
+
+  Future<void> acceptCall(
+    String callId,
+  ) async {
+    if (_acceptInProgress) {
+      return;
+    }
+
+    _acceptInProgress =
+        true;
+
+    try {
+      _ensureNotDisposed();
+
+      final user =
+          _auth.currentUser;
+
+      if (user == null) {
+        throw Exception(
+          'You must be logged in to answer a call.',
+        );
+      }
+
+      final uid =
+          user.uid;
+
+      if (_activeCallId != null) {
+        throw Exception(
+          'Another call is already active.',
+        );
+      }
+
+      final cleanCallId =
+          callId.trim();
+
+      if (cleanCallId.isEmpty) {
+        throw Exception(
+          'Call ID is empty.',
         );
       }
 
       final callRef =
           _firestore
               .collection('calls')
-              .doc(callId);
+              .doc(cleanCallId);
 
-      /// --------------------------------------------------------------------
-      /// GET CALL
-      /// --------------------------------------------------------------------
+      /// ----------------------------------------------------------------------
+      /// READ CALL
+      /// ----------------------------------------------------------------------
 
       final snapshot =
           await callRef.get();
@@ -1321,15 +1309,17 @@ class ChattaxCallService {
 
       if (data == null) {
         throw Exception(
-          'Invalid call data.',
+          'Call data is unavailable.',
         );
       }
 
       final callerId =
-          (data['callerId'] ?? '').toString();
+          (data['callerId'] ?? '')
+              .toString();
 
       final receiverId =
-          (data['receiverId'] ?? '').toString();
+          (data['receiverId'] ?? '')
+              .toString();
 
       final status =
           (data['status'] ?? '')
@@ -1338,32 +1328,28 @@ class ChattaxCallService {
 
       if (receiverId != uid) {
         throw Exception(
-          'You are not the receiver of this call.',
+          'Receiver mismatch.',
         );
       }
 
       if (callerId.isEmpty) {
         throw Exception(
-          'Invalid caller.',
+          'Caller ID is missing.',
         );
       }
 
       if (status != 'ringing') {
         throw Exception(
-          'This call is no longer available.',
+          'This call is no longer ringing.',
         );
       }
-
-      /// --------------------------------------------------------------------
-      /// OFFER VALIDATION
-      /// --------------------------------------------------------------------
 
       final offer =
           data['offer'];
 
       if (offer is! Map) {
         throw Exception(
-          'WebRTC offer is missing.',
+          'Caller offer is missing.',
         );
       }
 
@@ -1373,31 +1359,22 @@ class ChattaxCallService {
       if (offerSdp == null ||
           offerSdp.isEmpty) {
         throw Exception(
-          'WebRTC offer SDP is missing.',
+          'Caller offer SDP is missing.',
         );
       }
 
-      /// --------------------------------------------------------------------
-      /// STALE CHECK
-      /// --------------------------------------------------------------------
+      final createdAt =
+          _getCallCreatedTime(data);
 
-      final createdTime =
-          _getCallCreatedTime(
-        data,
-      );
-
-      if (createdTime != null) {
+      if (createdAt != null) {
         final age =
             DateTime.now().difference(
-          createdTime,
+          createdAt,
         );
 
-        if (age >
-            incomingCallMaxAge) {
-          await _safeUpdateCallStatus(
-            callRef,
-            'ended',
-            includeEndedAt: true,
+        if (age > incomingCallMaxAge) {
+          await _safeMarkCallEnded(
+            cleanCallId,
           );
 
           throw Exception(
@@ -1405,77 +1382,6 @@ class ChattaxCallService {
           );
         }
       }
-
-      /// --------------------------------------------------------------------
-      /// CLAIM CALL
-      /// --------------------------------------------------------------------
-
-      await _firestore.runTransaction(
-        (transaction) async {
-          final fresh =
-              await transaction.get(
-            callRef,
-          );
-
-          if (!fresh.exists) {
-            throw Exception(
-              'Call no longer exists.',
-            );
-          }
-
-          final freshData =
-              fresh.data();
-
-          if (freshData == null) {
-            throw Exception(
-              'Invalid call data.',
-            );
-          }
-
-          final freshReceiver =
-              (freshData['receiverId'] ?? '')
-                  .toString();
-
-          final freshStatus =
-              (freshData['status'] ?? '')
-                  .toString()
-                  .toLowerCase();
-
-          if (freshReceiver != uid) {
-            throw Exception(
-              'You are not the receiver.',
-            );
-          }
-
-          if (freshStatus != 'ringing') {
-            throw Exception(
-              'This call was already answered or ended.',
-            );
-          }
-
-          transaction.update(
-            callRef,
-            <String, dynamic>{
-              'status':
-                  'connecting',
-              'answeredAt':
-                  FieldValue.serverTimestamp(),
-            },
-          );
-        },
-      );
-
-      _log(
-        'ACCEPT: call successfully claimed.',
-      );
-
-      _announcedIncomingCalls.remove(
-        callId,
-      );
-
-      /// --------------------------------------------------------------------
-      /// CALL TYPE
-      /// --------------------------------------------------------------------
 
       final typeString =
           (data['type'] ?? 'audio')
@@ -1487,14 +1393,38 @@ class ChattaxCallService {
               ? ChattaxCallType.video
               : ChattaxCallType.audio;
 
+      /// ----------------------------------------------------------------------
+      /// PERMISSIONS
+      /// ----------------------------------------------------------------------
+
       await _requestPermissions(
         type,
       );
 
+      /// ----------------------------------------------------------------------
+      /// CLAIM CALL
+      /// ----------------------------------------------------------------------
+
+      final claimed =
+          await _claimIncomingCall(
+        callRef,
+        uid,
+      );
+
+      if (!claimed) {
+        throw Exception(
+          'This call was already answered or ended.',
+        );
+      }
+
+      /// ----------------------------------------------------------------------
+      /// PREPARE
+      /// ----------------------------------------------------------------------
+
       await _prepareForNewCall();
 
       _activeCallId =
-          callId;
+          cleanCallId;
 
       _activeCallType =
           type;
@@ -1502,620 +1432,278 @@ class ChattaxCallService {
       _isCaller =
           false;
 
-      try {
-        /// ------------------------------------------------------------------
-        /// PEER CONNECTION
-        /// ------------------------------------------------------------------
+      _connectedReported =
+          false;
 
-        _log(
-          'RECEIVER: creating PeerConnection...',
+      _signalingReady =
+          false;
+
+      _remoteDescriptionSet =
+          false;
+
+      _answerApplied =
+          false;
+
+      _log(
+        '==================================================',
+      );
+
+      _log(
+        '📲 ACCEPTING CHATTªX CALL',
+      );
+
+      _log(
+        'callId=$cleanCallId',
+      );
+
+      _log(
+        'caller=$callerId',
+      );
+
+      _log(
+        '==================================================',
+      );
+
+      /// ----------------------------------------------------------------------
+      /// PEER
+      /// ----------------------------------------------------------------------
+
+      await _createPeerConnection();
+
+      /// ----------------------------------------------------------------------
+      /// CALLER ICE LISTENER
+      /// ----------------------------------------------------------------------
+
+      _listenForCallerCandidates(
+        cleanCallId,
+      );
+
+      /// ----------------------------------------------------------------------
+      /// LOCAL MICROPHONE
+      /// ----------------------------------------------------------------------
+
+      await _createLocalStream(
+        type,
+      );
+
+      /// ----------------------------------------------------------------------
+      /// REMOTE OFFER
+      /// ----------------------------------------------------------------------
+
+      await _applyRemoteOffer(
+        data,
+      );
+
+      /// ----------------------------------------------------------------------
+      /// ANSWER
+      /// ----------------------------------------------------------------------
+
+      final pc =
+          _peerConnection;
+
+      if (pc == null) {
+        throw Exception(
+          'PeerConnection unavailable.',
         );
-
-        await _createPeerConnection();
-
-        /// ------------------------------------------------------------------
-        /// LOCAL MEDIA
-        /// ------------------------------------------------------------------
-
-        _log(
-          'RECEIVER: creating local media...',
-        );
-
-        await _createLocalStream(
-          type,
-        );
-
-        /// ------------------------------------------------------------------
-        /// LISTEN FOR CALLER ICE
-        /// ------------------------------------------------------------------
-
-        _listenForCallerCandidates(
-          callId,
-        );
-
-        /// ------------------------------------------------------------------
-        /// APPLY OFFER
-        /// ------------------------------------------------------------------
-
-        _log(
-          'RECEIVER: applying OFFER...',
-        );
-
-        await _applyRemoteOffer(
-          data,
-        );
-
-        _remoteDescriptionSet =
-            true;
-
-        _log(
-          'RECEIVER: OFFER APPLIED',
-        );
-
-        await _flushPendingRemoteCandidates();
-
-        final peerConnection =
-            _peerConnection;
-
-        if (peerConnection == null) {
-          throw Exception(
-            'Peer connection unavailable.',
-          );
-        }
-
-        _emitStatus(
-          ChattaxCallStatus.connecting,
-        );
-
-        /// ------------------------------------------------------------------
-        /// CREATE ANSWER
-        /// ------------------------------------------------------------------
-
-        _log(
-          'RECEIVER: creating ANSWER...',
-        );
-
-        final answer =
-            await peerConnection.createAnswer(
-          <String, dynamic>{
-            'offerToReceiveAudio':
-                true,
-            'offerToReceiveVideo':
-                type ==
-                    ChattaxCallType.video,
-          },
-        );
-
-        _log(
-          'RECEIVER: ANSWER CREATED '
-          'type=${answer.type} '
-          'sdpLength=${answer.sdp?.length ?? 0}',
-        );
-
-        /// ------------------------------------------------------------------
-        /// LOCAL ANSWER
-        /// ------------------------------------------------------------------
-
-        await peerConnection.setLocalDescription(
-          answer,
-        );
-
-        _log(
-          'RECEIVER: LOCAL ANSWER SET',
-        );
-
-        /// ------------------------------------------------------------------
-        /// WRITE ANSWER
-        /// ------------------------------------------------------------------
-
-        await callRef.update(
-          <String, dynamic>{
-            'status':
-                'connecting',
-            'answer':
-                <String, dynamic>{
-              'type':
-                  answer.type,
-              'sdp':
-                  answer.sdp,
-            },
-          },
-        );
-
-        _log(
-          '==================================================',
-        );
-
-        _log(
-          '✅ ACCEPT COMPLETE',
-        );
-
-        _log(
-          'callId=$callId',
-        );
-
-        _log(
-          'status=connecting',
-        );
-
-        _log(
-          'ANSWER WRITTEN',
-        );
-
-        _log(
-          '==================================================',
-        );
-
-        /// ------------------------------------------------------------------
-        /// SIGNALING READY
-        /// ------------------------------------------------------------------
-
-        _signalingReady =
-            true;
-
-        await _flushPendingLocalCandidates();
-
-        _listenToCallDocument(
-          callId,
-        );
-
-        _emitStatus(
-          ChattaxCallStatus.connecting,
-        );
-
-        _log(
-          'RECEIVER: waiting for WebRTC connection.',
-        );
-      } catch (error, stackTrace) {
-        _logError(
-          'ACCEPT CALL FAILED',
-          error,
-          stackTrace,
-        );
-
-        await _safeMarkCallFailed(
-          callId,
-        );
-
-        await _cleanupCall();
-
-        rethrow;
       }
+
+      _log(
+        'RECEIVER: creating answer',
+      );
+
+      final answer =
+          await pc.createAnswer(
+        <String, dynamic>{
+          'offerToReceiveAudio': true,
+          'offerToReceiveVideo':
+              type == ChattaxCallType.video,
+        },
+      );
+
+      await pc.setLocalDescription(
+        answer,
+      );
+
+      _log(
+        'RECEIVER: local answer applied',
+      );
+
+      /// ----------------------------------------------------------------------
+      /// WRITE ANSWER
+      /// ----------------------------------------------------------------------
+
+      await callRef.update(
+        <String, dynamic>{
+          'status': 'connecting',
+          'answer': <String, dynamic>{
+            'type': answer.type,
+            'sdp': answer.sdp,
+          },
+          'answeredAt':
+              FieldValue.serverTimestamp(),
+        },
+      );
+
+      _log(
+        'RECEIVER: ANSWER WRITTEN',
+      );
+
+      _signalingReady =
+          true;
+
+      await _flushPendingLocalCandidates();
+
+      _startConnectionTimeout(
+        cleanCallId,
+      );
+
+      _emitStatus(
+        ChattaxCallStatus.connecting,
+        callId: cleanCallId,
+      );
+
+      _log(
+        'RECEIVER: WebRTC negotiation active',
+      );
+    } catch (error, stackTrace) {
+      _logError(
+        'ACCEPT CALL FAILED',
+        error,
+        stackTrace,
+      );
+
+      final currentCallId =
+          _activeCallId;
+
+      if (currentCallId != null) {
+        await _safeMarkCallFailed(
+          currentCallId,
+        );
+
+        _emitStatus(
+          ChattaxCallStatus.failed,
+          callId: currentCallId,
+        );
+      }
+
+      await _cleanupCall();
+
+      rethrow;
     } finally {
       _acceptInProgress =
           false;
     }
   }
 
-  /// ========================================================================
-  /// APPLY OFFER
-  /// ========================================================================
+  /// ==========================================================================
+  /// CLAIM INCOMING CALL
+  /// ==========================================================================
 
-  Future<void> _applyRemoteOffer(
-    Map<String, dynamic> data,
+  Future<bool> _claimIncomingCall(
+    DocumentReference<Map<String, dynamic>>
+        callRef,
+    String receiverId,
   ) async {
-    final offerData =
-        data['offer'];
-
-    if (offerData is! Map) {
-      throw Exception(
-        'No WebRTC offer found.',
-      );
-    }
-
-    final sdp =
-        offerData['sdp']?.toString();
-
-    if (sdp == null ||
-        sdp.isEmpty) {
-      throw Exception(
-        'WebRTC offer SDP is empty.',
-      );
-    }
-
-    final offer =
-        RTCSessionDescription(
-      sdp,
-      offerData['type']?.toString() ??
-          'offer',
-    );
-
-    final peerConnection =
-        _peerConnection;
-
-    if (peerConnection == null) {
-      throw Exception(
-        'Peer connection unavailable.',
-      );
-    }
-
-    await peerConnection.setRemoteDescription(
-      offer,
-    );
-
-    _log(
-      'RECEIVER: remote OFFER successfully applied.',
-    );
-  }
-
-  /// ========================================================================
-  /// REJECT CALL
-  /// ========================================================================
-
-  Future<void> rejectCall(
-    String callId,
-  ) async {
-    _ensureNotDisposed();
-
-    final uid =
-        currentUserId;
-
-    if (uid == null) {
-      return;
-    }
-
-    final callRef =
-        _firestore
-            .collection('calls')
-            .doc(callId);
-
     try {
-      final snapshot =
-          await callRef.get();
+      return await _firestore.runTransaction(
+        (transaction) async {
+          final snapshot =
+              await transaction.get(
+            callRef,
+          );
 
-      if (!snapshot.exists) {
-        return;
-      }
+          if (!snapshot.exists) {
+            return false;
+          }
 
-      final data =
-          snapshot.data();
+          final data =
+              snapshot.data();
 
-      if (data == null) {
-        return;
-      }
+          if (data == null) {
+            return false;
+          }
 
-      if (data['receiverId'] != uid) {
-        return;
-      }
+          final currentReceiver =
+              (data['receiverId'] ?? '')
+                  .toString();
 
-      final status =
-          (data['status'] ?? '')
-              .toString()
-              .toLowerCase();
+          final currentStatus =
+              (data['status'] ?? '')
+                  .toString()
+                  .toLowerCase();
 
-      if (status != 'ringing') {
-        return;
-      }
+          if (currentReceiver != receiverId) {
+            return false;
+          }
 
-      await callRef.update(
-        <String, dynamic>{
-          'status':
-              'rejected',
-          'endedAt':
-              FieldValue.serverTimestamp(),
+          if (currentStatus != 'ringing') {
+            return false;
+          }
+
+          transaction.update(
+            callRef,
+            <String, dynamic>{
+              'status': 'connecting',
+              'acceptedBy':
+                  receiverId,
+              'acceptedAt':
+                  FieldValue.serverTimestamp(),
+            },
+          );
+
+          return true;
         },
       );
-
-      _log(
-        'CALL REJECTED | $callId',
-      );
     } catch (error, stackTrace) {
       _logError(
-        'REJECT CALL FAILED',
+        'CLAIM CALL FAILED',
         error,
         stackTrace,
       );
-    }
 
-    _announcedIncomingCalls.remove(
-      callId,
-    );
-
-    if (_activeCallId == callId) {
-      _emitStatus(
-        ChattaxCallStatus.rejected,
-      );
-
-      await _cleanupCall();
-    } else {
-      _emitStatus(
-        ChattaxCallStatus.rejected,
-      );
+      return false;
     }
   }
 
-  /// ========================================================================
-  /// END CALL
-  /// ========================================================================
-
-  Future<void> endCall() async {
-    _ensureNotDisposed();
-
-    await _finishCall(
-      uiStatus:
-          ChattaxCallStatus.ended,
-      firestoreStatus:
-          'ended',
-    );
-  }
-
-  /// ========================================================================
-  /// CANCEL OUTGOING CALL
-  /// ========================================================================
-
-  Future<void> cancelCall() async {
-    _ensureNotDisposed();
-
-    if (!_isCaller) {
-      return;
-    }
-
-    await _finishCall(
-      uiStatus:
-          ChattaxCallStatus.ended,
-      firestoreStatus:
-          'ended',
-    );
-  }
-
-  Future<void> cancelOutgoingCall() async {
-    await cancelCall();
-  }
-
-  /// ========================================================================
-  /// FINISH CALL
-  /// ========================================================================
-
-  Future<void> _finishCall({
-    required ChattaxCallStatus uiStatus,
-    required String firestoreStatus,
-  }) async {
-    final currentCallId =
-        _activeCallId;
-
-    if (currentCallId == null) {
-      return;
-    }
-
-    if (_endingCall) {
-      return;
-    }
-
-    _endingCall =
-        true;
-
-    try {
-      _cancelOutgoingCallTimer();
-
-      _cancelDisconnectTimer();
-
-      try {
-        await _firestore
-            .collection('calls')
-            .doc(currentCallId)
-            .update(
-          <String, dynamic>{
-            'status':
-                firestoreStatus,
-            'endedAt':
-                FieldValue.serverTimestamp(),
-          },
-        );
-      } catch (error, stackTrace) {
-        _logError(
-          'FINISH CALL FIRESTORE UPDATE FAILED',
-          error,
-          stackTrace,
-        );
-      }
-
-      _emitStatus(
-        uiStatus,
-      );
-
-      await _cleanupCall();
-    } finally {
-      _endingCall =
-          false;
-    }
-  }
-
-  /// ========================================================================
-  /// MICROPHONE
-  /// ========================================================================
-
-  Future<void> toggleMicrophone() async {
-    await setMicrophoneMuted(
-      !_microphoneMuted,
-    );
-  }
-
-  Future<void> setMicrophoneMuted(
-    bool muted,
-  ) async {
-    _microphoneMuted =
-        muted;
-
-    final stream =
-        _localStream;
-
-    if (stream == null) {
-      return;
-    }
-
-    for (final track
-        in stream.getAudioTracks()) {
-      track.enabled =
-          !muted;
-    }
-
-    _log(
-      'MICROPHONE '
-      '${muted ? 'MUTED' : 'UNMUTED'}',
-    );
-  }
-
-  /// ========================================================================
-  /// CAMERA
-  /// ========================================================================
-
-  Future<void> toggleCamera() async {
-    await setCameraEnabled(
-      !_cameraEnabled,
-    );
-  }
-
-  Future<void> setCameraEnabled(
-    bool enabled,
-  ) async {
-    _cameraEnabled =
-        enabled;
-
-    final stream =
-        _localStream;
-
-    if (stream == null) {
-      return;
-    }
-
-    for (final track
-        in stream.getVideoTracks()) {
-      track.enabled =
-          enabled;
-    }
-
-    _log(
-      'CAMERA '
-      '${enabled ? 'ENABLED' : 'DISABLED'}',
-    );
-  }
-
-  /// ========================================================================
-  /// SWITCH CAMERA
-  /// ========================================================================
-
-  Future<void> switchCamera() async {
-    final stream =
-        _localStream;
-
-    if (stream == null) {
-      return;
-    }
-
-    final tracks =
-        stream.getVideoTracks();
-
-    if (tracks.isEmpty) {
-      return;
-    }
-
-    try {
-      await Helper.switchCamera(
-        tracks.first,
-      );
-
-      _log(
-        'CAMERA SWITCHED',
-      );
-    } catch (error, stackTrace) {
-      _logError(
-        'CAMERA SWITCH FAILED',
-        error,
-        stackTrace,
-      );
-    }
-  }
-
-  /// ========================================================================
-  /// SPEAKER
-  /// ========================================================================
-
-  Future<void> setSpeaker(
-    bool enabled,
-  ) async {
-    _speakerEnabled =
-        enabled;
-
-    try {
-      await Helper.setSpeakerphoneOn(
-        enabled,
-      );
-
-      _log(
-        'SPEAKERPHONE '
-        '${enabled ? 'ON' : 'OFF'}',
-      );
-    } catch (error, stackTrace) {
-      _logError(
-        'SPEAKERPHONE ERROR',
-        error,
-        stackTrace,
-      );
-    }
-  }
-
-  Future<void> toggleSpeaker() async {
-    await setSpeaker(
-      !_speakerEnabled,
-    );
-  }
-
-  /// ========================================================================
+  /// ==========================================================================
   /// CREATE PEER CONNECTION
-  /// ========================================================================
+  /// ==========================================================================
 
   Future<void> _createPeerConnection() async {
+    if (_peerConnection != null) {
+      return;
+    }
+
+    _log(
+      'WEBRTC: creating peer connection',
+    );
+
     final configuration =
         <String, dynamic>{
-      'iceServers':
-          _buildIceServers(),
-      'sdpSemantics':
-          'unified-plan',
-      'bundlePolicy':
-          'max-bundle',
-      'rtcpMuxPolicy':
-          'require',
-      'iceTransportPolicy':
-          'all',
+      'iceServers': _buildIceServers(),
+
+      'sdpSemantics': 'unified-plan',
+
+      'bundlePolicy': 'max-bundle',
+
+      'rtcpMuxPolicy': 'require',
+
+      'iceCandidatePoolSize': 10,
     };
 
-    _log(
-      'WEBRTC: creating PeerConnection',
+    final pc =
+        await createPeerConnection(
+      configuration,
     );
 
-    try {
-      _peerConnection =
-          await createPeerConnection(
-        configuration,
-      );
-    } catch (error, stackTrace) {
-      _logError(
-        'CREATE PEER CONNECTION FAILED',
-        error,
-        stackTrace,
-      );
+    _peerConnection =
+        pc;
 
-      rethrow;
-    }
-
-    final peerConnection =
-        _peerConnection;
-
-    if (peerConnection == null) {
-      throw Exception(
-        'createPeerConnection returned null.',
-      );
-    }
-
-    _log(
-      'WEBRTC: PeerConnection CREATED',
-    );
-
-    /// ----------------------------------------------------------------------
+    /// ------------------------------------------------------------------------
     /// LOCAL ICE
-    /// ----------------------------------------------------------------------
+    /// ------------------------------------------------------------------------
 
-    peerConnection.onIceCandidate =
+    pc.onIceCandidate =
         (RTCIceCandidate candidate) {
       final value =
           candidate.candidate;
@@ -2126,7 +1714,7 @@ class ChattaxCallService {
       }
 
       _log(
-        'LOCAL ICE GENERATED | '
+        'LOCAL ICE | '
         '${_candidateSummary(candidate)}',
       );
 
@@ -2137,193 +1725,607 @@ class ChattaxCallService {
       );
     };
 
-    /// ----------------------------------------------------------------------
+    /// ------------------------------------------------------------------------
     /// ICE GATHERING
-    /// ----------------------------------------------------------------------
+    /// ------------------------------------------------------------------------
 
-    peerConnection.onIceGatheringState =
+    pc.onIceGatheringState =
         (RTCIceGatheringState state) {
       _log(
-        'ICE GATHERING STATE = $state',
+        'ICE GATHERING = $state',
       );
     };
 
-    /// ----------------------------------------------------------------------
+    /// ------------------------------------------------------------------------
     /// REMOTE TRACK
-    /// ----------------------------------------------------------------------
+    ///
+    /// IMPORTANT:
+    /// Do NOT assume event.streams is non-empty.
+    /// Some WebRTC implementations can deliver a track without
+    /// an attached stream.
+    /// ------------------------------------------------------------------------
 
-    peerConnection.onTrack =
-        (RTCTrackEvent event) {
+    pc.onTrack =
+        (RTCTrackEvent event) async {
       _log(
         'REMOTE TRACK | '
         'kind=${event.track.kind} '
         'streams=${event.streams.length}',
       );
 
-      if (event.streams.isEmpty) {
+      try {
+        event.track.enabled =
+            true;
+      } catch (_) {}
+
+      if (event.streams.isNotEmpty) {
+        _setRemoteStream(
+          event.streams.first,
+        );
+
         return;
       }
 
-      _remoteStream =
-          event.streams.first;
+      /// ----------------------------------------------------------------------
+      /// STREAMLESS TRACK
+      /// ----------------------------------------------------------------------
 
-      if (!_isDisposed &&
-          !_remoteStreamController.isClosed) {
-        _remoteStreamController.add(
-          _remoteStream,
+      try {
+        final existing =
+            _remoteStream;
+
+        if (existing != null) {
+          await existing.addTrack(
+            event.track,
+          );
+
+          _setRemoteStream(
+            existing,
+          );
+
+          _log(
+            'REMOTE TRACK ATTACHED TO EXISTING STREAM',
+          );
+
+          return;
+        }
+
+        final created =
+            await createLocalMediaStream(
+          'chattax-remote-${_activeCallId ?? _uuid.v4()}',
+        );
+
+        await created.addTrack(
+          event.track,
+        );
+
+        _setRemoteStream(
+          created,
+        );
+
+        _log(
+          'REMOTE STREAM CREATED FOR STREAMLESS TRACK',
+        );
+      } catch (error, stackTrace) {
+        _logError(
+          'REMOTE TRACK STREAM CREATION FAILED',
+          error,
+          stackTrace,
         );
       }
     };
 
-    /// ----------------------------------------------------------------------
-    /// REMOTE STREAM
-    /// ----------------------------------------------------------------------
+    /// ------------------------------------------------------------------------
+    /// LEGACY REMOTE STREAM
+    /// ------------------------------------------------------------------------
 
-    peerConnection.onAddStream =
+    pc.onAddStream =
         (MediaStream stream) {
       _log(
         'REMOTE STREAM RECEIVED',
       );
 
-      _remoteStream =
-          stream;
-
-      if (!_isDisposed &&
-          !_remoteStreamController.isClosed) {
-        _remoteStreamController.add(
-          stream,
-        );
-      }
+      _setRemoteStream(
+        stream,
+      );
     };
 
-    /// ----------------------------------------------------------------------
-    /// ICE CONNECTION
-    /// ----------------------------------------------------------------------
+    /// ------------------------------------------------------------------------
+    /// ICE CONNECTION STATE
+    /// ------------------------------------------------------------------------
 
-    peerConnection.onIceConnectionState =
+    pc.onIceConnectionState =
         (RTCIceConnectionState state) {
       _log(
         'ICE CONNECTION STATE = $state',
       );
 
-      final value =
-          state.toString().toLowerCase();
+      switch (state) {
+        case RTCIceConnectionState.RTCIceConnectionStateChecking:
+          _emitStatus(
+            ChattaxCallStatus.connecting,
+            callId: _activeCallId,
+          );
 
-      if (value.contains('checking')) {
-        _cancelDisconnectTimer();
+          _cancelDisconnectTimer();
 
-        _emitStatus(
-          ChattaxCallStatus.connecting,
-        );
+          break;
 
-        return;
-      }
+        case RTCIceConnectionState.RTCIceConnectionStateConnected:
+        case RTCIceConnectionState.RTCIceConnectionStateCompleted:
+          _cancelDisconnectTimer();
 
-      if (value.contains('connected') ||
-          value.contains('completed')) {
-        _cancelDisconnectTimer();
+          _log(
+            '✅ ICE TRANSPORT CONNECTED',
+          );
 
-        unawaited(
-          _markConnected(),
-        );
+          unawaited(
+            _markConnected(),
+          );
 
-        return;
-      }
+          break;
 
-      if (value.contains('disconnected')) {
-        _startDisconnectGracePeriod();
+        case RTCIceConnectionState.RTCIceConnectionStateDisconnected:
+          _log(
+            '⚠️ ICE DISCONNECTED',
+          );
 
-        return;
-      }
+          _startDisconnectGracePeriod();
 
-      if (value.contains('failed')) {
-        _cancelDisconnectTimer();
+          break;
 
-        unawaited(
-          _handleConnectionFailure(),
-        );
+        case RTCIceConnectionState.RTCIceConnectionStateFailed:
+          _cancelDisconnectTimer();
 
-        return;
-      }
+          _log(
+            '❌ ICE CONNECTION FAILED',
+          );
 
-      if (value.contains('closed')) {
-        _log(
-          'ICE CLOSED',
-        );
+          unawaited(
+            _handleConnectionFailure(),
+          );
+
+          break;
+
+        case RTCIceConnectionState.RTCIceConnectionStateClosed:
+          _cancelDisconnectTimer();
+
+          break;
+
+        case RTCIceConnectionState.RTCIceConnectionStateNew:
+          break;
+          case RTCIceConnectionState.RTCIceConnectionStateCount:
+  break;
       }
     };
 
-    /// ----------------------------------------------------------------------
+    /// ------------------------------------------------------------------------
     /// PEER CONNECTION STATE
-    /// ----------------------------------------------------------------------
+    /// ------------------------------------------------------------------------
 
-    peerConnection.onConnectionState =
+    pc.onConnectionState =
         (RTCPeerConnectionState state) {
       _log(
         'PEER CONNECTION STATE = $state',
       );
 
-      final value =
-          state.toString().toLowerCase();
+      switch (state) {
+        case RTCPeerConnectionState.RTCPeerConnectionStateConnecting:
+          _cancelDisconnectTimer();
 
-      if (value.contains('connecting')) {
-        _cancelDisconnectTimer();
+          _emitStatus(
+            ChattaxCallStatus.connecting,
+            callId: _activeCallId,
+          );
 
-        _emitStatus(
-          ChattaxCallStatus.connecting,
-        );
+          break;
 
-        return;
-      }
+        case RTCPeerConnectionState.RTCPeerConnectionStateConnected:
+          _cancelDisconnectTimer();
 
-      if (value.contains('connected')) {
-        _cancelDisconnectTimer();
+          _log(
+            '✅ PEER CONNECTION CONNECTED',
+          );
 
-        unawaited(
-          _markConnected(),
-        );
+          unawaited(
+            _markConnected(),
+          );
 
-        return;
-      }
+          break;
 
-      if (value.contains('disconnected')) {
-        _startDisconnectGracePeriod();
+        case RTCPeerConnectionState.RTCPeerConnectionStateDisconnected:
+          _startDisconnectGracePeriod();
 
-        return;
-      }
+          break;
 
-      if (value.contains('failed')) {
-        _cancelDisconnectTimer();
+        case RTCPeerConnectionState.RTCPeerConnectionStateFailed:
+          _cancelDisconnectTimer();
 
-        unawaited(
-          _handleConnectionFailure(),
-        );
+          _log(
+            '❌ PEER CONNECTION FAILED',
+          );
 
-        return;
-      }
+          unawaited(
+            _handleConnectionFailure(),
+          );
 
-      if (value.contains('closed')) {
-        _log(
-          'PEER CONNECTION CLOSED',
-        );
+          break;
+
+        case RTCPeerConnectionState.RTCPeerConnectionStateClosed:
+          _cancelDisconnectTimer();
+
+          break;
+
+        case RTCPeerConnectionState.RTCPeerConnectionStateNew:
+          break;
       }
     };
 
-    /// ----------------------------------------------------------------------
+    /// ------------------------------------------------------------------------
     /// SIGNALING STATE
-    /// ----------------------------------------------------------------------
+    /// ------------------------------------------------------------------------
 
-    peerConnection.onSignalingState =
+    pc.onSignalingState =
         (RTCSignalingState state) {
       _log(
         'SIGNALING STATE = $state',
       );
     };
+
+    /// ------------------------------------------------------------------------
+    /// ICE CANDIDATE ERROR
+    /// ------------------------------------------------------------------------
+
+    /// ------------------------------------------------------------------------
+/// ICE CANDIDATE ERROR MONITORING
+/// ------------------------------------------------------------------------
+///
+/// This flutter_webrtc version does not expose an
+/// `onIceCandidateError` setter.
+///
+/// We therefore monitor ICE failures through the
+/// ICE connection-state callback above.
+
+_log(
+  'WEBRTC: ICE candidate error callback '
+  'not exposed by current flutter_webrtc API',
+);
+
+        _log(
+      'WEBRTC: peer connection ready',
+    );
   }
 
-  /// ========================================================================
+  /// ==========================================================================
+  /// CREATE GROUP PEER CONNECTION
+  /// ==========================================================================
+
+  Future<RTCPeerConnection> _createGroupPeerConnection(
+    String participantId,
+  ) async {
+    final existing =
+        _groupPeerConnections[participantId];
+
+    if (existing != null) {
+      return existing;
+    }
+
+    _log(
+      'GROUP WEBRTC: creating peer connection '
+      'for $participantId',
+    );
+
+    final configuration =
+        <String, dynamic>{
+      'iceServers': _buildIceServers(),
+      'sdpSemantics': 'unified-plan',
+      'bundlePolicy': 'max-bundle',
+      'rtcpMuxPolicy': 'require',
+      'iceCandidatePoolSize': 10,
+    };
+
+    final pc =
+    await createPeerConnection(
+  configuration,
+);
+
+_groupPeerConnections[participantId] =
+    pc;
+
+// ==========================================================================
+// ADD LOCAL MICROPHONE / CAMERA TO THIS GROUP PEER
+// ==========================================================================
+
+final localStream = _localStream;
+
+if (localStream != null) {
+  for (final track in localStream.getTracks()) {
+    try {
+      track.enabled = true;
+
+      await pc.addTrack(
+        track,
+        localStream,
+      );
+
+      _log(
+        'GROUP LOCAL TRACK ADDED | '
+        'participant=$participantId | '
+        'kind=${track.kind}',
+      );
+    } catch (error, stackTrace) {
+      _logError(
+        'GROUP LOCAL TRACK ADD FAILED',
+        error,
+        stackTrace,
+      );
+    }
+  }
+}
+
+pc.onIceCandidate =
+    (RTCIceCandidate candidate) { 
+      final value =
+          candidate.candidate;
+
+      if (value == null ||
+          value.isEmpty) {
+        return;
+      }
+
+      _log(
+        'GROUP LOCAL ICE | '
+        'participant=$participantId',
+      );
+
+      unawaited(
+        _sendGroupIceCandidate(
+          participantId,
+          candidate,
+        ),
+      );
+    };
+
+    pc.onIceConnectionState =
+        (RTCIceConnectionState state) {
+      _log(
+        'GROUP ICE STATE | '
+        'participant=$participantId | $state',
+      );
+    };
+
+    pc.onConnectionState =
+        (RTCPeerConnectionState state) {
+      _log(
+        'GROUP PEER STATE | '
+        'participant=$participantId | $state',
+      );
+    };
+
+        pc.onTrack =
+        (RTCTrackEvent event) async {
+      _log(
+        'GROUP REMOTE TRACK | '
+        'participant=$participantId | '
+        'kind=${event.track.kind}',
+      );
+
+      try {
+        event.track.enabled = true;
+      } catch (_) {}
+
+      if (event.streams.isNotEmpty) {
+        _groupRemoteStreams[participantId] =
+            event.streams.first;
+
+        _log(
+          'GROUP REMOTE STREAM RECEIVED | '
+          'participant=$participantId',
+        );
+
+        return;
+      }
+
+      try {
+        MediaStream? stream =
+            _groupRemoteStreams[participantId];
+
+        if (stream == null) {
+          stream =
+              await createLocalMediaStream(
+            'chattax-group-remote-$participantId',
+          );
+
+          _groupRemoteStreams[participantId] =
+              stream;
+        }
+
+        await stream.addTrack(
+          event.track,
+        );
+
+        _log(
+          'GROUP REMOTE TRACK ATTACHED | '
+          'participant=$participantId',
+        );
+      } catch (error, stackTrace) {
+        _logError(
+          'GROUP REMOTE TRACK FAILED',
+          error,
+          stackTrace,
+        );
+      }
+    };
+
+    _log(
+      'GROUP WEBRTC: peer connection ready '
+      'for $participantId',
+    );
+
+        return pc;
+  }
+
+  /// ==========================================================================
+/// CREATE GROUP OFFER
+/// ==========================================================================
+
+Future<void> _createGroupOffer(
+  String participantId,
+) async {
+  final callId = _groupCallId;
+
+  if (callId == null ||
+      callId.isEmpty) {
+    throw Exception(
+      'Group call ID is unavailable.',
+    );
+  }
+
+  final pc =
+      _groupPeerConnections[participantId];
+
+  if (pc == null) {
+    throw Exception(
+      'Group peer connection unavailable.',
+    );
+  }
+
+  _log(
+    '==================================================',
+  );
+
+  _log(
+    'GROUP CALLER: creating offer',
+  );
+
+  _log(
+    'callId=$callId',
+  );
+
+  _log(
+    'participant=$participantId',
+  );
+
+  _log(
+    '==================================================',
+  );
+
+  try {
+    final offer =
+        await pc.createOffer(
+      <String, dynamic>{
+        'offerToReceiveAudio': true,
+        'offerToReceiveVideo':
+            _activeCallType ==
+                ChattaxCallType.video,
+      },
+    );
+
+    await pc.setLocalDescription(
+      offer,
+    );
+
+    _log(
+      'GROUP CALLER: local offer applied | '
+      'participant=$participantId',
+    );
+
+    final peerRef = _firestore
+        .collection('calls')
+        .doc(callId)
+        .collection('peers')
+        .doc(participantId);
+
+    await peerRef.set(
+      <String, dynamic>{
+        'callerId': currentUserId,
+        'receiverId': participantId,
+        'offer': <String, dynamic>{
+          'type': offer.type,
+          'sdp': offer.sdp,
+        },
+        'status': 'offered',
+        'createdAt':
+            FieldValue.serverTimestamp(),
+      },
+    );
+
+    _log(
+      'GROUP OFFER WRITTEN | '
+      'participant=$participantId',
+    );
+  } catch (error, stackTrace) {
+    _logError(
+      'GROUP OFFER CREATION FAILED',
+      error,
+      stackTrace,
+    );
+
+    rethrow;
+  }
+}
+
+  /// ==========================================================================
+  /// SEND GROUP ICE CANDIDATE
+  /// ==========================================================================
+
+  Future<void> _sendGroupIceCandidate(
+    String participantId,
+    RTCIceCandidate candidate,
+  ) async {
+    final callId = _groupCallId;
+    final user = _auth.currentUser;
+
+    if (callId == null ||
+        callId.isEmpty ||
+        user == null) {
+      return;
+    }
+
+    final value = candidate.candidate;
+
+    if (value == null ||
+        value.isEmpty) {
+      return;
+    }
+
+    try {
+      final peerRef = _firestore
+          .collection('calls')
+          .doc(callId)
+          .collection('peers')
+          .doc(participantId);
+
+      await peerRef
+          .collection('callerCandidates')
+          .add(
+        <String, dynamic>{
+          'candidate': value,
+          'sdpMid': candidate.sdpMid,
+          'sdpMLineIndex':
+              candidate.sdpMLineIndex,
+          'senderId': user.uid,
+          'createdAt':
+              FieldValue.serverTimestamp(),
+        },
+      );
+
+      _log(
+        'GROUP ICE UPLOADED | '
+        'participant=$participantId',
+      );
+    } catch (error, stackTrace) {
+      _logError(
+        'GROUP ICE UPLOAD FAILED',
+        error,
+        stackTrace,
+      );
+    }
+  }
+
+  /// ==========================================================================
   /// ICE SERVERS
-  /// ========================================================================
+  /// ==========================================================================
 
   List<Map<String, dynamic>>
       _buildIceServers() {
@@ -2351,34 +2353,54 @@ class ChattaxCallService {
 
       _log(
         'TURN CONFIGURED | '
-        'urls=${turn.urls}',
+        '${turn.urls}',
       );
     } else {
       _log(
-        'WARNING: NO TURN SERVER CONFIGURED',
+        '⚠️ NO TURN SERVER CONFIGURED',
       );
     }
 
     return servers;
   }
 
-  /// ========================================================================
+  /// ==========================================================================
   /// CONFIGURE TURN
-  /// ========================================================================
+  /// ==========================================================================
 
   void configureTurn({
     required String username,
     required String credential,
     required List<String> urls,
   }) {
+    final cleanUrls =
+        urls
+            .map(
+              (String value) =>
+                  value.trim(),
+            )
+            .where(
+              (String value) =>
+                  value.isNotEmpty,
+            )
+            .toList();
+
+    if (username.trim().isEmpty ||
+        credential.trim().isEmpty ||
+        cleanUrls.isEmpty) {
+      throw ArgumentError(
+        'Valid TURN username, credential and URL are required.',
+      );
+    }
+
     turnConfig =
         ChattaxTurnConfig(
       username:
-          username,
+          username.trim(),
       credential:
-          credential,
+          credential.trim(),
       urls:
-          urls,
+          cleanUrls,
     );
 
     _log(
@@ -2386,106 +2408,84 @@ class ChattaxCallService {
     );
   }
 
-  /// ========================================================================
+  /// ==========================================================================
   /// LOCAL MEDIA
-  /// ========================================================================
+  /// ==========================================================================
 
   Future<void> _createLocalStream(
     ChattaxCallType type,
   ) async {
     final constraints =
         <String, dynamic>{
-      'audio':
-          <String, dynamic>{
-        'echoCancellation':
-            true,
-        'noiseSuppression':
-            true,
-        'autoGainControl':
-            true,
-        'channelCount':
-            1,
+      'audio': <String, dynamic>{
+        'echoCancellation': true,
+        'noiseSuppression': true,
+        'autoGainControl': true,
+        'channelCount': 1,
       },
       'video':
-          type ==
-                  ChattaxCallType.video
+          type == ChattaxCallType.video
               ? <String, dynamic>{
-                  'facingMode':
-                      'user',
-                  'width':
-                      <String, dynamic>{
-                    'ideal':
-                        1280,
+                  'facingMode': 'user',
+                  'width': <String, dynamic>{
+                    'ideal': 1280,
                   },
-                  'height':
-                      <String, dynamic>{
-                    'ideal':
-                        720,
+                  'height': <String, dynamic>{
+                    'ideal': 720,
                   },
-                  'frameRate':
-                      <String, dynamic>{
-                    'ideal':
-                        30,
+                  'frameRate': <String, dynamic>{
+                    'ideal': 30,
                   },
                 }
               : false,
     };
 
     _log(
-      'MEDIA: requesting getUserMedia type=$type',
+      'MEDIA: requesting getUserMedia',
     );
 
-    try {
-      _localStream =
-          await navigator
-              .mediaDevices
-              .getUserMedia(
-        constraints,
-      );
-    } catch (error, stackTrace) {
-      _logError(
-        'GET USER MEDIA FAILED',
-        error,
-        stackTrace,
-      );
-
-      rethrow;
-    }
-
     final stream =
-        _localStream;
+        await navigator.mediaDevices
+            .getUserMedia(
+      constraints,
+    );
 
-    if (stream == null) {
-      throw Exception(
-        'Unable to create local media stream.',
-      );
-    }
+    _localStream =
+        stream;
+
+    final audioTracks =
+        stream.getAudioTracks();
+
+    final videoTracks =
+        stream.getVideoTracks();
 
     _log(
       'MEDIA CREATED | '
-      'audio=${stream.getAudioTracks().length} '
-      'video=${stream.getVideoTracks().length}',
+      'audio=${audioTracks.length} '
+      'video=${videoTracks.length}',
     );
 
-    if (!_isDisposed &&
-        !_localStreamController.isClosed) {
-      _localStreamController.add(
-        stream,
-      );
-    }
-
-    final peerConnection =
-        _peerConnection;
-
-    if (peerConnection == null) {
+    if (audioTracks.isEmpty) {
       throw Exception(
-        'PeerConnection unavailable.',
+        'Microphone track was not created.',
       );
     }
 
     for (final track
         in stream.getTracks()) {
-      await peerConnection.addTrack(
+      track.enabled =
+          true;
+
+      final pc =
+          _peerConnection;
+
+      if (pc == null) {
+        throw Exception(
+          'PeerConnection unavailable.',
+        );
+      }
+
+      await pc.addTrack(
         track,
         stream,
       );
@@ -2495,37 +2495,70 @@ class ChattaxCallService {
         false;
 
     _cameraEnabled =
-        type ==
-            ChattaxCallType.video;
+        type == ChattaxCallType.video;
 
+    if (!_localStreamController.isClosed &&
+        !_isDisposed) {
+      _localStreamController.add(
+        stream,
+      );
+    }
+
+    /// Speaker ON by default for voice calls.
     await setSpeaker(
       true,
     );
   }
 
-  /// ========================================================================
+  /// ==========================================================================
+  /// REMOTE STREAM
+  /// ==========================================================================
+
+  void _setRemoteStream(
+    MediaStream stream,
+  ) {
+    if (_isDisposed) {
+      return;
+    }
+
+    _remoteStream =
+        stream;
+
+    _log(
+      'REMOTE STREAM SET | '
+      'audio=${stream.getAudioTracks().length} '
+      'video=${stream.getVideoTracks().length}',
+    );
+
+    if (!_remoteStreamController.isClosed) {
+      _remoteStreamController.add(
+        stream,
+      );
+    }
+  }
+
+  /// ==========================================================================
   /// LOCAL ICE
-  /// ========================================================================
+  /// ==========================================================================
 
   Future<void> _handleLocalIceCandidate(
     RTCIceCandidate candidate,
   ) async {
-    final candidateValue =
+    final value =
         candidate.candidate;
 
-    if (candidateValue == null ||
-        candidateValue.isEmpty) {
+    if (value == null ||
+        value.isEmpty) {
       return;
     }
 
     final key =
-        '$candidateValue|'
+        '$value|'
         '${candidate.sdpMid}|'
         '${candidate.sdpMLineIndex}';
 
-    if (_sentLocalCandidateKeys.contains(
-      key,
-    )) {
+    if (_sentLocalCandidateKeys
+        .contains(key)) {
       return;
     }
 
@@ -2534,12 +2567,12 @@ class ChattaxCallService {
     );
 
     if (!_signalingReady) {
-      _log(
-        'LOCAL ICE QUEUED: signaling not ready',
-      );
-
       _pendingLocalCandidates.add(
         candidate,
+      );
+
+      _log(
+        'LOCAL ICE QUEUED | signaling not ready',
       );
 
       return;
@@ -2553,14 +2586,14 @@ class ChattaxCallService {
   Future<void> _sendIceCandidate(
     RTCIceCandidate candidate,
   ) async {
-    final currentCallId =
+    final callId =
         _activeCallId;
 
-    if (currentCallId == null) {
+    if (callId == null) {
       return;
     }
 
-    final collectionName =
+    final collection =
         _isCaller
             ? 'callerCandidates'
             : 'receiverCandidates';
@@ -2568,8 +2601,8 @@ class ChattaxCallService {
     try {
       await _firestore
           .collection('calls')
-          .doc(currentCallId)
-          .collection(collectionName)
+          .doc(callId)
+          .collection(collection)
           .add(
         <String, dynamic>{
           'candidate':
@@ -2584,7 +2617,7 @@ class ChattaxCallService {
       );
 
       _log(
-        'ICE UPLOADED | $collectionName',
+        'ICE UPLOADED | $collection',
       );
     } catch (error, stackTrace) {
       _logError(
@@ -2616,9 +2649,9 @@ class ChattaxCallService {
     }
   }
 
-  /// ========================================================================
+  /// ==========================================================================
   /// CALLER ICE
-  /// ========================================================================
+  /// ==========================================================================
 
   void _listenForCallerCandidates(
     String callId,
@@ -2668,9 +2701,9 @@ class ChattaxCallService {
     );
   }
 
-  /// ========================================================================
+  /// ==========================================================================
   /// RECEIVER ICE
-  /// ========================================================================
+  /// ==========================================================================
 
   void _listenForReceiverCandidates(
     String callId,
@@ -2720,9 +2753,9 @@ class ChattaxCallService {
     );
   }
 
-  /// ========================================================================
+  /// ==========================================================================
   /// REMOTE ICE
-  /// ========================================================================
+  /// ==========================================================================
 
   Future<void> _handleRemoteIceCandidate(
     Map<String, dynamic> data,
@@ -2757,23 +2790,24 @@ class ChattaxCallService {
       sdpMLineIndex,
     );
 
-    if (!_remoteDescriptionSet) {
+    final pc =
+        _peerConnection;
+
+    if (pc == null ||
+        !_remoteDescriptionSet) {
       _pendingRemoteCandidates.add(
         candidate,
+      );
+
+      _log(
+        'REMOTE ICE QUEUED',
       );
 
       return;
     }
 
-    final peerConnection =
-        _peerConnection;
-
-    if (peerConnection == null) {
-      return;
-    }
-
     try {
-      await peerConnection.addCandidate(
+      await pc.addCandidate(
         candidate,
       );
 
@@ -2789,9 +2823,9 @@ class ChattaxCallService {
     }
   }
 
-  /// ========================================================================
+  /// ==========================================================================
   /// FLUSH REMOTE ICE
-  /// ========================================================================
+  /// ==========================================================================
 
   Future<void>
       _flushPendingRemoteCandidates() async {
@@ -2799,10 +2833,10 @@ class ChattaxCallService {
       return;
     }
 
-    final peerConnection =
+    final pc =
         _peerConnection;
 
-    if (peerConnection == null) {
+    if (pc == null) {
       return;
     }
 
@@ -2816,8 +2850,12 @@ class ChattaxCallService {
     for (final candidate
         in candidates) {
       try {
-        await peerConnection.addCandidate(
+        await pc.addCandidate(
           candidate,
+        );
+
+        _log(
+          'QUEUED REMOTE ICE ADDED',
         );
       } catch (error, stackTrace) {
         _logError(
@@ -2829,9 +2867,9 @@ class ChattaxCallService {
     }
   }
 
-  /// ========================================================================
+  /// ==========================================================================
   /// CALL DOCUMENT LISTENER
-  /// ========================================================================
+  /// ==========================================================================
 
   void _listenToCallDocument(
     String callId,
@@ -2847,15 +2885,7 @@ class ChattaxCallService {
             .snapshots()
             .listen(
       (snapshot) {
-        if (_activeCallId != callId) {
-          return;
-        }
-
         if (!snapshot.exists) {
-          unawaited(
-            _cleanupCall(),
-          );
-
           return;
         }
 
@@ -2872,41 +2902,48 @@ class ChattaxCallService {
                 .toLowerCase();
 
         _log(
-          'CALL STATUS = $status',
+          'CALL DOCUMENT STATUS = $status',
         );
 
         switch (status) {
           case 'calling':
             _emitStatus(
               ChattaxCallStatus.calling,
+              callId: callId,
             );
-            break;
+
+            return;
 
           case 'ringing':
             _emitStatus(
               ChattaxCallStatus.ringing,
+              callId: callId,
             );
-            break;
+
+            return;
 
           case 'connecting':
             _emitStatus(
               ChattaxCallStatus.connecting,
+              callId: callId,
             );
+
             break;
 
           case 'connected':
-            _cancelOutgoingCallTimer();
-
-            _emitStatus(
-              ChattaxCallStatus.connected,
+            unawaited(
+              _markConnected(),
             );
-            break;
+
+            return;
 
           case 'rejected':
             _cancelOutgoingCallTimer();
+            _cancelConnectionTimer();
 
             _emitStatus(
               ChattaxCallStatus.rejected,
+              callId: callId,
             );
 
             unawaited(
@@ -2917,9 +2954,11 @@ class ChattaxCallService {
 
           case 'ended':
             _cancelOutgoingCallTimer();
+            _cancelConnectionTimer();
 
             _emitStatus(
               ChattaxCallStatus.ended,
+              callId: callId,
             );
 
             unawaited(
@@ -2930,9 +2969,11 @@ class ChattaxCallService {
 
           case 'failed':
             _cancelOutgoingCallTimer();
+            _cancelConnectionTimer();
 
             _emitStatus(
               ChattaxCallStatus.failed,
+              callId: callId,
             );
 
             unawaited(
@@ -2942,7 +2983,7 @@ class ChattaxCallService {
             return;
         }
 
-        /// Only the caller processes the answer.
+        /// Only caller processes answer.
         if (!_isCaller) {
           return;
         }
@@ -2959,10 +3000,10 @@ class ChattaxCallService {
           return;
         }
 
-        final peerConnection =
+        final pc =
             _peerConnection;
 
-        if (peerConnection == null) {
+        if (pc == null) {
           return;
         }
 
@@ -2981,13 +3022,9 @@ class ChattaxCallService {
               'answer',
         );
 
-        _log(
-          'CALLER: ANSWER RECEIVED',
-        );
-
         unawaited(
           _applyRemoteAnswer(
-            peerConnection,
+            pc,
             remoteAnswer,
           ),
         );
@@ -3005,12 +3042,72 @@ class ChattaxCallService {
     );
   }
 
-  /// ========================================================================
+  /// ==========================================================================
+  /// APPLY REMOTE OFFER
+  /// ==========================================================================
+
+  Future<void> _applyRemoteOffer(
+    Map<String, dynamic> data,
+  ) async {
+    final pc =
+        _peerConnection;
+
+    if (pc == null) {
+      throw Exception(
+        'PeerConnection unavailable.',
+      );
+    }
+
+    final offer =
+        data['offer'];
+
+    if (offer is! Map) {
+      throw Exception(
+        'Caller offer missing.',
+      );
+    }
+
+    final sdp =
+        offer['sdp']?.toString();
+
+    if (sdp == null ||
+        sdp.isEmpty) {
+      throw Exception(
+        'Caller offer SDP missing.',
+      );
+    }
+
+    final description =
+        RTCSessionDescription(
+      sdp,
+      offer['type']?.toString() ??
+          'offer',
+    );
+
+    _log(
+      'RECEIVER: applying remote offer',
+    );
+
+    await pc.setRemoteDescription(
+      description,
+    );
+
+    _remoteDescriptionSet =
+        true;
+
+    _log(
+      'RECEIVER: remote offer applied',
+    );
+
+    await _flushPendingRemoteCandidates();
+  }
+
+  /// ==========================================================================
   /// APPLY REMOTE ANSWER
-  /// ========================================================================
+  /// ==========================================================================
 
   Future<void> _applyRemoteAnswer(
-    RTCPeerConnection peerConnection,
+    RTCPeerConnection pc,
     RTCSessionDescription answer,
   ) async {
     if (_answerApplied ||
@@ -3023,8 +3120,7 @@ class ChattaxCallService {
 
     try {
       final current =
-          await peerConnection
-              .getRemoteDescription();
+          await pc.getRemoteDescription();
 
       if (current != null) {
         _answerApplied =
@@ -3038,7 +3134,11 @@ class ChattaxCallService {
         return;
       }
 
-      await peerConnection.setRemoteDescription(
+      _log(
+        'CALLER: applying remote answer',
+      );
+
+      await pc.setRemoteDescription(
         answer,
       );
 
@@ -3049,7 +3149,7 @@ class ChattaxCallService {
           true;
 
       _log(
-        'CALLER: REMOTE ANSWER APPLIED',
+        'CALLER: remote answer applied',
       );
 
       await _flushPendingRemoteCandidates();
@@ -3060,26 +3160,26 @@ class ChattaxCallService {
         stackTrace,
       );
 
-      await _handleConnectionFailure();
+      unawaited(
+        _handleConnectionFailure(),
+      );
     } finally {
       _answerApplying =
           false;
     }
   }
 
-  /// ========================================================================
+  /// ==========================================================================
   /// CONNECTED
-  /// ========================================================================
+  /// ==========================================================================
 
   Future<void> _markConnected() async {
-    final currentCallId =
+    final callId =
         _activeCallId;
 
-    if (currentCallId == null) {
-      return;
-    }
-
-    if (_connectedReported) {
+    if (callId == null ||
+        _connectedReported ||
+        _endingCall) {
       return;
     }
 
@@ -3087,6 +3187,8 @@ class ChattaxCallService {
         true;
 
     _cancelOutgoingCallTimer();
+
+    _cancelConnectionTimer();
 
     _cancelDisconnectTimer();
 
@@ -3099,7 +3201,7 @@ class ChattaxCallService {
     );
 
     _log(
-      'callId=$currentCallId',
+      'callId=$callId',
     );
 
     _log(
@@ -3110,20 +3212,61 @@ class ChattaxCallService {
       '==================================================',
     );
 
+    /// Ensure speaker is enabled after connection.
+    try {
+      await Helper.setSpeakerphoneOn(
+        _speakerEnabled,
+      );
+    } catch (_) {}
+
     _emitStatus(
       ChattaxCallStatus.connected,
+      callId: callId,
     );
 
     try {
-      await _firestore
-          .collection('calls')
-          .doc(currentCallId)
-          .update(
-        <String, dynamic>{
-          'status':
-              'connected',
-          'connectedAt':
-              FieldValue.serverTimestamp(),
+      final callRef =
+          _firestore
+              .collection('calls')
+              .doc(callId);
+
+      await _firestore.runTransaction(
+        (transaction) async {
+          final snapshot =
+              await transaction.get(
+            callRef,
+          );
+
+          if (!snapshot.exists) {
+            return;
+          }
+
+          final data =
+              snapshot.data();
+
+          if (data == null) {
+            return;
+          }
+
+          final status =
+              (data['status'] ?? '')
+                  .toString()
+                  .toLowerCase();
+
+          if (status == 'ended' ||
+              status == 'rejected' ||
+              status == 'failed') {
+            return;
+          }
+
+          transaction.update(
+            callRef,
+            <String, dynamic>{
+              'status': 'connected',
+              'connectedAt':
+                  FieldValue.serverTimestamp(),
+            },
+          );
         },
       );
     } catch (error, stackTrace) {
@@ -3135,12 +3278,13 @@ class ChattaxCallService {
     }
   }
 
-  /// ========================================================================
+  /// ==========================================================================
   /// CONNECTION FAILURE
-  /// ========================================================================
+  /// ==========================================================================
 
   Future<void> _handleConnectionFailure() async {
-    if (_failureHandling) {
+    if (_failureHandling ||
+        _connectedReported) {
       return;
     }
 
@@ -3148,70 +3292,116 @@ class ChattaxCallService {
         true;
 
     try {
-      final currentCallId =
+      final callId =
           _activeCallId;
 
-      if (currentCallId == null) {
+      if (callId == null) {
         return;
       }
 
       _log(
-        '❌ WEBRTC CONNECTION FAILED '
-        'callId=$currentCallId',
+        '❌ WEBRTC CONNECTION FAILED | $callId',
       );
 
       _cancelOutgoingCallTimer();
+
+      _cancelConnectionTimer();
 
       _cancelDisconnectTimer();
 
       _emitStatus(
         ChattaxCallStatus.failed,
+        callId: callId,
       );
 
-      try {
-        await _firestore
-            .collection('calls')
-            .doc(currentCallId)
-            .update(
-          <String, dynamic>{
-            'status':
-                'failed',
-            'endedAt':
-                FieldValue.serverTimestamp(),
-          },
-        );
-      } catch (error, stackTrace) {
-        _logError(
-          'FAILURE STATUS WRITE FAILED',
-          error,
-          stackTrace,
-        );
-      }
+      await _safeMarkCallFailed(
+  callId,
+);
 
-      await _cleanupCall();
+try {
+  await _updateCallHistoryMessage(
+    callId: callId,
+    callStatus: 'unanswered',
+  );
+} catch (e) {
+  debugPrint(
+    'CHATTªX call history failure update failed: $e',
+  );
+}
+
+await _cleanupCall();
     } finally {
       _failureHandling =
           false;
     }
   }
 
-  /// ========================================================================
+  /// ==========================================================================
+  /// CONNECTION TIMEOUT
+  /// ==========================================================================
+
+  void _startConnectionTimeout(
+    String callId,
+  ) {
+    _cancelConnectionTimer();
+
+    _connectionTimerStarted =
+        true;
+
+    _connectionTimer =
+        Timer(
+      connectionTimeout,
+      () {
+        if (_activeCallId != callId) {
+          return;
+        }
+
+        if (_connectedReported) {
+          return;
+        }
+
+        _log(
+          '❌ WEBRTC CONNECTION TIMEOUT | $callId',
+        );
+
+        unawaited(
+          _handleConnectionFailure(),
+        );
+      },
+    );
+  }
+
+  void _cancelConnectionTimer() {
+    _connectionTimer?.cancel();
+
+    _connectionTimer =
+        null;
+
+    _connectionTimerStarted =
+        false;
+  }
+
+  /// ==========================================================================
   /// DISCONNECT GRACE
-  /// ========================================================================
+  /// ==========================================================================
 
   void _startDisconnectGracePeriod() {
-    _cancelDisconnectTimer();
+    if (_activeCallId == null ||
+        _connectedReported == false) {
+      return;
+    }
 
-    _log(
-      'Starting disconnect grace period '
-      '${disconnectGracePeriod.inSeconds}s',
-    );
+    _cancelDisconnectTimer();
 
     _disconnectTimer =
         Timer(
       disconnectGracePeriod,
       () {
         if (_activeCallId == null) {
+          return;
+        }
+
+        if (!_connectedReported) {
           return;
         }
 
@@ -3229,9 +3419,9 @@ class ChattaxCallService {
         null;
   }
 
-  /// ========================================================================
-  /// OUTGOING TIMEOUT
-  /// ========================================================================
+  /// ==========================================================================
+  /// OUTGOING CALL TIMEOUT
+  /// ==========================================================================
 
   void _startOutgoingCallTimeout(
     String callId,
@@ -3258,29 +3448,25 @@ class ChattaxCallService {
           'OUTGOING CALL TIMEOUT',
         );
 
-        try {
-          await _firestore
-              .collection('calls')
-              .doc(callId)
-              .update(
-            <String, dynamic>{
-              'status':
-                  'ended',
-              'endedAt':
-                  FieldValue.serverTimestamp(),
-            },
-          );
-        } catch (error, stackTrace) {
-          _logError(
-            'OUTGOING TIMEOUT FIRESTORE FAILED',
-            error,
-            stackTrace,
-          );
-        }
+        await _safeMarkCallEnded(
+  callId,
+);
 
-        _emitStatus(
-          ChattaxCallStatus.ended,
-        );
+try {
+  await _updateCallHistoryMessage(
+    callId: callId,
+    callStatus: 'unanswered',
+  );
+} catch (e) {
+  debugPrint(
+    'CHATTªX unanswered call history update failed: $e',
+  );
+}
+
+_emitStatus(
+  ChattaxCallStatus.ended,
+  callId: callId,
+);
 
         await _cleanupCall();
       },
@@ -3294,99 +3480,165 @@ class ChattaxCallService {
         null;
   }
 
-  /// ========================================================================
-  /// SET CALL STATUS
-  /// ========================================================================
+  /// ==========================================================================
+  /// MICROPHONE
+  /// ==========================================================================
 
-  Future<void> setCallStatus(
-    ChattaxCallStatus status,
+  Future<bool> toggleMicrophone() async {
+    final muted =
+        !_microphoneMuted;
+
+    await setMicrophoneMuted(
+      muted,
+    );
+
+    return !_microphoneMuted;
+  }
+
+  Future<void> setMicrophoneMuted(
+    bool muted,
   ) async {
-    final currentCallId =
-        _activeCallId;
+    final stream =
+        _localStream;
 
-    if (currentCallId == null) {
+    if (stream == null) {
+      _microphoneMuted =
+          muted;
+
+      return;
+    }
+
+    for (final track
+        in stream.getAudioTracks()) {
+      track.enabled =
+          !muted;
+    }
+
+    _microphoneMuted =
+        muted;
+
+    _log(
+      'MICROPHONE '
+      '${muted ? 'MUTED' : 'UNMUTED'}',
+    );
+  }
+
+  /// ==========================================================================
+  /// CAMERA
+  /// ==========================================================================
+
+  Future<bool> toggleCamera() async {
+    final enabled =
+        !_cameraEnabled;
+
+    await setCameraEnabled(
+      enabled,
+    );
+
+    return _cameraEnabled;
+  }
+
+  Future<void> setCameraEnabled(
+    bool enabled,
+  ) async {
+    final stream =
+        _localStream;
+
+    if (stream == null) {
+      _cameraEnabled =
+          enabled;
+
+      return;
+    }
+
+    for (final track
+        in stream.getVideoTracks()) {
+      track.enabled =
+          enabled;
+    }
+
+    _cameraEnabled =
+        enabled;
+  }
+
+  /// ==========================================================================
+  /// SWITCH CAMERA
+  /// ==========================================================================
+
+  Future<void> switchCamera() async {
+    final stream =
+        _localStream;
+
+    if (stream == null) {
+      return;
+    }
+
+    final tracks =
+        stream.getVideoTracks();
+
+    if (tracks.isEmpty) {
       return;
     }
 
     try {
-      await _firestore
-          .collection('calls')
-          .doc(currentCallId)
-          .update(
-        <String, dynamic>{
-          'status':
-              _statusToString(
-            status,
-          ),
-        },
+      await Helper.switchCamera(
+        tracks.first,
+      );
+
+      _log(
+        'CAMERA SWITCHED',
       );
     } catch (error, stackTrace) {
       _logError(
-        'SET CALL STATUS FAILED',
+        'SWITCH CAMERA FAILED',
         error,
         stackTrace,
       );
     }
-
-    _emitStatus(
-      status,
-    );
   }
 
-  String _statusToString(
-    ChattaxCallStatus status,
-  ) {
-    switch (status) {
-      case ChattaxCallStatus.calling:
-        return 'calling';
+  /// ==========================================================================
+  /// SPEAKER
+  /// ==========================================================================
 
-      case ChattaxCallStatus.ringing:
-        return 'ringing';
+  Future<void> setSpeaker(
+    bool enabled,
+  ) async {
+    try {
+      await Helper.setSpeakerphoneOn(
+        enabled,
+      );
 
-      case ChattaxCallStatus.connecting:
-        return 'connecting';
+      _speakerEnabled =
+          enabled;
 
-      case ChattaxCallStatus.connected:
-        return 'connected';
-
-      case ChattaxCallStatus.rejected:
-        return 'rejected';
-
-      case ChattaxCallStatus.ended:
-        return 'ended';
-
-      case ChattaxCallStatus.failed:
-        return 'failed';
+      _log(
+        'SPEAKERPHONE '
+        '${enabled ? 'ON' : 'OFF'}',
+      );
+    } catch (error, stackTrace) {
+      _logError(
+        'SPEAKER ROUTING FAILED',
+        error,
+        stackTrace,
+      );
     }
   }
 
-  /// ========================================================================
-  /// STATUS EMITTER
-  /// ========================================================================
+  Future<bool> toggleSpeaker() async {
+    final enabled =
+        !_speakerEnabled;
 
-  void _emitStatus(
-    ChattaxCallStatus status,
-  ) {
-    _log(
-      'UI CALL STATUS -> $status',
+    await setSpeaker(
+      enabled,
     );
 
-    if (_isDisposed) {
-      return;
-    }
-
-    if (_callStatusController.isClosed) {
-      return;
-    }
-
-    _callStatusController.add(
-      status,
-    );
+    return _speakerEnabled;
   }
 
-  /// ========================================================================
+  /// ==========================================================================
   /// PERMISSIONS
-  /// ========================================================================
+  /// ==========================================================================
 
   Future<void> _requestPermissions(
     ChattaxCallType type,
@@ -3411,60 +3663,11 @@ class ChattaxCallService {
         );
       }
     }
-
-    _log(
-      'CALL PERMISSIONS GRANTED',
-    );
   }
 
-  /// ========================================================================
-  /// CHECK CALL
-  /// ========================================================================
-
-  Future<bool> isCallStillActive(
-    String callId,
-  ) async {
-    try {
-      final snapshot =
-          await _firestore
-              .collection('calls')
-              .doc(callId)
-              .get();
-
-      if (!snapshot.exists) {
-        return false;
-      }
-
-      final data =
-          snapshot.data();
-
-      if (data == null) {
-        return false;
-      }
-
-      final status =
-          (data['status'] ?? '')
-              .toString()
-              .toLowerCase();
-
-      return status == 'calling' ||
-          status == 'ringing' ||
-          status == 'connecting' ||
-          status == 'connected';
-    } catch (error, stackTrace) {
-      _logError(
-        'CHECK CALL FAILED',
-        error,
-        stackTrace,
-      );
-
-      return false;
-    }
-  }
-
-  /// ========================================================================
+  /// ==========================================================================
   /// GET CALL
-  /// ========================================================================
+  /// ==========================================================================
 
   Future<ChattaxCall?> getCall(
     String callId,
@@ -3502,13 +3705,251 @@ class ChattaxCallService {
     }
   }
 
-  /// ========================================================================
-  /// CLOSE CALL
-  /// ========================================================================
+  /// ==========================================================================
+  /// CHECK CALL
+  /// ==========================================================================
 
-  Future<void> closeCall(
+  Future<bool> isCallStillActive(
     String callId,
   ) async {
+    try {
+      final call =
+          await getCall(
+        callId,
+      );
+
+      if (call == null) {
+        return false;
+      }
+
+      return call.status ==
+              ChattaxCallStatus.calling ||
+          call.status ==
+              ChattaxCallStatus.ringing ||
+          call.status ==
+              ChattaxCallStatus.connecting ||
+          call.status ==
+              ChattaxCallStatus.connected;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// ==========================================================================
+  /// REJECT CALL
+  /// ==========================================================================
+
+  Future<void> rejectCall(
+    String callId,
+  ) async {
+    final cleanCallId =
+        callId.trim();
+
+    if (cleanCallId.isEmpty) {
+      return;
+    }
+
+    try {
+      final callRef =
+          _firestore
+              .collection('calls')
+              .doc(cleanCallId);
+
+      await _firestore.runTransaction(
+        (transaction) async {
+          final snapshot =
+              await transaction.get(
+            callRef,
+          );
+
+          if (!snapshot.exists) {
+            return;
+          }
+
+          final data =
+              snapshot.data();
+
+          if (data == null) {
+            return;
+          }
+
+          final receiverId =
+              (data['receiverId'] ?? '')
+                  .toString();
+
+          final currentUser =
+              _auth.currentUser;
+
+          if (currentUser == null ||
+              receiverId !=
+                  currentUser.uid) {
+            return;
+          }
+
+          final status =
+              (data['status'] ?? '')
+                  .toString()
+                  .toLowerCase();
+
+          if (status != 'ringing') {
+            return;
+          }
+
+          transaction.update(
+            callRef,
+            <String, dynamic>{
+              'status': 'rejected',
+              'endedAt':
+                  FieldValue.serverTimestamp(),
+            },
+          );
+        },
+      );
+
+      _announcedIncomingCalls.remove(
+        cleanCallId,
+      );
+
+      _emitStatus(
+        ChattaxCallStatus.rejected,
+        callId: cleanCallId,
+      );
+
+      if (_activeCallId ==
+          cleanCallId) {
+        await _cleanupCall();
+      }
+    } catch (error, stackTrace) {
+      _logError(
+        'REJECT CALL FAILED',
+        error,
+        stackTrace,
+      );
+    }
+  }
+
+  /// ==========================================================================
+  /// END CALL
+  /// ==========================================================================
+
+  Future<void> endCall() async {
+    await _finishCall(
+      ChattaxCallStatus.ended,
+    );
+  }
+
+  /// ==========================================================================
+  /// CANCEL CALL
+  /// ==========================================================================
+
+  Future<void> cancelCall() async {
+    await _finishCall(
+      ChattaxCallStatus.ended,
+    );
+  }
+
+  /// ==========================================================================
+  /// CANCEL OUTGOING CALL
+  /// ==========================================================================
+
+  Future<void> cancelOutgoingCall() async {
+    await cancelCall();
+  }
+
+  /// ==========================================================================
+/// FINISH CALL
+/// ==========================================================================
+
+Future<void> _finishCall(
+  ChattaxCallStatus finalStatus,
+) async {
+  if (_endingCall) {
+    return;
+  }
+
+  _endingCall =
+      true;
+
+  try {
+    final callId =
+        _activeCallId;
+
+    if (callId == null) {
+      return;
+    }
+
+    _cancelOutgoingCallTimer();
+
+    _cancelConnectionTimer();
+
+    _cancelDisconnectTimer();
+
+    // Remember whether the call actually connected
+    // BEFORE cleanup clears the active call state.
+    final bool wasConnected =
+        _connectedReported;
+
+    int callDuration = 0;
+
+    if (wasConnected) {
+      callDuration =
+          await _getCallDuration(
+        callId,
+      );
+    }
+
+    // If the call connected, it is a real ended call.
+    // If it never connected, it is an unanswered call.
+    final String historyStatus =
+        wasConnected
+            ? 'ended'
+            : 'unanswered';
+
+    await _safeFinishCallDocument(
+      callId,
+      _statusToString(
+        finalStatus,
+      ),
+    );
+
+    try {
+      await _updateCallHistoryMessage(
+        callId: callId,
+        callStatus: historyStatus,
+        callDuration: callDuration,
+      );
+    } catch (e) {
+      debugPrint(
+        'CHATTªX call history finish update failed: $e',
+      );
+    }
+
+    _emitStatus(
+      finalStatus,
+      callId: callId,
+    );
+
+    await _cleanupCall();
+  } finally {
+    _endingCall =
+        false;
+  }
+}
+
+  /// ==========================================================================
+  /// SET CALL STATUS
+  /// ==========================================================================
+
+  Future<void> setCallStatus(
+    ChattaxCallStatus status,
+  ) async {
+    final callId =
+        _activeCallId;
+
+    if (callId == null) {
+      return;
+    }
+
     try {
       await _firestore
           .collection('calls')
@@ -3516,100 +3957,326 @@ class ChattaxCallService {
           .update(
         <String, dynamic>{
           'status':
-              'ended',
-          'endedAt':
-              FieldValue.serverTimestamp(),
+              _statusToString(
+            status,
+          ),
         },
       );
     } catch (error, stackTrace) {
       _logError(
-        'CLOSE CALL FIRESTORE FAILED',
+        'SET CALL STATUS FAILED',
         error,
         stackTrace,
       );
     }
 
-    _announcedIncomingCalls.remove(
-      callId,
+    _emitStatus(
+      status,
+      callId: callId,
     );
+  }
 
-    if (_activeCallId == callId) {
-      _emitStatus(
-        ChattaxCallStatus.ended,
-      );
+  /// ==========================================================================
+/// CLOSE CALL
+/// ==========================================================================
 
-      await _cleanupCall();
+Future<void> closeCall(
+  String callId,
+) async {
+  final cleanCallId =
+      callId.trim();
+
+  if (cleanCallId.isEmpty) {
+    return;
+  }
+
+  await _safeMarkCallEnded(
+    cleanCallId,
+  );
+
+  await _cleanupCall();
+}
+
+  /// ==========================================================================
+  /// STATUS STRING
+  /// ==========================================================================
+
+  String _statusToString(
+    ChattaxCallStatus status,
+  ) {
+    switch (status) {
+      case ChattaxCallStatus.calling:
+        return 'calling';
+
+      case ChattaxCallStatus.ringing:
+        return 'ringing';
+
+      case ChattaxCallStatus.connecting:
+        return 'connecting';
+
+      case ChattaxCallStatus.connected:
+        return 'connected';
+
+      case ChattaxCallStatus.rejected:
+        return 'rejected';
+
+      case ChattaxCallStatus.ended:
+        return 'ended';
+
+      case ChattaxCallStatus.failed:
+        return 'failed';
     }
   }
 
-  /// ========================================================================
-  /// SAFE STATUS UPDATE
-  /// ========================================================================
+  /// ==========================================================================
+  /// STATUS EMITTER
+  /// ==========================================================================
 
-  Future<void> _safeUpdateCallStatus(
-    DocumentReference<Map<String, dynamic>> callRef,
-    String status, {
-    bool includeEndedAt = false,
-  }) async {
-    final update =
-        <String, dynamic>{
-      'status':
-          status,
-    };
-
-    if (includeEndedAt) {
-      update['endedAt'] =
-          FieldValue.serverTimestamp();
+  void _emitStatus(
+    ChattaxCallStatus status, {
+    String? callId,
+  }) {
+    if (_isDisposed) {
+      return;
     }
 
+    final effectiveCallId =
+        callId ?? _activeCallId;
+
+    _log(
+      'UI STATUS = $status'
+      '${effectiveCallId == null ? '' : ' | $effectiveCallId'}',
+    );
+
+    if (!_callStatusController.isClosed) {
+      _callStatusController.add(
+        status,
+      );
+    }
+
+    if (effectiveCallId != null &&
+        !_callStatusEventController.isClosed) {
+      _callStatusEventController.add(
+        ChattaxCallStatusEvent(
+          callId:
+              effectiveCallId,
+          status:
+              status,
+        ),
+      );
+    }
+  }
+
+  /// ==========================================================================
+  /// SAFE FINISH CALL DOCUMENT
+  /// ==========================================================================
+
+  Future<void> _safeFinishCallDocument(
+    String callId,
+    String status,
+  ) async {
     try {
-      await callRef.update(
-        update,
+      final ref =
+          _firestore
+              .collection('calls')
+              .doc(callId);
+
+      await _firestore.runTransaction(
+        (transaction) async {
+          final snapshot =
+              await transaction.get(
+            ref,
+          );
+
+          if (!snapshot.exists) {
+            return;
+          }
+
+          final data =
+              snapshot.data();
+
+          if (data == null) {
+            return;
+          }
+
+          final currentStatus =
+              (data['status'] ?? '')
+                  .toString()
+                  .toLowerCase();
+
+          if (currentStatus ==
+                  'ended' ||
+              currentStatus ==
+                  'rejected' ||
+              currentStatus ==
+                  'failed') {
+            return;
+          }
+
+          transaction.update(
+            ref,
+            <String, dynamic>{
+              'status': status,
+              'endedAt':
+                  FieldValue.serverTimestamp(),
+            },
+          );
+        },
       );
     } catch (error, stackTrace) {
       _logError(
-        'SAFE CALL STATUS UPDATE FAILED',
+        'FINISH CALL DOCUMENT FAILED',
         error,
         stackTrace,
       );
     }
   }
 
-  /// ========================================================================
-  /// MARK FAILED
-  /// ========================================================================
+  /// ==========================================================================
+  /// SAFE MARK ENDED
+  /// ==========================================================================
+
+  Future<void> _safeMarkCallEnded(
+    String callId,
+  ) async {
+    try {
+      final ref =
+          _firestore
+              .collection('calls')
+              .doc(callId);
+
+      await _firestore.runTransaction(
+        (transaction) async {
+          final snapshot =
+              await transaction.get(
+            ref,
+          );
+
+          if (!snapshot.exists) {
+            return;
+          }
+
+          final data =
+              snapshot.data();
+
+          if (data == null) {
+            return;
+          }
+
+          final status =
+              (data['status'] ?? '')
+                  .toString()
+                  .toLowerCase();
+
+          if (status ==
+                  'ended' ||
+              status ==
+                  'rejected' ||
+              status ==
+                  'failed') {
+            return;
+          }
+
+          transaction.update(
+            ref,
+            <String, dynamic>{
+              'status': 'ended',
+              'endedAt':
+                  FieldValue.serverTimestamp(),
+            },
+          );
+        },
+      );
+    } catch (error, stackTrace) {
+      _logError(
+        'MARK CALL ENDED FAILED',
+        error,
+        stackTrace,
+      );
+    }
+  }
+
+  /// ==========================================================================
+  /// SAFE MARK FAILED
+  /// ==========================================================================
 
   Future<void> _safeMarkCallFailed(
     String callId,
   ) async {
     try {
-      await _firestore
-          .collection('calls')
-          .doc(callId)
-          .update(
-        <String, dynamic>{
-          'status':
-              'failed',
-          'endedAt':
-              FieldValue.serverTimestamp(),
-        },
-      );
+      final ref =
+          _firestore
+              .collection('calls')
+              .doc(callId);
 
-      _log(
-        'CALL MARKED FAILED | $callId',
+      await _firestore.runTransaction(
+        (transaction) async {
+          final snapshot =
+              await transaction.get(
+            ref,
+          );
+
+          if (!snapshot.exists) {
+            return;
+          }
+
+          final data =
+              snapshot.data();
+
+          if (data == null) {
+            return;
+          }
+
+          final status =
+              (data['status'] ?? '')
+                  .toString()
+                  .toLowerCase();
+
+          if (status ==
+                  'ended' ||
+              status ==
+                  'rejected' ||
+              status ==
+                  'failed') {
+            return;
+          }
+
+          transaction.update(
+            ref,
+            <String, dynamic>{
+              'status': 'failed',
+              'endedAt':
+                  FieldValue.serverTimestamp(),
+            },
+          );
+        },
       );
     } catch (error, stackTrace) {
       _logError(
-        'MARK CALL FAILED FIRESTORE ERROR',
+        'MARK CALL FAILED',
         error,
         stackTrace,
       );
     }
   }
 
-  /// ========================================================================
-  /// RESET CALL STATE
-  /// ========================================================================
+  /// ==========================================================================
+  /// PREPARE NEW CALL
+  /// ==========================================================================
+
+  Future<void> _prepareForNewCall() async {
+    if (_activeCallId != null ||
+        _peerConnection != null ||
+        _localStream != null) {
+      await _cleanupCall();
+    }
+
+    _resetCallState();
+  }
+
+  /// ==========================================================================
+  /// RESET STATE
+  /// ==========================================================================
 
   void _resetCallState() {
     _microphoneMuted =
@@ -3645,6 +4312,9 @@ class ChattaxCallService {
     _acceptInProgress =
         false;
 
+    _connectionTimerStarted =
+        false;
+
     _pendingLocalCandidates.clear();
 
     _pendingRemoteCandidates.clear();
@@ -3654,9 +4324,149 @@ class ChattaxCallService {
     _sentLocalCandidateKeys.clear();
   }
 
-  /// ========================================================================
-  /// CLEANUP ACTIVE CALL
-  /// ========================================================================
+  String _callHistoryChatId(String callerId, String receiverId) {
+  final ids = [callerId, receiverId]..sort();
+  return ids.join('_');
+}
+
+DocumentReference<Map<String, dynamic>> _callHistoryMessageRef({
+  required String callId,
+  required String callerId,
+  required String receiverId,
+}) {
+  final chatId = _callHistoryChatId(callerId, receiverId);
+
+  return _firestore
+      .collection('chat_rooms')
+      .doc(chatId)
+      .collection('messages')
+      .doc('call_$callId');
+}
+
+DateTime? _timestampToDate(dynamic value) {
+  if (value is Timestamp) {
+    return value.toDate();
+  }
+
+  if (value is DateTime) {
+    return value;
+  }
+
+  return null;
+}
+
+Future<void> _createCallHistoryMessage({
+  required String callId,
+  required String callerId,
+  required String receiverId,
+  required ChattaxCallType type,
+}) async {
+  final bool isVideo = type == ChattaxCallType.video;
+
+  final ref = _callHistoryMessageRef(
+    callId: callId,
+    callerId: callerId,
+    receiverId: receiverId,
+  );
+
+  await ref.set(
+    {
+      'senderId': callerId,
+      'receiverId': receiverId,
+      'message': isVideo ? '📹 Video call' : '📞 Voice call',
+      'type': isVideo ? 'video_call' : 'voice_call',
+      'callId': callId,
+      'callStatus': 'outgoing',
+      'callDuration': 0,
+      'timestamp': FieldValue.serverTimestamp(),
+      'seen': false,
+      'delivered': true,
+      'isFrozen': false,
+      'isMelted': false,
+      'reactions': {},
+    },
+    SetOptions(merge: true),
+  );
+}
+
+Future<void> _updateCallHistoryMessage({
+  required String callId,
+  required String callStatus,
+  int callDuration = 0,
+}) async {
+  final callSnap =
+      await _firestore.collection('calls').doc(callId).get();
+
+  if (!callSnap.exists) {
+    return;
+  }
+
+  final data = callSnap.data();
+
+  if (data == null) {
+    return;
+  }
+
+  final callerId = (data['callerId'] ?? '').toString();
+  final receiverId = (data['receiverId'] ?? '').toString();
+
+  if (callerId.isEmpty || receiverId.isEmpty) {
+    return;
+  }
+
+  final typeValue =
+      (data['type'] ?? 'audio').toString();
+
+  final bool isVideo = typeValue == 'video';
+
+  final ref = _callHistoryMessageRef(
+    callId: callId,
+    callerId: callerId,
+    receiverId: receiverId,
+  );
+
+  await ref.set(
+    {
+      'senderId': callerId,
+      'receiverId': receiverId,
+      'message': isVideo ? '📹 Video call' : '📞 Voice call',
+      'type': isVideo ? 'video_call' : 'voice_call',
+      'callId': callId,
+      'callStatus': callStatus,
+      'callDuration': callDuration < 0 ? 0 : callDuration,
+      'delivered': true,
+      'updatedAt': FieldValue.serverTimestamp(),
+    },
+    SetOptions(merge: true),
+  );
+}
+
+Future<int> _getCallDuration(String callId) async {
+  final snap =
+      await _firestore.collection('calls').doc(callId).get();
+
+  final data = snap.data();
+
+  if (data == null) {
+    return 0;
+  }
+
+  final connectedAt =
+      _timestampToDate(data['connectedAt']);
+
+  if (connectedAt == null) {
+    return 0;
+  }
+
+  final seconds =
+      DateTime.now().difference(connectedAt).inSeconds;
+
+  return seconds < 0 ? 0 : seconds;
+}
+
+  /// ==========================================================================
+  /// CLEANUP
+  /// ==========================================================================
 
   Future<void> _cleanupCall() async {
     if (_cleanupInProgress) {
@@ -3667,110 +4477,108 @@ class ChattaxCallService {
         true;
 
     try {
-      _log(
-        'CLEANUP: starting',
-      );
-
       _cancelOutgoingCallTimer();
+
+      _cancelConnectionTimer();
 
       _cancelDisconnectTimer();
 
-      /// --------------------------------------------------------------------
-      /// CALL LISTENER
-      /// --------------------------------------------------------------------
+      /// ----------------------------------------------------------------------
+      /// FIRESTORE LISTENERS
+      /// ----------------------------------------------------------------------
 
       await _callSubscription?.cancel();
 
       _callSubscription =
           null;
 
-      /// --------------------------------------------------------------------
-      /// CALLER ICE
-      /// --------------------------------------------------------------------
-
       await _callerCandidatesSubscription?.cancel();
 
       _callerCandidatesSubscription =
           null;
-
-      /// --------------------------------------------------------------------
-      /// RECEIVER ICE
-      /// --------------------------------------------------------------------
 
       await _receiverCandidatesSubscription?.cancel();
 
       _receiverCandidatesSubscription =
           null;
 
-      /// --------------------------------------------------------------------
+      /// ----------------------------------------------------------------------
       /// PEER CONNECTION
-      /// --------------------------------------------------------------------
+      /// ----------------------------------------------------------------------
 
-      final peerConnection =
+      final pc =
           _peerConnection;
 
       _peerConnection =
           null;
 
-      if (peerConnection != null) {
+      if (pc != null) {
         try {
-          await peerConnection.close();
-        } catch (error, stackTrace) {
-          _logError(
-            'PEER CONNECTION CLOSE FAILED',
-            error,
-            stackTrace,
+          pc.onTrack =
+              null;
+
+          pc.onAddStream =
+              null;
+
+          pc.onIceCandidate =
+              null;
+
+          pc.onIceConnectionState =
+              null;
+
+          pc.onConnectionState =
+              null;
+
+          pc.onSignalingState =
+              null;
+
+          pc.onIceGatheringState =
+              null;
+
+          await pc.close();
+        } catch (error) {
+          _log(
+            'PEER CLOSE ERROR | $error',
           );
         }
       }
 
-      /// --------------------------------------------------------------------
+      /// ----------------------------------------------------------------------
       /// LOCAL STREAM
-      /// --------------------------------------------------------------------
+      /// ----------------------------------------------------------------------
 
-      final localStream =
+      final local =
           _localStream;
 
       _localStream =
           null;
 
-      if (localStream != null) {
+      if (local != null) {
         for (final track
-            in localStream.getTracks()) {
+            in local.getTracks()) {
           try {
             await track.stop();
           } catch (_) {}
         }
 
         try {
-          await localStream.dispose();
+          await local.dispose();
         } catch (_) {}
       }
 
-      /// --------------------------------------------------------------------
+      /// ----------------------------------------------------------------------
       /// REMOTE STREAM
-      /// --------------------------------------------------------------------
-
-      final remoteStream =
-          _remoteStream;
+      ///
+      /// Do not stop remote tracks here if the plugin owns the remote
+      /// receiver lifecycle. Clearing the reference is sufficient.
+      /// ----------------------------------------------------------------------
 
       _remoteStream =
           null;
 
-      if (remoteStream != null) {
-        try {
-          for (final track
-              in remoteStream.getTracks()) {
-            try {
-              await track.stop();
-            } catch (_) {}
-          }
-        } catch (_) {}
-      }
-
-      /// --------------------------------------------------------------------
-      /// RESET SIGNALING
-      /// --------------------------------------------------------------------
+      /// ----------------------------------------------------------------------
+      /// RESET
+      /// ----------------------------------------------------------------------
 
       _pendingLocalCandidates.clear();
 
@@ -3792,13 +4600,6 @@ class ChattaxCallService {
       _signalingReady =
           false;
 
-      _answerApplying =
-          false;
-
-      /// --------------------------------------------------------------------
-      /// RESET ACTIVE CALL
-      /// --------------------------------------------------------------------
-
       _activeCallId =
           null;
 
@@ -3817,15 +4618,12 @@ class ChattaxCallService {
       _speakerEnabled =
           true;
 
-      _endingCall =
+      _connectionTimerStarted =
           false;
 
-      _failureHandling =
-          false;
-
-      /// --------------------------------------------------------------------
+      /// ----------------------------------------------------------------------
       /// AUDIO ROUTING
-      /// --------------------------------------------------------------------
+      /// ----------------------------------------------------------------------
 
       try {
         await Helper.setSpeakerphoneOn(
@@ -3833,9 +4631,9 @@ class ChattaxCallService {
         );
       } catch (_) {}
 
-      /// --------------------------------------------------------------------
-      /// UI STREAMS
-      /// --------------------------------------------------------------------
+      /// ----------------------------------------------------------------------
+      /// UI STREAM RESET
+      /// ----------------------------------------------------------------------
 
       if (!_isDisposed) {
         if (!_localStreamController.isClosed) {
@@ -3852,7 +4650,7 @@ class ChattaxCallService {
       }
 
       _log(
-        'CLEANUP: complete',
+        'CALL CLEANUP COMPLETE',
       );
     } finally {
       _cleanupInProgress =
@@ -3860,9 +4658,33 @@ class ChattaxCallService {
     }
   }
 
-  /// ========================================================================
+  /// ==========================================================================
+  /// CALL CREATED TIME
+  /// ==========================================================================
+
+  DateTime? _getCallCreatedTime(
+    Map<String, dynamic> data,
+  ) {
+    final created =
+        data['createdAt'];
+
+    if (created is Timestamp) {
+      return created.toDate();
+    }
+
+    final clientCreated =
+        data['clientCreatedAt'];
+
+    if (clientCreated is Timestamp) {
+      return clientCreated.toDate();
+    }
+
+    return null;
+  }
+
+  /// ==========================================================================
   /// DISPOSE
-  /// ========================================================================
+  /// ==========================================================================
 
   Future<void> dispose() async {
     if (_isDisposed) {
@@ -3889,6 +4711,8 @@ class ChattaxCallService {
 
     await _callStatusController.close();
 
+    await _callStatusEventController.close();
+
     await _remoteStreamController.close();
 
     await _localStreamController.close();
@@ -3900,15 +4724,14 @@ class ChattaxCallService {
     );
   }
 
-  /// ========================================================================
+  /// ==========================================================================
   /// LOGGING
-  /// ========================================================================
+  /// ==========================================================================
 
   void _log(
     String message,
   ) {
-    // ignore: avoid_print
-    print(
+    debugPrint(
       '📞 [ChattªX CALL] $message',
     );
   }
@@ -3918,18 +4741,15 @@ class ChattaxCallService {
     Object error,
     StackTrace stackTrace,
   ) {
-    // ignore: avoid_print
-    print(
+    debugPrint(
       '❌ [ChattªX CALL] $message',
     );
 
-    // ignore: avoid_print
-    print(
+    debugPrint(
       '❌ ERROR: $error',
     );
 
-    // ignore: avoid_print
-    print(
+    debugPrint(
       '❌ STACK TRACE:\n$stackTrace',
     );
   }
@@ -3940,19 +4760,19 @@ class ChattaxCallService {
     final value =
         candidate.candidate ?? '';
 
-    if (value.length <= 100) {
+    if (value.length <= 120) {
       return value;
     }
 
     return value.substring(
       0,
-      100,
+      120,
     );
   }
 
-  /// ========================================================================
+  /// ==========================================================================
   /// SAFETY
-  /// ========================================================================
+  /// ==========================================================================
 
   void _ensureNotDisposed() {
     if (_isDisposed) {

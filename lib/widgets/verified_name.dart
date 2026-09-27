@@ -6,15 +6,11 @@ import 'package:flutter/material.dart';
 /// CHATTªX — VERIFIED NAME
 /// ============================================================================
 ///
-/// One verification badge used everywhere in ChattªX.
+/// Name + ChattªX verification badge.
 ///
-/// Badge size remains EXACTLY:
-///     17 × 17
-///
-/// Badge color remains EXACTLY:
-///     #2196F3
-///
-/// Only the badge shape has been changed.
+/// The badge space is ALWAYS reserved.
+/// This prevents the name row from shifting when
+/// verification data finishes loading.
 /// ============================================================================
 
 class VerifiedName extends StatelessWidget {
@@ -33,7 +29,8 @@ class VerifiedName extends StatelessWidget {
     this.textColor = Colors.white,
   });
 
-  static const Color verificationBlue = Color(0xFF2196F3);
+  static const Color verificationBlue =
+      Color(0xFF2196F3);
 
   Widget _buildVerificationBadge() {
     return const SizedBox(
@@ -69,20 +66,34 @@ class VerifiedName extends StatelessWidget {
             ),
           ),
         ),
-        if (verified) ...[
-          const SizedBox(width: 5),
-          _buildVerificationBadge(),
-        ],
+
+        const SizedBox(width: 5),
+
+        // ------------------------------------------------------------
+        // ALWAYS RESERVE THE BADGE SPACE.
+        //
+        // If verified == false, the space stays there but is invisible.
+        // This prevents the name from jumping when verification arrives.
+        // ------------------------------------------------------------
+
+        SizedBox(
+          width: 17,
+          height: 17,
+          child: verified
+              ? _buildVerificationBadge()
+              : const SizedBox.shrink(),
+        ),
       ],
     );
   }
 }
 
 /// ============================================================================
-/// PLAIN BLUE CHATTªX VERIFICATION BADGE
+/// CHATTªX VERIFICATION BADGE
 /// ============================================================================
 
-class _VerificationBadgePainter extends CustomPainter {
+class _VerificationBadgePainter
+    extends CustomPainter {
   const _VerificationBadgePainter();
 
   @override
@@ -90,11 +101,18 @@ class _VerificationBadgePainter extends CustomPainter {
     Canvas canvas,
     Size size,
   ) {
-    final double centerX = size.width / 2;
-    final double centerY = size.height / 2;
+    final double centerX =
+        size.width / 2;
+
+    final double centerY =
+        size.height / 2;
 
     final double outerRadius =
-        math.min(size.width, size.height) / 2;
+        math.min(
+          size.width,
+          size.height,
+        ) /
+        2;
 
     final double innerRadius =
         outerRadius * 0.80;
@@ -109,13 +127,17 @@ class _VerificationBadgePainter extends CustomPainter {
           (2 * math.pi * i / points);
 
       final double radius =
-          i.isEven ? outerRadius : innerRadius;
+          i.isEven
+              ? outerRadius
+              : innerRadius;
 
       final double x =
-          centerX + math.cos(angle) * radius;
+          centerX +
+          math.cos(angle) * radius;
 
       final double y =
-          centerY + math.sin(angle) * radius;
+          centerY +
+          math.sin(angle) * radius;
 
       if (i == 0) {
         path.moveTo(x, y);
@@ -129,8 +151,10 @@ class _VerificationBadgePainter extends CustomPainter {
     canvas.drawPath(
       path,
       Paint()
-        ..color = const Color(0xFF2196F3)
-        ..style = PaintingStyle.fill,
+        ..color =
+            const Color(0xFF2196F3)
+        ..style =
+            PaintingStyle.fill,
     );
   }
 

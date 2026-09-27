@@ -1,41 +1,29 @@
 import 'dart:async';
 
+import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:just_audio/just_audio.dart';
 
 import '../../services/call_service.dart';
+import '../../widgets/verified_name.dart';
 import 'voice_call_screen.dart';
 
 /// ============================================================================
 /// CHATTªX — INCOMING VOICE CALL SCREEN
 /// ============================================================================
 ///
-/// FLOW:
+/// Incoming call UI.
 ///
-/// Firestore
-///     │
-///     ▼
-/// IncomingVoiceCallScreen
-///     │
-///     ├── Decline
-///     │      └── rejectCall()
-///     │
-///     └── Accept
-///            └── acceptCall()
-///                   │
-///                   ▼
-///             VoiceCallScreen
-///                   │
-///                   ▼
-///             WebRTC connects
+/// This screen:
+/// - Owns the incoming-call UI
+/// - Owns the incoming ringtone
+/// - Accepts / declines the call
+/// - Supports swipe-up answering
+/// - Shows caller verification
+/// - Opens VoiceCallScreen using the SAME callId
 ///
-/// IMPORTANT:
-/// - This screen does NOT own WebRTC.
-/// - ChattaxCallService owns signaling/WebRTC.
-/// - This screen owns the incoming-call UI and ringtone.
-/// - When acceptCall() succeeds, we immediately navigate to
-///   VoiceCallScreen instead of waiting for a CONNECTED event.
+/// WebRTC/signaling remains owned by ChattaxCallService.
 /// ============================================================================
 
 class IncomingVoiceCallScreen extends StatefulWidget {
@@ -45,6 +33,9 @@ class IncomingVoiceCallScreen extends StatefulWidget {
   final String? callerImageUrl;
   final ImageProvider? callerImage;
 
+  /// Initial verification value supplied by the caller.
+  ///
+  /// Firestore verification is loaded as the authoritative value.
   final bool isVerified;
 
   final VoidCallback? onDecline;
@@ -57,7 +48,7 @@ class IncomingVoiceCallScreen extends StatefulWidget {
     this.callerName = 'Brandon Hotshot',
     this.callerImageUrl,
     this.callerImage,
-    this.isVerified = true,
+    this.isVerified = false,
     this.onDecline,
     this.onRemindMe,
     this.onMessage,
@@ -95,7 +86,6 @@ class _IncomingVoiceCallScreenState
   // ==========================================================================
 
   late final AnimationController _pulseController;
-
   late final Animation<double> _pulseAnimation;
 
   // ==========================================================================
@@ -103,17 +93,17 @@ class _IncomingVoiceCallScreenState
   // ==========================================================================
 
   bool _isProcessing = false;
-
   bool _hasOpenedCall = false;
-
   bool _hasClosed = false;
+
+  /// Actual Firestore verification state.
+  bool _isVerified = false;
 
   // ==========================================================================
   // SWIPE
   // ==========================================================================
 
   bool _isSwipeTracking = false;
-
   double _swipeDistance = 0.0;
 
   static const double _swipeThreshold = 100.0;
@@ -151,9 +141,68 @@ class _IncomingVoiceCallScreenState
 
     _listenToCallStatus();
 
+    // Start with the value supplied by the caller,
+    // then replace it with the actual Firestore value.
+    _isVerified = widget.isVerified;
+
+    unawaited(
+      _loadVerificationStatus(),
+    );
+
     unawaited(
       _startIncomingRingtone(),
     );
+  }
+
+  // ==========================================================================
+  // VERIFICATION
+  // ==========================================================================
+
+  Future<void> _loadVerificationStatus() async {
+    try {
+      final String name =
+          _displayCallerName.trim();
+
+      if (name.isEmpty) {
+        return;
+      }
+
+      final QuerySnapshot<Map<String, dynamic>>
+          snapshot =
+          await FirebaseFirestore.instance
+              .collection('users')
+              .where(
+                'displayName',
+                isEqualTo: name,
+              )
+              .limit(1)
+              .get();
+
+      if (!mounted ||
+          snapshot.docs.isEmpty) {
+        return;
+      }
+
+      final Map<String, dynamic> data =
+          snapshot.docs.first.data();
+
+      final bool verified =
+          data['verified'] == true ||
+          data['isVerified'] == true;
+
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _isVerified = verified;
+      });
+    } catch (error) {
+      debugPrint(
+        'ChattªX incoming verification lookup error: '
+        '$error',
+      );
+    }
   }
 
   // ==========================================================================
@@ -175,7 +224,8 @@ class _IncomingVoiceCallScreenState
       const SystemUiOverlayStyle(
         statusBarColor: Colors.transparent,
         systemNavigationBarColor: Colors.transparent,
-        statusBarIconBrightness: Brightness.dark,
+        statusBarIconBrightness:
+            Brightness.dark,
         systemNavigationBarIconBrightness:
             Brightness.dark,
       ),
@@ -193,7 +243,8 @@ class _IncomingVoiceCallScreenState
       const SystemUiOverlayStyle(
         statusBarColor: Colors.transparent,
         systemNavigationBarColor: Colors.transparent,
-        statusBarIconBrightness: Brightness.light,
+        statusBarIconBrightness:
+            Brightness.light,
         systemNavigationBarIconBrightness:
             Brightness.light,
       ),
@@ -207,7 +258,8 @@ class _IncomingVoiceCallScreenState
   Future<void> _startIncomingRingtone() async {
     if (_ringtoneStarting ||
         _ringtoneDisposed ||
-        _hasClosed) {
+        _hasClosed ||
+        _hasOpenedCall) {
       return;
     }
 
@@ -223,7 +275,8 @@ class _IncomingVoiceCallScreenState
       );
 
       if (_hasClosed ||
-          _ringtoneDisposed) {
+          _ringtoneDisposed ||
+          _hasOpenedCall) {
         return;
       }
 
@@ -234,7 +287,8 @@ class _IncomingVoiceCallScreenState
       await _ringtonePlayer.setVolume(1.0);
 
       if (_hasClosed ||
-          _ringtoneDisposed) {
+          _ringtoneDisposed ||
+          _hasOpenedCall) {
         return;
       }
 
@@ -320,7 +374,9 @@ class _IncomingVoiceCallScreenState
   void _handleCallStatus(
     ChattaxCallStatus status,
   ) {
-    if (!mounted || _hasClosed) {
+    if (!mounted ||
+        _hasClosed ||
+        _hasOpenedCall) {
       return;
     }
 
@@ -330,9 +386,8 @@ class _IncomingVoiceCallScreenState
     );
 
     switch (status) {
-      // ======================================================================
-      // RINGING
-      // ======================================================================
+      case ChattaxCallStatus.calling:
+        break;
 
       case ChattaxCallStatus.ringing:
         if (!_isProcessing) {
@@ -341,17 +396,6 @@ class _IncomingVoiceCallScreenState
           );
         }
         break;
-
-      // ======================================================================
-      // CALLING
-      // ======================================================================
-
-      case ChattaxCallStatus.calling:
-        break;
-
-      // ======================================================================
-      // CONNECTING
-      // ======================================================================
 
       case ChattaxCallStatus.connecting:
         unawaited(
@@ -367,26 +411,11 @@ class _IncomingVoiceCallScreenState
         }
         break;
 
-      // ======================================================================
-      // CONNECTED
-      // ======================================================================
-      //
-      // Normally VoiceCallScreen is already open because we navigate
-      // immediately after acceptCall().
-      //
-      // This remains as a safety fallback in case the service reports
-      // connected before navigation finishes.
-      // ======================================================================
-
       case ChattaxCallStatus.connected:
         if (!_hasOpenedCall) {
           _openConnectedCall();
         }
         break;
-
-      // ======================================================================
-      // REJECTED
-      // ======================================================================
 
       case ChattaxCallStatus.rejected:
         unawaited(
@@ -398,10 +427,6 @@ class _IncomingVoiceCallScreenState
         }
         break;
 
-      // ======================================================================
-      // ENDED
-      // ======================================================================
-
       case ChattaxCallStatus.ended:
         unawaited(
           _stopRingtone(),
@@ -411,10 +436,6 @@ class _IncomingVoiceCallScreenState
           _closeIncomingScreen();
         }
         break;
-
-      // ======================================================================
-      // FAILED
-      // ======================================================================
 
       case ChattaxCallStatus.failed:
         unawaited(
@@ -439,23 +460,6 @@ class _IncomingVoiceCallScreenState
   // ==========================================================================
   // ACCEPT CALL
   // ==========================================================================
-  //
-  // IMPORTANT CHANGE:
-  //
-  // OLD:
-  //
-  //   await acceptCall()
-  //   wait for connected
-  //   open VoiceCallScreen
-  //
-  // NEW:
-  //
-  //   await acceptCall()
-  //   immediately open VoiceCallScreen
-  //
-  // VoiceCallScreen then owns the connected-call UI while the service
-  // continues handling WebRTC.
-  // ==========================================================================
 
   Future<void> _acceptCall() async {
     if (_isProcessing ||
@@ -464,7 +468,8 @@ class _IncomingVoiceCallScreenState
       return;
     }
 
-    final callId = widget.callId.trim();
+    final String callId =
+        widget.callId.trim();
 
     if (callId.isEmpty) {
       _showCallError(
@@ -504,10 +509,6 @@ class _IncomingVoiceCallScreenState
         '════════════════════════════════════',
       );
 
-      // ======================================================================
-      // ACCEPT CALL IN SERVICE
-      // ======================================================================
-
       await _callService.acceptCall(
         callId,
       );
@@ -519,19 +520,15 @@ class _IncomingVoiceCallScreenState
       }
 
       debugPrint(
-        'ChattªX: acceptCall() completed.',
+        'ChattªX: acceptCall() completed successfully.',
       );
 
       debugPrint(
-        'ChattªX: opening VoiceCallScreen...',
+        'ChattªX: WebRTC receiver setup has been '
+        'handed to ChattaxCallService.',
       );
 
-      // ======================================================================
-      // OPEN REAL CALL SCREEN IMMEDIATELY
-      // ======================================================================
-
       _openVoiceCallScreen();
-
     } catch (error, stackTrace) {
       debugPrint(
         '════════════════════════════════════',
@@ -643,7 +640,8 @@ class _IncomingVoiceCallScreenState
           Animation<double> secondaryAnimation,
           Widget child,
         ) {
-          final curvedAnimation =
+          final CurvedAnimation
+              curvedAnimation =
               CurvedAnimation(
             parent: animation,
             curve: Curves.easeOutCubic,
@@ -669,6 +667,11 @@ class _IncomingVoiceCallScreenState
       return;
     }
 
+    debugPrint(
+      'ChattªX: connected event received '
+      'before VoiceCallScreen opened.',
+    );
+
     _openVoiceCallScreen();
   }
 
@@ -679,7 +682,11 @@ class _IncomingVoiceCallScreenState
   String _friendlyAcceptError(
     Object error,
   ) {
-    final message = error.toString();
+    final String message =
+        error.toString();
+
+    final String lowerMessage =
+        message.toLowerCase();
 
     if (message.contains(
       'permission-denied',
@@ -688,29 +695,38 @@ class _IncomingVoiceCallScreenState
           'Check your Firestore rules.';
     }
 
-    if (message.toLowerCase().contains(
+    if (lowerMessage.contains(
       'microphone',
     )) {
       return 'Microphone permission is required '
           'to answer the call.';
     }
 
-    if (message.toLowerCase().contains(
+    if (lowerMessage.contains(
       'receiver mismatch',
     )) {
       return 'This call belongs to another account.';
     }
 
-    if (message.toLowerCase().contains(
+    if (lowerMessage.contains(
       'no longer available',
     )) {
       return 'This call is no longer available.';
     }
 
-    if (message.toLowerCase().contains(
+    if (lowerMessage.contains(
       'offer',
     )) {
       return 'The caller connection could not be established.';
+    }
+
+    if (lowerMessage.contains(
+          'status',
+        ) &&
+        lowerMessage.contains(
+          'ringing',
+        )) {
+      return 'This call is no longer ringing.';
     }
 
     return 'Unable to answer call.\n$message';
@@ -726,7 +742,8 @@ class _IncomingVoiceCallScreenState
       return;
     }
 
-    final callId = widget.callId.trim();
+    final String callId =
+        widget.callId.trim();
 
     HapticFeedback.mediumImpact();
 
@@ -904,12 +921,11 @@ class _IncomingVoiceCallScreenState
       return;
     }
 
-    final movement =
+    final double movement =
         -details.delta.dy;
 
-    final nextDistance =
-        (_swipeDistance + movement)
-            .clamp(
+    final double nextDistance =
+        (_swipeDistance + movement).clamp(
       0.0,
       _swipeThreshold,
     );
@@ -989,7 +1005,7 @@ class _IncomingVoiceCallScreenState
       return widget.callerImage!;
     }
 
-    final url =
+    final String? url =
         widget.callerImageUrl?.trim();
 
     if (url != null &&
@@ -1007,7 +1023,7 @@ class _IncomingVoiceCallScreenState
   // ==========================================================================
 
   String get _displayCallerName {
-    final name =
+    final String name =
         widget.callerName.trim();
 
     if (name.isEmpty) {
@@ -1046,25 +1062,29 @@ class _IncomingVoiceCallScreenState
             BuildContext context,
             BoxConstraints constraints,
           ) {
-            final width =
+            final double width =
                 constraints.maxWidth;
 
-            final height =
+            final double height =
                 constraints.maxHeight;
 
-            final avatarSize =
+            // ================================================================
+            // MATCH OUTGOING SCREEN SIZING
+            // ================================================================
+
+            final double avatarSize =
                 (width * 0.50).clamp(
               170.0,
               330.0,
             );
 
-            final buttonSize =
+            final double buttonSize =
                 (width * 0.145).clamp(
               64.0,
               92.0,
             );
 
-            final horizontalPadding =
+            final double horizontalPadding =
                 (width * 0.07).clamp(
               20.0,
               55.0,
@@ -1086,6 +1106,10 @@ class _IncomingVoiceCallScreenState
                     ),
                     child: Column(
                       children: [
+                        // ====================================================
+                        // TOP SPACING
+                        // ====================================================
+
                         SizedBox(
                           height:
                               (height * 0.035)
@@ -1094,6 +1118,10 @@ class _IncomingVoiceCallScreenState
                             42.0,
                           ),
                         ),
+
+                        // ====================================================
+                        // HEADER
+                        // ====================================================
 
                         _buildHeader(),
 
@@ -1106,6 +1134,10 @@ class _IncomingVoiceCallScreenState
                           ),
                         ),
 
+                        // ====================================================
+                        // CALLER
+                        // ====================================================
+
                         Expanded(
                           flex: 5,
                           child: Center(
@@ -1117,6 +1149,10 @@ class _IncomingVoiceCallScreenState
                           ),
                         ),
 
+                        // ====================================================
+                        // SECONDARY ACTIONS
+                        // ====================================================
+
                         _buildSecondaryActions(),
 
                         SizedBox(
@@ -1127,6 +1163,10 @@ class _IncomingVoiceCallScreenState
                             30.0,
                           ),
                         ),
+
+                        // ====================================================
+                        // DECLINE / ACCEPT
+                        // ====================================================
 
                         _buildCallButtons(
                           buttonSize,
@@ -1140,6 +1180,10 @@ class _IncomingVoiceCallScreenState
                             22.0,
                           ),
                         ),
+
+                        // ====================================================
+                        // SWIPE
+                        // ====================================================
 
                         _buildSwipeGestureArea(),
 
@@ -1184,15 +1228,14 @@ class _IncomingVoiceCallScreenState
   }
 
   // ==========================================================================
-  // OVERLAY
+  // BACKGROUND OVERLAY
   // ==========================================================================
 
   Widget _buildBackgroundOverlay() {
     return IgnorePointer(
       child: DecoratedBox(
         decoration: BoxDecoration(
-          gradient:
-              LinearGradient(
+          gradient: LinearGradient(
             begin:
                 Alignment.topCenter,
             end:
@@ -1318,7 +1361,7 @@ class _IncomingVoiceCallScreenState
     double avatarSize,
     double width,
   ) {
-    final nameSize =
+    final double nameSize =
         (width * 0.064).clamp(
       22.0,
       31.0,
@@ -1328,12 +1371,15 @@ class _IncomingVoiceCallScreenState
       mainAxisSize:
           MainAxisSize.min,
       children: [
+        // ================================================================
+        // WAVEFORM
+        // ================================================================
+
         SizedBox(
           width:
               double.infinity,
           height: 28,
-          child:
-              const CustomPaint(
+          child: const CustomPaint(
             painter:
                 _WaveformPainter(),
           ),
@@ -1342,6 +1388,10 @@ class _IncomingVoiceCallScreenState
         const SizedBox(
           height: 5,
         ),
+
+        // ================================================================
+        // AVATAR
+        // ================================================================
 
         AnimatedBuilder(
           animation:
@@ -1366,6 +1416,10 @@ class _IncomingVoiceCallScreenState
           height: 14,
         ),
 
+        // ================================================================
+        // VERIFIED NAME
+        // ================================================================
+
         _buildCallerName(
           nameSize,
         ),
@@ -1373,6 +1427,10 @@ class _IncomingVoiceCallScreenState
         const SizedBox(
           height: 7,
         ),
+
+        // ================================================================
+        // STATUS
+        // ================================================================
 
         AnimatedSwitcher(
           duration:
@@ -1409,8 +1467,10 @@ class _IncomingVoiceCallScreenState
     double avatarSize,
   ) {
     return Container(
-      width: avatarSize,
-      height: avatarSize,
+      width:
+          avatarSize,
+      height:
+          avatarSize,
       padding:
           const EdgeInsets.all(4),
       decoration:
@@ -1419,8 +1479,10 @@ class _IncomingVoiceCallScreenState
             BoxShape.circle,
         gradient:
             const LinearGradient(
-          begin: Alignment.topLeft,
-          end: Alignment.bottomRight,
+          begin:
+              Alignment.topLeft,
+          end:
+              Alignment.bottomRight,
           colors: [
             Color(0xFFA855FF),
             Color(0xFF763BFF),
@@ -1510,79 +1572,17 @@ class _IncomingVoiceCallScreenState
           const EdgeInsets.symmetric(
         horizontal: 12,
       ),
-      child: Row(
-        mainAxisSize:
-            MainAxisSize.min,
-        children: [
-          Flexible(
-            child:
-                ConstrainedBox(
-              constraints:
-                  const BoxConstraints(
-                maxWidth: 280,
-              ),
-              child: Text(
-                _displayCallerName,
-                maxLines: 1,
-                overflow:
-                    TextOverflow.ellipsis,
-                textAlign:
-                    TextAlign.center,
-                style:
-                    TextStyle(
-                  color:
-                      Colors.white,
-                  fontSize:
-                      nameSize,
-                  fontWeight:
-                      FontWeight.w700,
-                  letterSpacing:
-                      -0.6,
-                ),
-              ),
-            ),
-          ),
-
-          if (widget.isVerified) ...[
-            const SizedBox(
-              width: 8,
-            ),
-            _buildVerifiedBadge(),
-          ],
-        ],
-      ),
-    );
-  }
-
-  // ==========================================================================
-  // VERIFIED BADGE
-  // ==========================================================================
-
-  Widget _buildVerifiedBadge() {
-    return Semantics(
-      label: 'Verified',
-      child: Container(
-        width: 31,
-        height: 31,
-        decoration:
-            const BoxDecoration(
-          shape:
-              BoxShape.circle,
-          gradient:
-              LinearGradient(
-            colors: [
-              Color(0xFFB34BFF),
-              Color(0xFF7131FF),
-            ],
-          ),
-        ),
-        child:
-            const Icon(
-          Icons.check_rounded,
-          color:
-              Colors.white,
-          size: 21,
-        ),
+      child: VerifiedName(
+        name:
+            _displayCallerName,
+        verified:
+            _isVerified,
+        fontSize:
+            nameSize,
+        fontWeight:
+            FontWeight.w700,
+        textColor:
+            Colors.white,
       ),
     );
   }
@@ -1606,6 +1606,7 @@ class _IncomingVoiceCallScreenState
           enabled:
               !_isProcessing,
         ),
+
         _SecondaryCallAction(
           icon:
               Icons.chat_bubble_rounded,
@@ -1647,6 +1648,7 @@ class _IncomingVoiceCallScreenState
           onTap:
               _declineCall,
         ),
+
         _CallActionButton(
           size:
               buttonSize,
@@ -1672,7 +1674,7 @@ class _IncomingVoiceCallScreenState
   // ==========================================================================
 
   Widget _buildSwipeGestureArea() {
-    final progress =
+    final double progress =
         (_swipeDistance /
                 _swipeThreshold)
             .clamp(
@@ -1680,7 +1682,7 @@ class _IncomingVoiceCallScreenState
       1.0,
     );
 
-    final progressColor =
+    final Color progressColor =
         Color.lerp(
       const Color(0xFF7B2FF7),
       const Color(0xFF00D9FF),
@@ -1772,8 +1774,7 @@ class _IncomingVoiceCallScreenState
                     value:
                         progress,
                     backgroundColor:
-                        Colors.white
-                            .withValues(
+                        Colors.white.withValues(
                       alpha: 0.10,
                     ),
                     valueColor:
@@ -1799,11 +1800,8 @@ class _IncomingVoiceCallScreenState
 class _SecondaryCallAction
     extends StatelessWidget {
   final IconData icon;
-
   final String title;
-
   final VoidCallback onTap;
-
   final bool enabled;
 
   const _SecondaryCallAction({
@@ -1865,8 +1863,7 @@ class _SecondaryCallAction
                   style:
                       TextStyle(
                     color:
-                        Colors.white
-                            .withValues(
+                        Colors.white.withValues(
                       alpha: 0.70,
                     ),
                     fontSize:
@@ -1891,15 +1888,10 @@ class _SecondaryCallAction
 class _CallActionButton
     extends StatelessWidget {
   final double size;
-
   final Color backgroundColor;
-
   final IconData icon;
-
   final String label;
-
   final VoidCallback onTap;
-
   final bool enabled;
 
   const _CallActionButton({
@@ -1966,10 +1958,8 @@ class _CallActionButton
                     boxShadow: [
                       BoxShadow(
                         color:
-                            backgroundColor
-                                .withValues(
-                          alpha:
-                              0.30,
+                            backgroundColor.withValues(
+                          alpha: 0.30,
                         ),
                         blurRadius:
                             22,
@@ -1999,8 +1989,7 @@ class _CallActionButton
               style:
                   TextStyle(
                 color:
-                    Colors.white
-                        .withValues(
+                    Colors.white.withValues(
                   alpha: 0.70,
                 ),
                 fontSize:
@@ -2054,8 +2043,8 @@ class _WaveformPainter
 
       final double baseHeight =
           4 +
-          (1 - centerDistance) *
-              18;
+              (1 - centerDistance) *
+                  18;
 
       final double variation =
           ((i * 37) % 11) / 11;
@@ -2063,11 +2052,9 @@ class _WaveformPainter
       final double barHeight =
           baseHeight *
               (0.55 +
-                  variation *
-                      0.45);
+                  variation * 0.45);
 
-      if (i <
-          barCount / 2) {
+      if (i < barCount / 2) {
         paint.color =
             Color.lerp(
           const Color(
@@ -2076,8 +2063,7 @@ class _WaveformPainter
           const Color(
             0xFF7D35FF,
           ),
-          i /
-              (barCount / 2),
+          i / (barCount / 2),
         )!;
       } else {
         paint.color =
@@ -2088,8 +2074,7 @@ class _WaveformPainter
           const Color(
             0xFF00A8FF,
           ),
-          (i -
-                  barCount / 2) /
+          (i - barCount / 2) /
               (barCount / 2),
         )!;
       }
@@ -2112,8 +2097,7 @@ class _WaveformPainter
 
   @override
   bool shouldRepaint(
-    covariant
-        _WaveformPainter oldDelegate,
+    covariant _WaveformPainter oldDelegate,
   ) {
     return false;
   }

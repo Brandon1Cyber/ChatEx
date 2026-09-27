@@ -27,6 +27,8 @@ import '../widgets/message_menu.dart';
 import '../widgets/reaction_bar.dart';
 import '../widgets/typing_indicator.dart';
 import '../widgets/voice_recorder.dart';
+import 'package:image_picker/image_picker.dart';
+import 'package:file_picker/file_picker.dart';
 
 class ChatScreen extends StatefulWidget {
   final String receiverId;
@@ -46,16 +48,13 @@ class ChatScreen extends StatefulWidget {
 
 class _ChatScreenState extends State<ChatScreen> {
   // ============================================================
-  // FIREBASE
+  // FIREBASE / SERVICES
   // ============================================================
 
   final FirebaseAuth _auth = FirebaseAuth.instance;
-
-  final FirebaseFirestore _firestore =
-      FirebaseFirestore.instance;
+  final FirebaseFirestore _firestore = FirebaseFirestore.instance;
 
   final ChatService _chatService = ChatService();
-
   final ChatMessageCacheService _messageCache =
       ChatMessageCacheService();
 
@@ -66,77 +65,66 @@ class _ChatScreenState extends State<ChatScreen> {
   final TextEditingController _controller =
       TextEditingController();
 
-  final TextEditingController _reactionEmojiController =
-      TextEditingController();
-
-  final FocusNode _reactionEmojiFocusNode =
-      FocusNode();
-
   final ScrollController _scrollController =
       ScrollController();
 
-  final GlobalKey _messageListKey =
-      GlobalKey();
-
   // ============================================================
-  // MESSAGE KEYS
+  // SUBSCRIPTIONS
   // ============================================================
 
-  final Map<String, GlobalKey> _messageKeys = {};
-
-  // ============================================================
-  // SUBSCRIPTIONS / TIMERS
-  // ============================================================
-
-  Timer? _typingTimer;
-
+  StreamSubscription? _messagesSubscription;
   StreamSubscription? _typingSubscription;
   StreamSubscription? _receiverStatusSubscription;
-  StreamSubscription? _messagesSubscription;
-
-  StreamSubscription?
-      _currentUserVerificationSubscription;
-
-  StreamSubscription?
-      _receiverVerificationSubscription;
-
+  StreamSubscription? _currentVerificationSubscription;
+  StreamSubscription? _receiverVerificationSubscription;
   StreamSubscription? _liveLocationSubscription;
+
+  Timer? _typingTimer;
 
   // ============================================================
   // MESSAGE STATE
   // ============================================================
 
-  List<Map<String, dynamic>> _currentMessages = [];
+  List<Map<String, dynamic>> _messages = [];
 
-  List<Map<String, dynamic>> cachedMessages = [];
-
-  bool _firestoreHasLoadedMessages = false;
-
-  bool _isInitialMessageLoad = true;
+  bool _firestoreLoaded = false;
+bool _loadingInitialMessages = false;
 
   // ============================================================
   // UI STATE
   // ============================================================
 
   bool typing = false;
-
   bool recording = false;
-
   bool showQuickActions = true;
+  bool _sendingMessage = false;
+  bool _sendingVoice = false;
 
   String receiverStatus = "Offline";
 
-  String currentDateLabel = "";
+final ValueNotifier<String> _currentDateLabel =
+    ValueNotifier<String>("");
+
+bool _dateUpdateScheduled = false;
 
   // ============================================================
-  // SELECTION / REACTIONS
-  // ============================================================
+// SELECTION
+// ============================================================
 
-  String? _selectedMessageId;
+String? _selectedMessageId;
 
-  String? _reactionMessageId;
+/// Keeps the floating reaction/menu overlay attached to the
+/// selected message without changing the message-list layout.
+///
+/// IMPORTANT:
+/// We deliberately do NOT use a GlobalKey or measure the
+/// RenderBox. The overlay follows the selected message through
+/// Flutter's composited transform system.
+final LayerLink _selectionLayerLink = LayerLink();
 
-  bool _processingReactionEmoji = false;
+bool get hasSelectedMessage =>
+    _selectedMessageId != null &&
+    _selectedMessageId!.isNotEmpty;
 
   // ============================================================
   // REPLY
@@ -149,7 +137,6 @@ class _ChatScreenState extends State<ChatScreen> {
   // ============================================================
 
   bool receiverIsVerified = false;
-
   bool currentUserIsVerified = false;
 
   // ============================================================
@@ -160,10 +147,14 @@ class _ChatScreenState extends State<ChatScreen> {
       _liveLocationController;
 
   bool _startingLiveLocation = false;
-
   bool _liveLocationMessageSent = false;
-
   String? _liveLocationMessageId;
+
+  // ============================================================
+  // REACTION
+  // ============================================================
+
+  bool _processingReaction = false;
 
   // ============================================================
   // GETTERS
@@ -172,186 +163,361 @@ class _ChatScreenState extends State<ChatScreen> {
   String get currentUser =>
       _auth.currentUser?.uid ?? "";
 
-  bool get hasSelectedMessage =>
-      _selectedMessageId != null;
-
   String get chatId {
-    final users = <String>[
+    final ids = <String>[
       currentUser,
       widget.receiverId,
     ];
 
-    users.sort();
+    ids.sort();
 
-    return users.join("_");
+    return ids.join("_");
   }
 
+// ============================================================
+// INIT
+// ============================================================
+
+@override
+void initState() {
+  super.initState();
+
   // ============================================================
-  // INIT
+  // LIVE LOCATION
   // ============================================================
 
-  @override
-  void initState() {
-    super.initState();
+  _liveLocationController =
+      ChattaXLiveLocationController();
 
-    _liveLocationController =
-        ChattaXLiveLocationController();
+  // ============================================================
+  // SCROLL
+  // ============================================================
 
-    _loadCachedMessages();
+  _scrollController.addListener(
+    _onScroll,
+  );
 
-    _chatService.setOnline();
+  // ============================================================
+  // LOAD CACHE IMMEDIATELY
+  // ============================================================
+  //
+  // Hive reads synchronously because the box was already opened
+  // in main.dart.
+  //
+  // This puts the previous conversation into _messages before
+  // the first useful frame whenever cached messages exist.
+  //
 
-    _resetUnreadCount();
+  _loadCachedMessages();
 
-    _listenToMessages();
+  // ============================================================
+  // START MESSAGE STREAM IMMEDIATELY
+  // ============================================================
+  //
+  // IMPORTANT:
+  // Do NOT put this inside addPostFrameCallback.
+  //
+  // Firestore's local/offline cache can deliver data without
+  // waiting for the network. Starting the listener immediately
+  // allows the conversation to appear as soon as Flutter can
+  // build it.
+  //
 
-    _listenToTyping();
+  _listenToMessages();
 
-    _listenToReceiverStatus();
+  // ============================================================
+  // ONLINE STATUS
+  // ============================================================
 
-    _listenToVerificationStatus();
+  _chatService.setOnline();
 
-    _loadExistingLiveLocationSession();
+  // ============================================================
+  // RESET UNREAD
+  // ============================================================
 
-    Future.microtask(
-      _markMessagesAsSeen,
-    );
+  _resetUnreadCount();
 
-    _scrollController.addListener(
-      _onScroll,
-    );
-  }
+  // ============================================================
+  // TYPING
+  // ============================================================
+
+  _listenToTyping();
+
+  // ============================================================
+  // RECEIVER STATUS
+  // ============================================================
+
+  _listenToReceiverStatus();
+
+  // ============================================================
+  // VERIFICATION
+  // ============================================================
+
+  _listenToVerificationStatus();
+
+  // ============================================================
+  // LIVE LOCATION
+  // ============================================================
+
+  _loadExistingLiveLocationSession();
+
+  // ============================================================
+  // AFTER FIRST FRAME
+  // ============================================================
+  //
+  // These operations depend on the widgets having been laid out,
+  // so they can safely remain after the first frame.
+  //
+
+  WidgetsBinding.instance.addPostFrameCallback(
+    (_) {
+      if (!mounted) return;
+
+      // ----------------------------------------------------------
+      // MARK MESSAGES SEEN
+      // ----------------------------------------------------------
+
+      _markMessagesAsSeen();
+
+      // ----------------------------------------------------------
+      // UPDATE DATE LABEL
+      // ----------------------------------------------------------
+
+      _scheduleDateUpdate();
+    },
+  );
+}
+
 
   // ============================================================
   // CACHE
   // ============================================================
 
-  void _loadCachedMessages() {
-    final cached =
-        _messageCache.getMessages(chatId);
+void _loadCachedMessages() {
+  if (currentUser.isEmpty) {
+    return;
+  }
+
+  try {
+    // ============================================================
+    // READ HIVE CACHE
+    // ============================================================
+
+    final cached = _messageCache.getMessages(
+      chatId,
+    );
+
+    // ============================================================
+    // NOTHING CACHED
+    // ============================================================
 
     if (cached.isEmpty) {
-      debugPrint(
-        "ChattªX CACHE: No cached messages for $chatId.",
-      );
+      _messages = <Map<String, dynamic>>[];
+
+      _firestoreLoaded = false;
+      _loadingInitialMessages = false;
+
       return;
     }
 
-    cachedMessages =
-        List<Map<String, dynamic>>.from(
-      cached,
-    );
+    // ============================================================
+    // CREATE SAFE COPY
+    // ============================================================
 
-    _currentMessages =
-        List<Map<String, dynamic>>.from(
-      cached,
-    );
-
-    _isInitialMessageLoad = false;
-
-    debugPrint(
-      "ChattªX CACHE: "
-      "${cached.length} messages loaded immediately.",
-    );
-  }
-
-  // ============================================================
-  // FIRESTORE MESSAGE LISTENER
-  // ============================================================
-
-  void _listenToMessages() {
-    _messagesSubscription?.cancel();
-
-    _messagesSubscription = _firestore
-        .collection("chat_rooms")
-        .doc(chatId)
-        .collection("messages")
-        .orderBy(
-          "timestamp",
-          descending: false,
+    final safeCopy = cached
+        .map<Map<String, dynamic>>(
+          (message) => Map<String, dynamic>.from(
+            message,
+          ),
         )
-        .snapshots()
-        .listen(
-      (snapshot) {
-        if (!mounted) {
-          return;
-        }
+        .toList();
 
-        final firestoreMessages =
-            snapshot.docs
-                .map<Map<String, dynamic>>(
-          (doc) {
-            return {
-              ...doc.data(),
-              "_id": doc.id,
-            };
-          },
-        ).toList();
+    // ============================================================
+    // PUT CACHE INTO MEMORY IMMEDIATELY
+    // ============================================================
+    //
+    // This is the important part.
+    //
+    // The ListView should be able to use these messages during the
+    // very first build instead of waiting for Firestore.
+    //
 
-        _firestoreHasLoadedMessages = true;
+    _messages = safeCopy;
 
-        if (firestoreMessages.isEmpty) {
-          debugPrint(
-            "ChattªX FIRESTORE: No messages returned.",
+    _firestoreLoaded = false;
+    _loadingInitialMessages = false;
+
+    // ============================================================
+    // PRE-CACHE IMAGES
+    // ============================================================
+    //
+    // Image downloading MUST NOT block the messages from appearing.
+    //
+
+    for (final message in safeCopy) {
+      final imageUrl =
+          message["imageUrl"]
+                  ?.toString()
+                  .trim() ??
+              "";
+
+      if (imageUrl.isNotEmpty &&
+          imageUrl.startsWith("http")) {
+        precacheImage(
+          NetworkImage(imageUrl),
+          context,
+        );
+      }
+    }
+
+    // ============================================================
+    // AFTER FIRST FRAME
+    // ============================================================
+
+    WidgetsBinding.instance.addPostFrameCallback(
+      (_) {
+        if (!mounted) return;
+
+        _scheduleDateUpdate();
+
+        // ========================================================
+        // OPEN AT NEWEST MESSAGE
+        // ========================================================
+
+        if (_scrollController.hasClients) {
+          _scrollController.jumpTo(
+            _scrollController.position.minScrollExtent,
           );
-
-          if (_currentMessages.isEmpty &&
-              _isInitialMessageLoad) {
-            setState(() {
-              _isInitialMessageLoad = false;
-            });
-          }
-
-          return;
         }
-
-        _messageCache.saveMessages(
-          chatId,
-          firestoreMessages,
-        );
-
-        final changed = !_listsAreEqual(
-          _currentMessages,
-          firestoreMessages,
-        );
-
-        if (!changed &&
-            !_isInitialMessageLoad) {
-          return;
-        }
-
-        setState(() {
-          _currentMessages =
-              List<Map<String, dynamic>>.from(
-            firestoreMessages,
-          );
-
-          cachedMessages =
-              List<Map<String, dynamic>>.from(
-            firestoreMessages,
-          );
-
-          _isInitialMessageLoad = false;
-        });
-
-        debugPrint(
-          "ChattªX FIRESTORE: "
-          "${firestoreMessages.length} messages received.",
-        );
-      },
-      onError: (error) {
-        debugPrint(
-          "ChattªX MESSAGE LISTENER ERROR: $error",
-        );
       },
     );
+  } catch (e) {
+    debugPrint(
+      "ChattªX CACHE LOAD ERROR: $e",
+    );
   }
+}
+
 
   // ============================================================
-  // COMPLETE MESSAGE COMPARISON
+// FIRESTORE MESSAGE LISTENER
+// ============================================================
+
+void _listenToMessages() {
+  _messagesSubscription?.cancel();
+
+  _messagesSubscription = _firestore
+      .collection("chat_rooms")
+      .doc(chatId)
+      .collection("messages")
+      .orderBy(
+        "timestamp",
+        descending: false,
+      )
+      .snapshots()
+      .listen(
+    (snapshot) {
+      if (!mounted) return;
+
+      final nextMessages =
+          snapshot.docs.map<Map<String, dynamic>>(
+        (doc) {
+          final data =
+              Map<String, dynamic>.from(
+            doc.data(),
+          );
+
+          data["_id"] = doc.id;
+
+          return data;
+        },
+      ).toList();
+
+      _firestoreLoaded = true;
+
+      // ==========================================================
+      // EMPTY FIRESTORE CHAT
+      // ==========================================================
+
+      if (nextMessages.isEmpty) {
+        if (_messages.isEmpty) {
+          setState(() {
+            _messages = <Map<String, dynamic>>[];
+            _loadingInitialMessages = false;
+          });
+
+          _currentDateLabel.value = "";
+        }
+
+        return;
+      }
+
+      // ==========================================================
+      // SAVE FIRESTORE DATA TO HIVE
+      // ==========================================================
+      //
+      // This runs independently and does not block the UI.
+      //
+
+      _messageCache.saveMessages(
+        chatId,
+        nextMessages,
+      );
+
+      // ==========================================================
+      // CHECK WHETHER CACHE IS ALREADY CURRENT
+      // ==========================================================
+
+      if (_messagesEqual(
+        _messages,
+        nextMessages,
+      )) {
+        _loadingInitialMessages = false;
+        return;
+      }
+
+      // ==========================================================
+      // UPDATE IMMEDIATELY
+      // ==========================================================
+      //
+      // IMPORTANT:
+      // There is NO addPostFrameCallback here.
+      //
+      // As soon as Firestore provides the messages, they are
+      // placed into memory and Flutter rebuilds the message list.
+      //
+
+      setState(() {
+        _messages = nextMessages
+            .map<Map<String, dynamic>>(
+              (message) =>
+                  Map<String, dynamic>.from(message),
+            )
+            .toList();
+
+        _loadingInitialMessages = false;
+      });
+
+      // ==========================================================
+      // UPDATE DATE LABEL
+      // ==========================================================
+
+      _scheduleDateUpdate();
+    },
+    onError: (error) {
+      debugPrint(
+        "ChattªX MESSAGE STREAM ERROR: $error",
+      );
+    },
+  );
+}
+
+
+  // ============================================================
+  // MESSAGE COMPARISON
   // ============================================================
 
-  bool _listsAreEqual(
+  bool _messagesEqual(
     List<Map<String, dynamic>> a,
     List<Map<String, dynamic>> b,
   ) {
@@ -360,7 +526,7 @@ class _ChatScreenState extends State<ChatScreen> {
     }
 
     for (int i = 0; i < a.length; i++) {
-      if (!_mapsAreEqual(
+      if (!_mapEqual(
         a[i],
         b[i],
       )) {
@@ -371,7 +537,7 @@ class _ChatScreenState extends State<ChatScreen> {
     return true;
   }
 
-  bool _mapsAreEqual(
+  bool _mapEqual(
     Map<String, dynamic> a,
     Map<String, dynamic> b,
   ) {
@@ -384,7 +550,7 @@ class _ChatScreenState extends State<ChatScreen> {
         return false;
       }
 
-      if (!_valuesAreEqual(
+      if (!_valueEqual(
         a[key],
         b[key],
       )) {
@@ -395,7 +561,7 @@ class _ChatScreenState extends State<ChatScreen> {
     return true;
   }
 
-  bool _valuesAreEqual(
+  bool _valueEqual(
     dynamic a,
     dynamic b,
   ) {
@@ -403,19 +569,16 @@ class _ChatScreenState extends State<ChatScreen> {
       return true;
     }
 
-    if (a is Timestamp &&
-        b is Timestamp) {
+    if (a is Timestamp && b is Timestamp) {
       return a.seconds == b.seconds &&
           a.nanoseconds == b.nanoseconds;
     }
 
-    if (a is DateTime &&
-        b is DateTime) {
+    if (a is DateTime && b is DateTime) {
       return a.isAtSameMomentAs(b);
     }
 
-    if (a is Map &&
-        b is Map) {
+    if (a is Map && b is Map) {
       if (a.length != b.length) {
         return false;
       }
@@ -425,7 +588,7 @@ class _ChatScreenState extends State<ChatScreen> {
           return false;
         }
 
-        if (!_valuesAreEqual(
+        if (!_valueEqual(
           a[key],
           b[key],
         )) {
@@ -436,14 +599,13 @@ class _ChatScreenState extends State<ChatScreen> {
       return true;
     }
 
-    if (a is List &&
-        b is List) {
+    if (a is List && b is List) {
       if (a.length != b.length) {
         return false;
       }
 
       for (int i = 0; i < a.length; i++) {
-        if (!_valuesAreEqual(
+        if (!_valueEqual(
           a[i],
           b[i],
         )) {
@@ -458,33 +620,83 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   // ============================================================
-  // SCROLL
+  // SCROLL / DATE
   // ============================================================
 
   void _onScroll() {
-    if (!mounted) {
+    _scheduleDateUpdate();
+  }
+
+  void _scheduleDateUpdate() {
+    if (!mounted ||
+        _dateUpdateScheduled) {
       return;
     }
 
-    WidgetsBinding.instance
-        .addPostFrameCallback(
-      (_) {
-        if (!mounted) {
-          return;
-        }
+    _dateUpdateScheduled = true;
 
-        _updateCurrentDateLabel();
-      },
-    );
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _dateUpdateScheduled = false;
+
+      if (!mounted) return;
+
+      _updateCurrentDateLabel();
+    });
   }
 
-  // ============================================================
-  // DATE
-  // ============================================================
+  void _updateCurrentDateLabel() {
+  if (!mounted ||
+      !_scrollController.hasClients ||
+      _messages.isEmpty) {
+    return;
+  }
 
-  String getDateLabel(
-    DateTime date,
-  ) {
+  const double estimatedHeight = 76.0;
+
+  final offset = _scrollController.offset;
+
+  int displayedIndex =
+      (offset / estimatedHeight).floor();
+
+  if (displayedIndex < 0) {
+    displayedIndex = 0;
+  }
+
+  if (displayedIndex >= _messages.length) {
+    displayedIndex = _messages.length - 1;
+  }
+
+  final actualIndex =
+      _messages.length - 1 - displayedIndex;
+
+  if (actualIndex < 0 ||
+      actualIndex >= _messages.length) {
+    return;
+  }
+
+  final date = _messageDate(
+    _messages[actualIndex]["timestamp"],
+  );
+
+  if (date == null) {
+    return;
+  }
+
+  final label = getDateLabel(date);
+
+  if (label == _currentDateLabel.value) {
+    return;
+  }
+
+  // IMPORTANT:
+  // Do NOT call setState() while the user is scrolling.
+  //
+  // Only the small floating date widget listens to this value.
+  _currentDateLabel.value = label;
+}
+
+
+  String getDateLabel(DateTime date) {
     final now = DateTime.now();
 
     final today = DateTime(
@@ -500,9 +712,7 @@ class _ChatScreenState extends State<ChatScreen> {
     );
 
     final difference =
-        today
-            .difference(messageDay)
-            .inDays;
+        today.difference(messageDay).inDays;
 
     if (difference == 0) {
       return "Today";
@@ -524,150 +734,7 @@ class _ChatScreenState extends State<ChatScreen> {
     ).format(date);
   }
 
-  // ============================================================
-  // DATE SCROLL LABEL
-  // ============================================================
-
-  void _updateCurrentDateLabel() {
-    if (!mounted ||
-        !_scrollController.hasClients ||
-        _currentMessages.isEmpty) {
-      return;
-    }
-
-    final listContext =
-        _messageListKey.currentContext;
-
-    if (listContext == null) {
-      return;
-    }
-
-    final renderObject =
-        listContext.findRenderObject();
-
-    if (renderObject is! RenderBox) {
-      return;
-    }
-
-    final listTop =
-        renderObject
-            .localToGlobal(
-              Offset.zero,
-            )
-            .dy;
-
-    if (_scrollController.offset <= 20) {
-      final newest =
-          _currentMessages.last;
-
-      final date =
-          _messageDate(
-        newest["timestamp"],
-      );
-
-      if (date == null) {
-        return;
-      }
-
-      final label =
-          getDateLabel(date);
-
-      if (label != currentDateLabel) {
-        setState(() {
-          currentDateLabel = label;
-        });
-      }
-
-      return;
-    }
-
-    Map<String, dynamic>? visibleMessage;
-
-    double closestTop =
-        double.infinity;
-
-    for (final message
-        in _currentMessages) {
-      final id =
-          message["_id"]?.toString() ?? "";
-
-      if (id.isEmpty) {
-        continue;
-      }
-
-      final key = _messageKeys[id];
-
-      if (key == null) {
-        continue;
-      }
-
-      final context =
-          key.currentContext;
-
-      if (context == null) {
-        continue;
-      }
-
-      final object =
-          context.findRenderObject();
-
-      if (object is! RenderBox) {
-        continue;
-      }
-
-      final position =
-          object.localToGlobal(
-        Offset.zero,
-      );
-
-      final top = position.dy;
-
-      final bottom =
-          top + object.size.height;
-
-      if (bottom <= listTop) {
-        continue;
-      }
-
-      if (top <= listTop &&
-          bottom > listTop) {
-        visibleMessage = message;
-        break;
-      }
-
-      if (top >= listTop &&
-          top < closestTop) {
-        closestTop = top;
-        visibleMessage = message;
-      }
-    }
-
-    if (visibleMessage == null) {
-      return;
-    }
-
-    final date =
-        _messageDate(
-      visibleMessage["timestamp"],
-    );
-
-    if (date == null) {
-      return;
-    }
-
-    final label =
-        getDateLabel(date);
-
-    if (label != currentDateLabel) {
-      setState(() {
-        currentDateLabel = label;
-      });
-    }
-  }
-
-  DateTime? _messageDate(
-    dynamic timestamp,
-  ) {
+  DateTime? _messageDate(dynamic timestamp) {
     if (timestamp is Timestamp) {
       return timestamp.toDate();
     }
@@ -684,9 +751,7 @@ class _ChatScreenState extends State<ChatScreen> {
   // ============================================================
 
   Future<void> _resetUnreadCount() async {
-    if (currentUser.isEmpty) {
-      return;
-    }
+    if (currentUser.isEmpty) return;
 
     try {
       await _firestore
@@ -696,9 +761,7 @@ class _ChatScreenState extends State<ChatScreen> {
         {
           "unread_$currentUser": 0,
         },
-        SetOptions(
-          merge: true,
-        ),
+        SetOptions(merge: true),
       );
     } catch (e) {
       debugPrint(
@@ -712,9 +775,7 @@ class _ChatScreenState extends State<ChatScreen> {
   // ============================================================
 
   Future<void> _markMessagesAsSeen() async {
-    if (currentUser.isEmpty) {
-      return;
-    }
+    if (currentUser.isEmpty) return;
 
     try {
       final snapshot =
@@ -732,12 +793,9 @@ class _ChatScreenState extends State<ChatScreen> {
               )
               .get();
 
-      if (snapshot.docs.isEmpty) {
-        return;
-      }
+      if (snapshot.docs.isEmpty) return;
 
-      final batch =
-          _firestore.batch();
+      final batch = _firestore.batch();
 
       for (final doc in snapshot.docs) {
         batch.update(
@@ -752,50 +810,21 @@ class _ChatScreenState extends State<ChatScreen> {
         );
       }
 
-      final chatRoomRef =
-          _firestore
-              .collection("chat_rooms")
-              .doc(chatId);
+      final roomRef = _firestore
+          .collection("chat_rooms")
+          .doc(chatId);
 
-      final chatRoom =
-          await chatRoomRef.get();
-
-      final data =
-          chatRoom.data() ?? {};
-
-      final lastSender =
-          data["lastSenderId"];
-
-      if (lastSender != currentUser) {
-        batch.set(
-          chatRoomRef,
-          {
-            "lastMessageStatus": "seen",
-            "lastInfinity": "seen",
-            "unread_$currentUser": 0,
-          },
-          SetOptions(
-            merge: true,
-          ),
-        );
-      } else {
-        batch.set(
-          chatRoomRef,
-          {
-            "unread_$currentUser": 0,
-          },
-          SetOptions(
-            merge: true,
-          ),
-        );
-      }
+      batch.set(
+        roomRef,
+        {
+          "unread_$currentUser": 0,
+          "lastMessageStatus": "seen",
+          "lastInfinity": "seen",
+        },
+        SetOptions(merge: true),
+      );
 
       await batch.commit();
-
-      debugPrint(
-        "ChattªX: "
-        "${snapshot.docs.length} messages marked as seen.",
-      );
     } catch (e) {
       debugPrint(
         "ChattªX MARK SEEN ERROR: $e",
@@ -808,8 +837,7 @@ class _ChatScreenState extends State<ChatScreen> {
   // ============================================================
 
   void handleTyping(String value) {
-    final id =
-        _chatService.getChatId(
+    final id = _chatService.getChatId(
       widget.receiverId,
     );
 
@@ -823,6 +851,8 @@ class _ChatScreenState extends State<ChatScreen> {
     _typingTimer = Timer(
       const Duration(seconds: 2),
       () {
+        if (!mounted) return;
+
         _chatService.setTyping(
           id,
           false,
@@ -855,11 +885,11 @@ class _ChatScreenState extends State<ChatScreen> {
         final value =
             data[key] == true;
 
-        if (value != typing) {
-          setState(() {
-            typing = value;
-          });
-        }
+        if (value == typing) return;
+
+        setState(() {
+          typing = value;
+        });
       },
       onError: (error) {
         debugPrint(
@@ -904,24 +934,25 @@ class _ChatScreenState extends State<ChatScreen> {
 
           if (lastSeen is Timestamp) {
             status =
-                "Last seen "
-                "${TimeOfDay.fromDateTime(
-                  lastSeen.toDate(),
-                ).format(context)}";
+                "Last seen ${TimeOfDay.fromDateTime(
+              lastSeen.toDate(),
+            ).format(context)}";
           } else {
             status = "Offline";
           }
         }
 
-        if (status != receiverStatus) {
-          setState(() {
-            receiverStatus = status;
-          });
+        if (status == receiverStatus) {
+          return;
         }
+
+        setState(() {
+          receiverStatus = status;
+        });
       },
       onError: (error) {
         debugPrint(
-          "ChattªX RECEIVER STATUS ERROR: $error",
+          "ChattªX STATUS ERROR: $error",
         );
       },
     );
@@ -930,41 +961,32 @@ class _ChatScreenState extends State<ChatScreen> {
   // ============================================================
   // VERIFICATION
   // ============================================================
-  //
-  // NOTE: Firestore stores this field as "verified" (same field
-  // used by home_screen.dart). This must stay in sync with that
-  // field name or the tick will silently stop working again.
-  // ============================================================
 
   void _listenToVerificationStatus() {
-    _currentUserVerificationSubscription?.cancel();
-
+    _currentVerificationSubscription?.cancel();
     _receiverVerificationSubscription?.cancel();
 
-    _currentUserVerificationSubscription =
+    _currentVerificationSubscription =
         _firestore
             .collection("users")
             .doc(currentUser)
             .snapshots()
             .listen(
       (snapshot) {
-        if (!mounted) {
+        if (!mounted) return;
+
+        final verified =
+            snapshot.data()?["verified"] == true;
+
+        if (verified ==
+            currentUserIsVerified) {
           return;
         }
 
-        final data =
-            snapshot.data();
-
-        final verified =
-            data?["verified"] == true;
-
-        if (verified !=
-            currentUserIsVerified) {
-          setState(() {
-            currentUserIsVerified =
-                verified;
-          });
-        }
+        setState(() {
+          currentUserIsVerified =
+              verified;
+        });
       },
       onError: (error) {
         debugPrint(
@@ -980,23 +1002,20 @@ class _ChatScreenState extends State<ChatScreen> {
             .snapshots()
             .listen(
       (snapshot) {
-        if (!mounted) {
+        if (!mounted) return;
+
+        final verified =
+            snapshot.data()?["verified"] == true;
+
+        if (verified ==
+            receiverIsVerified) {
           return;
         }
 
-        final data =
-            snapshot.data();
-
-        final verified =
-            data?["verified"] == true;
-
-        if (verified !=
-            receiverIsVerified) {
-          setState(() {
-            receiverIsVerified =
-                verified;
-          });
-        }
+        setState(() {
+          receiverIsVerified =
+              verified;
+        });
       },
       onError: (error) {
         debugPrint(
@@ -1007,21 +1026,7 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   // ============================================================
-  // ============================================================
-  // REACTIONS — FIXED
-  // ============================================================
-  //
-  // Reactions are stored as:
-  //
-  // "reactions": {
-  //   "❤️": ["userA", "userB"],
-  //   "😂": ["userC"]
-  // }
-  //
-  // Each user can have one instance of an emoji.
-  //
-  // A Firestore transaction is used so reactions cannot
-  // accidentally overwrite one another.
+  // REACTIONS
   // ============================================================
 
   Future<void> _addReaction(
@@ -1032,24 +1037,24 @@ class _ChatScreenState extends State<ChatScreen> {
 
     if (messageId.isEmpty ||
         cleanEmoji.isEmpty ||
-        currentUser.isEmpty) {
+        currentUser.isEmpty ||
+        _processingReaction) {
       return;
     }
 
+    _processingReaction = true;
+
     try {
-      final messageRef =
-          _firestore
-              .collection("chat_rooms")
-              .doc(chatId)
-              .collection("messages")
-              .doc(messageId);
+      final ref = _firestore
+          .collection("chat_rooms")
+          .doc(chatId)
+          .collection("messages")
+          .doc(messageId);
 
       await _firestore.runTransaction(
         (transaction) async {
           final snapshot =
-              await transaction.get(
-            messageRef,
-          );
+              await transaction.get(ref);
 
           if (!snapshot.exists) {
             throw Exception(
@@ -1058,31 +1063,30 @@ class _ChatScreenState extends State<ChatScreen> {
           }
 
           final data =
-              snapshot.data() ??
-                  <String, dynamic>{};
+              snapshot.data() ?? {};
 
-          final rawReactions =
+          final reactions =
+              <String, List<String>>{};
+
+          final raw =
               data["reactions"];
 
-          final Map<String, List<String>>
-              reactions = {};
-
-          if (rawReactions is Map) {
-            rawReactions.forEach(
+          if (raw is Map) {
+            raw.forEach(
               (key, value) {
-                final reactionEmoji =
+                final reaction =
                     key.toString();
 
                 if (value is List) {
-                  reactions[reactionEmoji] =
+                  reactions[reaction] =
                       value
                           .map(
-                            (user) =>
-                                user.toString(),
+                            (item) =>
+                                item.toString(),
                           )
                           .toList();
                 } else if (value is String) {
-                  reactions[reactionEmoji] = [
+                  reactions[reaction] = [
                     value,
                   ];
                 }
@@ -1090,39 +1094,25 @@ class _ChatScreenState extends State<ChatScreen> {
             );
           }
 
-          // ------------------------------------------------------
-          // Remove this user from every existing reaction.
-          //
-          // This guarantees that one user does not accidentally
-          // end up reacting multiple times to the same message.
-          // ------------------------------------------------------
-
-          final emptyReactionKeys =
+          final emptyKeys =
               <String>[];
 
           reactions.forEach(
-            (reactionEmoji, users) {
+            (reaction, users) {
               users.removeWhere(
-                (userId) =>
-                    userId == currentUser,
+                (id) =>
+                    id == currentUser,
               );
 
               if (users.isEmpty) {
-                emptyReactionKeys.add(
-                  reactionEmoji,
-                );
+                emptyKeys.add(reaction);
               }
             },
           );
 
-          for (final key
-              in emptyReactionKeys) {
+          for (final key in emptyKeys) {
             reactions.remove(key);
           }
-
-          // ------------------------------------------------------
-          // Add the new reaction.
-          // ------------------------------------------------------
 
           final users =
               reactions.putIfAbsent(
@@ -1134,46 +1124,16 @@ class _ChatScreenState extends State<ChatScreen> {
             users.add(currentUser);
           }
 
-          // ------------------------------------------------------
-          // Convert to Firestore-safe data.
-          // ------------------------------------------------------
-
-          final Map<String, dynamic>
-              firestoreReactions = {};
-
-          reactions.forEach(
-            (reactionEmoji, userIds) {
-              firestoreReactions[
-                  reactionEmoji] =
-                  List<String>.from(
-                userIds,
-              );
-            },
-          );
-
           transaction.update(
-            messageRef,
+            ref,
             {
-              "reactions":
-                  firestoreReactions,
+              "reactions": reactions,
             },
           );
         },
       );
 
-      debugPrint(
-        "ChattªX REACTION ADDED: "
-        "$cleanEmoji -> $messageId",
-      );
-
-      if (!mounted) {
-        return;
-      }
-
-      _reactionEmojiController.clear();
-
-      FocusManager.instance.primaryFocus
-          ?.unfocus();
+      if (!mounted) return;
 
       _closeSelection();
     } catch (e) {
@@ -1181,9 +1141,7 @@ class _ChatScreenState extends State<ChatScreen> {
         "ChattªX REACTION ERROR: $e",
       );
 
-      if (!mounted) {
-        return;
-      }
+      if (!mounted) return;
 
       ScaffoldMessenger.of(context)
           .showSnackBar(
@@ -1193,127 +1151,219 @@ class _ChatScreenState extends State<ChatScreen> {
           ),
         ),
       );
-    }
-  }
-
-  // ============================================================
-  // CUSTOM EMOJI INPUT
-  // ============================================================
-
-  Future<void> _handleReactionEmojiInput(
-    String value,
-  ) async {
-    if (_processingReactionEmoji) {
-      return;
-    }
-
-    final emoji = value.trim();
-
-    if (emoji.isEmpty) {
-      return;
-    }
-
-    final messageId =
-        _reactionMessageId;
-
-    if (messageId == null ||
-        messageId.isEmpty) {
-      _reactionEmojiController.clear();
-      return;
-    }
-
-    _processingReactionEmoji = true;
-
-    try {
-      await _addReaction(
-        messageId,
-        emoji,
-      );
     } finally {
-      _processingReactionEmoji = false;
+      _processingReaction = false;
     }
   }
 
-  void _openReactionEmojiKeyboard(
+  Future<void> _showCustomReactionDialog(
     String messageId,
-  ) {
-    if (messageId.isEmpty) {
+  ) async {
+    if (messageId.isEmpty ||
+        !mounted) {
       return;
     }
 
-    setState(() {
-      _reactionMessageId = messageId;
-    });
+    /*
+     * IMPORTANT:
+     *
+     * We now use a normal dialog instead of placing
+     * a hidden TextField over the Scaffold.
+     *
+     * This avoids the keyboard/focus/reparenting
+     * combination that was causing the framework
+     * assertions.
+     */
 
-    _reactionEmojiController.clear();
+    final controller =
+        TextEditingController();
 
-    WidgetsBinding.instance
-        .addPostFrameCallback(
-      (_) {
-        if (!mounted) {
-          return;
-        }
+    final emoji = await showDialog<String>(
+      context: context,
+      barrierDismissible: true,
+      builder: (dialogContext) {
+        return AlertDialog(
+          backgroundColor:
+              const Color(0xff111827),
+          title: const Text(
+            "Add reaction",
+            style: TextStyle(
+              color: Colors.white,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+          content: TextField(
+            controller: controller,
+            autofocus: true,
+            keyboardType:
+                TextInputType.text,
+            textInputAction:
+                TextInputAction.done,
+            autocorrect: false,
+            enableSuggestions: false,
+            style: const TextStyle(
+              color: Colors.white,
+              fontSize: 28,
+            ),
+            decoration:
+                const InputDecoration(
+              hintText: "😀",
+              hintStyle: TextStyle(
+                color: Colors.white30,
+              ),
+              enabledBorder:
+                  UnderlineInputBorder(
+                borderSide:
+                    BorderSide(
+                  color: Colors.white24,
+                ),
+              ),
+              focusedBorder:
+                  UnderlineInputBorder(
+                borderSide:
+                    BorderSide(
+                  color:
+                      Color(0xff00E5FF),
+                ),
+              ),
+            ),
+            onSubmitted: (value) {
+              final clean =
+                  value.trim();
 
-        _reactionEmojiFocusNode.requestFocus();
+              if (clean.isNotEmpty) {
+                Navigator.pop(
+                  dialogContext,
+                  clean,
+                );
+              }
+            },
+          ),
+          actions: [
+            TextButton(
+              onPressed: () {
+                Navigator.pop(
+                  dialogContext,
+                );
+              },
+              child: const Text(
+                "Cancel",
+              ),
+            ),
+            TextButton(
+              onPressed: () {
+                final clean =
+                    controller.text.trim();
 
-        SystemChannels.textInput.invokeMethod(
-          "TextInput.show",
+                if (clean.isNotEmpty) {
+                  Navigator.pop(
+                    dialogContext,
+                    clean,
+                  );
+                }
+              },
+              child: const Text(
+                "Add",
+                style: TextStyle(
+                  color:
+                      Color(0xff00E5FF),
+                ),
+              ),
+            ),
+          ],
         );
       },
+    );
+
+    controller.dispose();
+
+    if (!mounted ||
+        emoji == null ||
+        emoji.trim().isEmpty) {
+      return;
+    }
+
+    await _addReaction(
+      messageId,
+      emoji,
     );
   }
 
   // ============================================================
-  // MESSAGE SELECTION
+  // SELECTION
   // ============================================================
 
   void _selectMessage(
     String messageId,
   ) {
-    if (messageId.isEmpty) {
+    if (messageId.isEmpty ||
+        !mounted) {
       return;
     }
 
-    FocusScope.of(context).unfocus();
+    FocusManager.instance.primaryFocus
+        ?.unfocus();
+
+    if (_selectedMessageId ==
+        messageId) {
+      return;
+    }
 
     setState(() {
-      _selectedMessageId = messageId;
-      _reactionMessageId = messageId;
+      _selectedMessageId =
+          messageId;
     });
   }
 
   void _closeSelection() {
-    if (!mounted) {
+    if (!mounted ||
+        _selectedMessageId == null) {
       return;
     }
 
+    FocusManager.instance.primaryFocus
+        ?.unfocus();
+
     setState(() {
       _selectedMessageId = null;
-      _reactionMessageId = null;
     });
   }
 
   // ============================================================
-  // REPLY
-  // ============================================================
+// REPLY
+// ============================================================
 
-  void _startReply(
-    Map<String, dynamic> message,
-    String type,
-  ) {
-    setState(() {
-      replyingMessage =
-          type == "voice"
-              ? "🎤 Voice message"
-              : (message["message"] ?? "")
-                  .toString();
+void _startReply(
+  Map<String, dynamic> message,
+  String type,
+) {
+  if (!mounted) return;
 
-      _selectedMessageId = null;
-      _reactionMessageId = null;
-    });
+  final String text;
 
-    FocusScope.of(context).unfocus();
+  if (type == "voice_call") {
+    text = "📞 Voice call";
+  } else if (type == "voice") {
+    text = "🎤 Voice message";
+  } else {
+    text =
+        (message["message"] ?? "")
+            .toString();
   }
+
+  setState(() {
+    replyingMessage = text;
+    _selectedMessageId = null;
+  });
+
+  WidgetsBinding.instance
+      .addPostFrameCallback((_) {
+    if (!mounted) return;
+
+    FocusManager.instance.primaryFocus
+        ?.unfocus();
+  });
+}
 
   // ============================================================
   // STAR
@@ -1338,7 +1388,8 @@ class _ChatScreenState extends State<ChatScreen> {
     String messageId,
     Map<String, dynamic> message,
   ) async {
-    if (messageId.isEmpty) {
+    if (messageId.isEmpty ||
+        currentUser.isEmpty) {
       return;
     }
 
@@ -1370,7 +1421,7 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   // ============================================================
-  // SEND TEXT MESSAGE
+  // SEND TEXT
   // ============================================================
 
   Future<void> sendMessage({
@@ -1379,22 +1430,26 @@ class _ChatScreenState extends State<ChatScreen> {
     final text =
         _controller.text.trim();
 
-    if (text.isEmpty) {
+    if (text.isEmpty ||
+        currentUser.isEmpty ||
+        _sendingMessage) {
       return;
     }
 
-    final reply =
-        replyingMessage;
+    final reply = replyingMessage;
 
     _controller.clear();
 
-    setState(() {
-      replyingMessage = null;
-      _selectedMessageId = null;
-      _reactionMessageId = null;
-    });
+    if (mounted) {
+      setState(() {
+        replyingMessage = null;
+        _selectedMessageId = null;
+        _sendingMessage = true;
+      });
+    }
 
-    FocusScope.of(context).unfocus();
+    FocusManager.instance.primaryFocus
+        ?.unfocus();
 
     try {
       await _chatService.sendMessage(
@@ -1405,19 +1460,44 @@ class _ChatScreenState extends State<ChatScreen> {
         replyTo: reply,
       );
 
+      if (!mounted) return;
+
+      setState(() {
+        _sendingMessage = false;
+      });
+
       _scrollToBottom();
-    } catch (e) {
+    } catch (e, stackTrace) {
       debugPrint(
         "ChattªX SEND MESSAGE ERROR: $e",
+      );
+
+      debugPrintStack(
+        stackTrace: stackTrace,
+      );
+
+      if (!mounted) return;
+
+      setState(() {
+        _sendingMessage = false;
+      });
+
+      ScaffoldMessenger.of(context)
+          .showSnackBar(
+        const SnackBar(
+          content: Text(
+            "Couldn't send message. Please try again.",
+          ),
+        ),
       );
     }
   }
 
   void _scrollToBottom() {
-    WidgetsBinding.instance
-        .addPostFrameCallback(
+    WidgetsBinding.instance.addPostFrameCallback(
       (_) {
-        if (!_scrollController.hasClients) {
+        if (!mounted ||
+            !_scrollController.hasClients) {
           return;
         }
 
@@ -1434,13 +1514,789 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   // ============================================================
-  // LOCATION OPTIONS
+  // SEND VOICE NOTE (with real waveform)
+  // ============================================================
+  //
+  // VoiceRecorder hands us the actual recorded file path, the real
+  // duration, and a waveform compressed from the real microphone
+  // amplitude samples. We upload the audio then write the message
+  // directly to Firestore (same direct-write pattern already used
+  // for location / live-location messages) so we can persist the
+  // waveform alongside voiceUrl/voiceDuration. MessageBubble reads
+  // "voiceWaveform" straight off the message map and renders the
+  // real bars instead of a flat line.
+  // ============================================================
+
+  Future<void> _sendVoiceRecording(
+    String path,
+    int duration,
+    List<double> waveform,
+  ) async {
+    if (currentUser.isEmpty || _sendingVoice) {
+      return;
+    }
+
+    if (mounted) {
+      setState(() {
+        _sendingVoice = true;
+      });
+    }
+
+    final reply = replyingMessage;
+
+    try {
+      final url = await CloudinaryService.uploadVoice(
+        File(path),
+      );
+
+      if (url == null) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text(
+                "Couldn't upload voice message.",
+              ),
+            ),
+          );
+        }
+
+        return;
+      }
+
+      final ref = _firestore
+          .collection("chat_rooms")
+          .doc(chatId)
+          .collection("messages")
+          .doc();
+
+      await ref.set({
+        "senderId": currentUser,
+        "receiverId": widget.receiverId,
+        "message": "🎤 Voice message",
+        "type": "voice",
+        "voiceUrl": url,
+        "voiceDuration": duration,
+
+        // Real waveform derived from the actual recording —
+        // never random/decorative data.
+        "voiceWaveform": waveform,
+
+        "timestamp": FieldValue.serverTimestamp(),
+        "seen": false,
+        "delivered": false,
+        "isFrozen": false,
+        "isMelted": false,
+        "reactions": {},
+        "replyTo": reply,
+      });
+
+      await _firestore
+          .collection("chat_rooms")
+          .doc(chatId)
+          .set(
+        {
+          "participants": [
+            currentUser,
+            widget.receiverId,
+          ],
+          "lastMessage": "🎤 Voice message",
+          "lastMessageTime": FieldValue.serverTimestamp(),
+          "lastSenderId": currentUser,
+          "lastInfinity": "sent",
+          "unread_${widget.receiverId}": FieldValue.increment(1),
+        },
+        SetOptions(merge: true),
+      );
+
+      if (!mounted) return;
+
+      setState(() {
+        replyingMessage = null;
+        _selectedMessageId = null;
+      });
+
+      _scrollToBottom();
+    } catch (e) {
+      debugPrint(
+        "ChattªX VOICE SEND ERROR: $e",
+      );
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+              "Couldn't send voice message. Please try again.",
+            ),
+          ),
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() {
+          _sendingVoice = false;
+        });
+      }
+    }
+  }
+
+  // ============================================================
+// SEND IMAGE
+// ============================================================
+
+Future<void> _sendImageMessage(XFile file) async {
+  if (currentUser.isEmpty) return;
+
+  try {
+    final imageFile = File(file.path);
+
+    // ------------------------------------------------------------
+    // 1. Validate file
+    // ------------------------------------------------------------
+    if (!await imageFile.exists()) {
+      throw Exception("Image file does not exist.");
+    }
+
+    final fileSize = await imageFile.length();
+
+    if (fileSize == 0) {
+      throw Exception("Image file is empty.");
+    }
+
+    // ------------------------------------------------------------
+    // 2. Show uploading state
+    // ------------------------------------------------------------
+    if (mounted) {
+      ScaffoldMessenger.of(context).hideCurrentSnackBar();
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Row(
+            children: [
+              SizedBox(
+                width: 18,
+                height: 18,
+                child: CircularProgressIndicator(
+                  strokeWidth: 2,
+                ),
+              ),
+              SizedBox(width: 12),
+              Text("Uploading photo..."),
+            ],
+          ),
+          duration: Duration(minutes: 1),
+        ),
+      );
+    }
+
+    // ------------------------------------------------------------
+    // 3. Upload to Cloudinary
+    // ------------------------------------------------------------
+    final imageUrl = await CloudinaryService.uploadImage(
+      imageFile,
+    );
+
+    if (imageUrl == null || imageUrl.trim().isEmpty) {
+      throw Exception("Image upload failed.");
+    }
+
+    // ------------------------------------------------------------
+    // 4. Create message reference
+    // ------------------------------------------------------------
+    final messageRef = _firestore
+        .collection("chat_rooms")
+        .doc(chatId)
+        .collection("messages")
+        .doc();
+
+    final reply = replyingMessage;
+
+    // ------------------------------------------------------------
+    // 5. Save image message
+    // ------------------------------------------------------------
+    await messageRef.set({
+      "senderId": currentUser,
+      "receiverId": widget.receiverId,
+
+      "message": "📷 Photo",
+      "type": "image",
+
+      "imageUrl": imageUrl,
+
+      "timestamp": FieldValue.serverTimestamp(),
+
+      "seen": false,
+      "delivered": false,
+
+      "isFrozen": false,
+      "isMelted": false,
+
+      "reactions": {},
+
+      "replyTo": reply,
+
+      // Useful for identifying the message instantly.
+      "messageId": messageRef.id,
+    });
+
+    // ------------------------------------------------------------
+    // 6. Update chat room preview
+    // ------------------------------------------------------------
+    await _firestore
+        .collection("chat_rooms")
+        .doc(chatId)
+        .set(
+      {
+        "participants": [
+          currentUser,
+          widget.receiverId,
+        ],
+
+        "lastMessage": "📷 Photo",
+        "lastMessageType": "image",
+        "lastMessageTime": FieldValue.serverTimestamp(),
+        "lastSenderId": currentUser,
+
+        "lastInfinity": "sent",
+
+        "unread_${widget.receiverId}":
+            FieldValue.increment(1),
+      },
+      SetOptions(merge: true),
+    );
+
+    // ------------------------------------------------------------
+    // 7. Clear reply / selection
+    // ------------------------------------------------------------
+    if (!mounted) return;
+
+    ScaffoldMessenger.of(context).hideCurrentSnackBar();
+
+    setState(() {
+      replyingMessage = null;
+      _selectedMessageId = null;
+    });
+
+    // ------------------------------------------------------------
+    // 8. Scroll to newest message
+    // ------------------------------------------------------------
+    _scrollToBottom();
+
+    // ------------------------------------------------------------
+    // 9. Success
+    // ------------------------------------------------------------
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text("📷 Photo sent"),
+        duration: Duration(seconds: 2),
+      ),
+    );
+  } catch (e, stackTrace) {
+    debugPrint("ChattªX IMAGE SEND ERROR: $e");
+    debugPrintStack(stackTrace: stackTrace);
+
+    if (!mounted) return;
+
+    ScaffoldMessenger.of(context).hideCurrentSnackBar();
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text(
+          "Couldn't send photo. Please try again.",
+        ),
+        duration: Duration(seconds: 3),
+      ),
+    );
+  }
+}
+
+// ============================================================
+// SEND VIDEO TO CLOUDINARY
+// ============================================================
+
+Future<void> _sendVideoMessage(
+  XFile file,
+) async {
+  if (currentUser.isEmpty) {
+    return;
+  }
+
+  try {
+    final videoFile = File(file.path);
+
+    if (!await videoFile.exists()) {
+      throw Exception(
+        'Video file does not exist.',
+      );
+    }
+
+    final fileSize =
+        await videoFile.length();
+
+    if (fileSize <= 0) {
+      throw Exception(
+        'Video file is empty.',
+      );
+    }
+
+    if (mounted) {
+      ScaffoldMessenger.of(context)
+          .hideCurrentSnackBar();
+
+      ScaffoldMessenger.of(context)
+          .showSnackBar(
+        const SnackBar(
+          content: Row(
+            children: [
+              SizedBox(
+                width: 18,
+                height: 18,
+                child: CircularProgressIndicator(
+                  strokeWidth: 2,
+                ),
+              ),
+              SizedBox(width: 12),
+              Text(
+                'Uploading video...',
+              ),
+            ],
+          ),
+          duration: Duration(minutes: 1),
+        ),
+      );
+    }
+
+    // ==========================================================
+    // UPLOAD TO CLOUDINARY
+    // ==========================================================
+
+    final videoUrl =
+        await CloudinaryService.uploadVideo(
+      videoFile,
+      folder: 'chat_videos',
+    );
+
+    if (videoUrl == null ||
+        videoUrl.trim().isEmpty) {
+      throw Exception(
+        'Cloudinary video upload failed.',
+      );
+    }
+
+    // ==========================================================
+    // CREATE FIRESTORE MESSAGE
+    // ==========================================================
+
+    final messageRef = _firestore
+        .collection('chat_rooms')
+        .doc(chatId)
+        .collection('messages')
+        .doc();
+
+    final reply = replyingMessage;
+
+    final fileName =
+        file.name.trim().isNotEmpty
+            ? file.name.trim()
+            : 'Video';
+
+    await messageRef.set({
+      'senderId': currentUser,
+      'receiverId': widget.receiverId,
+
+      'message': '🎥 Video',
+      'type': 'video',
+
+      // CLOUDINARY URL
+      'videoUrl': videoUrl,
+
+      'fileName': fileName,
+      'mimeType': 'video/mp4',
+      'fileSize': fileSize,
+
+      'timestamp':
+          FieldValue.serverTimestamp(),
+
+      'seen': false,
+      'delivered': false,
+
+      'isFrozen': false,
+      'isMelted': false,
+
+      'reactions': {},
+
+      'replyTo': reply,
+
+      'messageId': messageRef.id,
+    });
+
+    // ==========================================================
+    // UPDATE CHAT PREVIEW
+    // ==========================================================
+
+    await _firestore
+        .collection('chat_rooms')
+        .doc(chatId)
+        .set(
+      {
+        'participants': [
+          currentUser,
+          widget.receiverId,
+        ],
+
+        'lastMessage': '🎥 Video',
+        'lastMessageType': 'video',
+        'lastMessageTime':
+            FieldValue.serverTimestamp(),
+        'lastSenderId': currentUser,
+
+        'unread_${widget.receiverId}':
+            FieldValue.increment(1),
+      },
+      SetOptions(merge: true),
+    );
+
+    if (!mounted) return;
+
+    ScaffoldMessenger.of(context)
+        .hideCurrentSnackBar();
+
+    setState(() {
+      replyingMessage = null;
+      _selectedMessageId = null;
+    });
+
+    _scrollToBottom();
+  } catch (e, stackTrace) {
+    debugPrint(
+      'ChattªX VIDEO SEND ERROR: $e',
+    );
+
+    debugPrintStack(
+      stackTrace: stackTrace,
+    );
+
+    if (!mounted) return;
+
+    ScaffoldMessenger.of(context)
+        .hideCurrentSnackBar();
+
+    ScaffoldMessenger.of(context)
+        .showSnackBar(
+      const SnackBar(
+        content: Text(
+          'Couldn\'t send video. Please try again.',
+        ),
+      ),
+    );
+  }
+}
+
+// ============================================================
+// PICK DOCUMENT
+// ============================================================
+
+Future<void> _pickAndSendDocument() async {
+  if (currentUser.isEmpty) {
+    return;
+  }
+
+  try {
+    final result =
+        await FilePicker.platform.pickFiles(
+      allowMultiple: false,
+      withData: false,
+    );
+
+    if (result == null ||
+        result.files.isEmpty ||
+        !mounted) {
+      return;
+    }
+
+    final picked =
+        result.files.single;
+
+    final path = picked.path;
+
+    if (path == null ||
+        path.trim().isEmpty) {
+      throw Exception(
+        'Document path unavailable.',
+      );
+    }
+
+    final extension =
+        picked.extension ?? '';
+
+    await _sendDocumentMessage(
+      File(path),
+      fileName: picked.name,
+      mimeType:
+          _documentMimeFromExtension(
+        extension,
+      ),
+      fileSize: picked.size,
+    );
+  } catch (e, stackTrace) {
+    debugPrint(
+      'ChattªX DOCUMENT PICK ERROR: $e',
+    );
+
+    debugPrintStack(
+      stackTrace: stackTrace,
+    );
+
+    if (!mounted) return;
+
+    ScaffoldMessenger.of(context)
+        .showSnackBar(
+      const SnackBar(
+        content: Text(
+          'Couldn\'t select document.',
+        ),
+      ),
+    );
+  }
+}
+
+// ============================================================
+// SEND DOCUMENT TO CLOUDINARY
+// ============================================================
+
+Future<void> _sendDocumentMessage(
+  File file, {
+  required String fileName,
+  required String mimeType,
+  required int fileSize,
+}) async {
+  if (currentUser.isEmpty) {
+    return;
+  }
+
+  try {
+    if (!await file.exists()) {
+      throw Exception(
+        'Document does not exist.',
+      );
+    }
+
+    final actualSize =
+        await file.length();
+
+    if (actualSize <= 0) {
+      throw Exception(
+        'Document is empty.',
+      );
+    }
+
+    if (mounted) {
+      ScaffoldMessenger.of(context)
+          .hideCurrentSnackBar();
+
+      ScaffoldMessenger.of(context)
+          .showSnackBar(
+        const SnackBar(
+          content: Row(
+            children: [
+              SizedBox(
+                width: 18,
+                height: 18,
+                child: CircularProgressIndicator(
+                  strokeWidth: 2,
+                ),
+              ),
+              SizedBox(width: 12),
+              Text(
+                'Uploading document...',
+              ),
+            ],
+          ),
+          duration: Duration(minutes: 1),
+        ),
+      );
+    }
+
+    // ==========================================================
+    // UPLOAD TO CLOUDINARY AS RAW
+    // ==========================================================
+
+    final documentUrl =
+        await CloudinaryService.uploadDocument(
+      file,
+    );
+
+    if (documentUrl == null ||
+        documentUrl.trim().isEmpty) {
+      throw Exception(
+        'Cloudinary document upload failed.',
+      );
+    }
+
+    // ==========================================================
+    // CREATE FIRESTORE MESSAGE
+    // ==========================================================
+
+    final messageRef = _firestore
+        .collection('chat_rooms')
+        .doc(chatId)
+        .collection('messages')
+        .doc();
+
+    final reply = replyingMessage;
+
+    await messageRef.set({
+      'senderId': currentUser,
+      'receiverId': widget.receiverId,
+
+      'message': '📄 $fileName',
+      'type': 'document',
+
+      // CLOUDINARY URL
+      'documentUrl': documentUrl,
+
+      'fileName': fileName,
+      'mimeType': mimeType,
+      'fileSize': actualSize,
+
+      'timestamp':
+          FieldValue.serverTimestamp(),
+
+      'seen': false,
+      'delivered': false,
+
+      'isFrozen': false,
+      'isMelted': false,
+
+      'reactions': {},
+
+      'replyTo': reply,
+
+      'messageId': messageRef.id,
+    });
+
+    // ==========================================================
+    // UPDATE CHAT PREVIEW
+    // ==========================================================
+
+    await _firestore
+        .collection('chat_rooms')
+        .doc(chatId)
+        .set(
+      {
+        'participants': [
+          currentUser,
+          widget.receiverId,
+        ],
+
+        'lastMessage':
+            '📄 $fileName',
+
+        'lastMessageType':
+            'document',
+
+        'lastMessageTime':
+            FieldValue.serverTimestamp(),
+
+        'lastSenderId':
+            currentUser,
+
+        'unread_${widget.receiverId}':
+            FieldValue.increment(1),
+      },
+      SetOptions(merge: true),
+    );
+
+    if (!mounted) return;
+
+    ScaffoldMessenger.of(context)
+        .hideCurrentSnackBar();
+
+    setState(() {
+      replyingMessage = null;
+      _selectedMessageId = null;
+    });
+
+    _scrollToBottom();
+  } catch (e, stackTrace) {
+    debugPrint(
+      'ChattªX DOCUMENT SEND ERROR: $e',
+    );
+
+    debugPrintStack(
+      stackTrace: stackTrace,
+    );
+
+    if (!mounted) return;
+
+    ScaffoldMessenger.of(context)
+        .hideCurrentSnackBar();
+
+    ScaffoldMessenger.of(context)
+        .showSnackBar(
+      const SnackBar(
+        content: Text(
+          'Couldn\'t send document. Please try again.',
+        ),
+      ),
+    );
+  }
+}
+
+// ============================================================
+// DOCUMENT MIME TYPE
+// ============================================================
+
+String _documentMimeFromExtension(
+  String extension,
+) {
+  switch (extension.toLowerCase()) {
+    case 'pdf':
+      return 'application/pdf';
+
+    case 'doc':
+      return 'application/msword';
+
+    case 'docx':
+      return 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+
+    case 'xls':
+      return 'application/vnd.ms-excel';
+
+    case 'xlsx':
+      return 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+
+    case 'ppt':
+      return 'application/vnd.ms-powerpoint';
+
+    case 'pptx':
+      return 'application/vnd.openxmlformats-officedocument.presentationml.presentation';
+
+    case 'txt':
+      return 'text/plain';
+
+    case 'csv':
+      return 'text/csv';
+
+    case 'json':
+      return 'application/json';
+
+    case 'zip':
+      return 'application/zip';
+
+    case 'rar':
+      return 'application/vnd.rar';
+
+    default:
+      return 'application/octet-stream';
+  }
+}
+
+  // ============================================================
+  // LOCATION
   // ============================================================
 
   Future<void> _showLocationOptions() async {
-    if (!mounted) {
-      return;
-    }
+    if (!mounted) return;
 
     final choice =
         await showModalBottomSheet<String>(
@@ -1454,7 +2310,7 @@ class _ChatScreenState extends State<ChatScreen> {
           top: Radius.circular(26),
         ),
       ),
-      builder: (context) {
+      builder: (sheetContext) {
         return SafeArea(
           child: Padding(
             padding:
@@ -1536,7 +2392,7 @@ class _ChatScreenState extends State<ChatScreen> {
                   ),
                   onTap: () {
                     Navigator.pop(
-                      context,
+                      sheetContext,
                       "current",
                     );
                   },
@@ -1574,7 +2430,7 @@ class _ChatScreenState extends State<ChatScreen> {
                   ),
                   onTap: () {
                     Navigator.pop(
-                      context,
+                      sheetContext,
                       "live",
                     );
                   },
@@ -1586,9 +2442,7 @@ class _ChatScreenState extends State<ChatScreen> {
       },
     );
 
-    if (!mounted) {
-      return;
-    }
+    if (!mounted) return;
 
     if (choice == "current") {
       await _sendLocation();
@@ -1597,24 +2451,19 @@ class _ChatScreenState extends State<ChatScreen> {
     }
   }
 
-  // ============================================================
-  // CURRENT LOCATION
-  // ============================================================
-
   Future<void> _sendLocation() async {
     try {
       final serviceEnabled =
-          await Geolocator.isLocationServiceEnabled();
+          await Geolocator
+              .isLocationServiceEnabled();
 
       if (!serviceEnabled) {
-        if (!mounted) {
-          return;
-        }
+        if (!mounted) return;
 
         final open =
             await showDialog<bool>(
           context: context,
-          builder: (_) {
+          builder: (dialogContext) {
             return AlertDialog(
               backgroundColor:
                   const Color(0xff111827),
@@ -1637,18 +2486,17 @@ class _ChatScreenState extends State<ChatScreen> {
                 TextButton(
                   onPressed: () {
                     Navigator.pop(
-                      context,
+                      dialogContext,
                       false,
                     );
                   },
-                  child: const Text(
-                    "Cancel",
-                  ),
+                  child:
+                      const Text("Cancel"),
                 ),
                 TextButton(
                   onPressed: () {
                     Navigator.pop(
-                      context,
+                      dialogContext,
                       true,
                     );
                   },
@@ -1704,7 +2552,7 @@ class _ChatScreenState extends State<ChatScreen> {
           final open =
               await showDialog<bool>(
             context: context,
-            builder: (_) {
+            builder: (dialogContext) {
               return AlertDialog(
                 backgroundColor:
                     const Color(0xff111827),
@@ -1724,7 +2572,7 @@ class _ChatScreenState extends State<ChatScreen> {
                   TextButton(
                     onPressed: () {
                       Navigator.pop(
-                        context,
+                        dialogContext,
                         false,
                       );
                     },
@@ -1734,11 +2582,12 @@ class _ChatScreenState extends State<ChatScreen> {
                   TextButton(
                     onPressed: () {
                       Navigator.pop(
-                        context,
+                        dialogContext,
                         true,
                       );
                     },
-                    child: const Text(
+                    child:
+                        const Text(
                       "Open Settings",
                     ),
                   ),
@@ -1784,7 +2633,8 @@ class _ChatScreenState extends State<ChatScreen> {
       }
 
       final position =
-          await Geolocator.getCurrentPosition(
+          await Geolocator
+              .getCurrentPosition(
         locationSettings:
             const LocationSettings(
           accuracy:
@@ -1835,20 +2685,19 @@ class _ChatScreenState extends State<ChatScreen> {
           "unread_${widget.receiverId}":
               FieldValue.increment(1),
         },
-        SetOptions(
-          merge: true,
-        ),
+        SetOptions(merge: true),
       );
 
       if (mounted) {
         ScaffoldMessenger.of(context)
             .showSnackBar(
           const SnackBar(
-            content: Text(
-              "📍 Location sent",
-            ),
+            content:
+                Text("📍 Location sent"),
           ),
         );
+
+        _scrollToBottom();
       }
     } on TimeoutException {
       if (mounted) {
@@ -1894,6 +2743,8 @@ class _ChatScreenState extends State<ChatScreen> {
 
     if (latitude == null ||
         longitude == null) {
+      if (!mounted) return;
+
       ScaffoldMessenger.of(context)
           .showSnackBar(
         const SnackBar(
@@ -1953,7 +2804,7 @@ class _ChatScreenState extends State<ChatScreen> {
         return;
       }
 
-      final messages =
+      final result =
           await _firestore
               .collection("chat_rooms")
               .doc(chatId)
@@ -1966,12 +2817,12 @@ class _ChatScreenState extends State<ChatScreen> {
               .limit(1)
               .get();
 
-      if (messages.docs.isEmpty) {
+      if (result.docs.isEmpty) {
         return;
       }
 
       _liveLocationMessageId =
-          messages.docs.first.id;
+          result.docs.first.id;
 
       _liveLocationMessageSent = true;
 
@@ -1996,7 +2847,8 @@ class _ChatScreenState extends State<ChatScreen> {
             await _liveLocationSubscription
                 ?.cancel();
 
-            _liveLocationSubscription = null;
+            _liveLocationSubscription =
+                null;
 
             return;
           }
@@ -2007,9 +2859,7 @@ class _ChatScreenState extends State<ChatScreen> {
             position,
           );
 
-          if (!updated) {
-            return;
-          }
+          if (!updated) return;
 
           final messageId =
               _liveLocationMessageId;
@@ -2087,14 +2937,16 @@ class _ChatScreenState extends State<ChatScreen> {
       );
 
       if (session == null) {
-        ScaffoldMessenger.of(context)
-            .showSnackBar(
-          const SnackBar(
-            content: Text(
-              "Unable to start live location.",
+        if (mounted) {
+          ScaffoldMessenger.of(context)
+              .showSnackBar(
+            const SnackBar(
+              content: Text(
+                "Unable to start live location.",
+              ),
             ),
-          ),
-        );
+          );
+        }
 
         return;
       }
@@ -2147,17 +2999,16 @@ class _ChatScreenState extends State<ChatScreen> {
       return;
     }
 
-    final messageRef =
+    final ref =
         _firestore
             .collection("chat_rooms")
             .doc(chatId)
             .collection("messages")
             .doc();
 
-    _liveLocationMessageId =
-        messageRef.id;
+    _liveLocationMessageId = ref.id;
 
-    await messageRef.set({
+    await ref.set({
       "senderId": currentUser,
       "receiverId": widget.receiverId,
       "message": "🔴 Live location",
@@ -2206,17 +3057,13 @@ class _ChatScreenState extends State<ChatScreen> {
         "unread_${widget.receiverId}":
             FieldValue.increment(1),
       },
-      SetOptions(
-        merge: true,
-      ),
+      SetOptions(merge: true),
     );
 
     _liveLocationMessageSent = true;
-  }
 
-  // ============================================================
-  // STOP LIVE LOCATION
-  // ============================================================
+    _scrollToBottom();
+  }
 
   Future<void> _stopLiveLocationMessage() async {
     final messageId =
@@ -2269,9 +3116,7 @@ class _ChatScreenState extends State<ChatScreen> {
         );
       }
 
-      if (!mounted) {
-        return;
-      }
+      if (!mounted) return;
 
       Navigator.push(
         context,
@@ -2304,14 +3149,2233 @@ class _ChatScreenState extends State<ChatScreen> {
     }
   }
 
+// ============================================================ 
+// CHATTªX — CHAT OPTIONS 
+// ============================================================ 
+// 
+// Opens the useful chat controls directly over the current 
+// conversation. This does NOT navigate away from ChatScreen. 
+// 
+// ============================================================ 
+ 
+void _showChatOptions() { 
+  showModalBottomSheet( 
+    context: context, 
+    backgroundColor: Colors.transparent, 
+    isScrollControlled: true, 
+    useSafeArea: true, 
+    builder: (sheetContext) { 
+      return Container( 
+        constraints: BoxConstraints( 
+          maxHeight: MediaQuery.of(context).size.height * 0.82, 
+        ), 
+        decoration: const BoxDecoration( 
+          color: Color(0xFF080D18), 
+          borderRadius: BorderRadius.vertical( 
+            top: Radius.circular(26), 
+          ), 
+        ), 
+        child: Column( 
+          mainAxisSize: MainAxisSize.min, 
+          children: [ 
+            // ====================================================== 
+            // HANDLE 
+            // ====================================================== 
+ 
+            const SizedBox(height: 10), 
+ 
+            Container( 
+              width: 42, 
+              height: 4, 
+              decoration: BoxDecoration( 
+                color: Colors.white24, 
+                borderRadius: BorderRadius.circular(20), 
+              ), 
+            ), 
+ 
+            const SizedBox(height: 14), 
+ 
+            // ====================================================== 
+            // CONTACT HEADER 
+            // ====================================================== 
+ 
+            Padding( 
+              padding: const EdgeInsets.symmetric( 
+                horizontal: 18, 
+              ), 
+              child: Row( 
+                children: [ 
+                  Container( 
+                    width: 52, 
+                    height: 52, 
+                    padding: const EdgeInsets.all(2), 
+                    decoration: const BoxDecoration( 
+                      shape: BoxShape.circle, 
+                      gradient: LinearGradient( 
+                        colors: [ 
+                          Color(0xFF00D9FF), 
+                          Color(0xFF7B2FF7), 
+                        ], 
+                      ), 
+                    ), 
+                    child: CircleAvatar( 
+                      backgroundColor: 
+                          const Color(0xFF111827), 
+                      backgroundImage: 
+                          _chatOptionsImageProvider(), 
+                      child: 
+                          _chatOptionsImageProvider() == null 
+                              ? const Icon( 
+                                  Icons.person_rounded, 
+                                  color: Colors.white54, 
+                                  size: 27, 
+                                ) 
+                              : null, 
+                    ), 
+                  ), 
+ 
+                  const SizedBox(width: 12), 
+ 
+                  Expanded( 
+                    child: Column( 
+                      crossAxisAlignment: 
+                          CrossAxisAlignment.start, 
+                      children: [ 
+                        Row( 
+                          children: [ 
+                            Flexible( 
+                              child: Text( 
+                                widget.receiverName, 
+                                maxLines: 1, 
+                                overflow: 
+                                    TextOverflow.ellipsis, 
+                                style: const TextStyle( 
+                                  color: Colors.white, 
+                                  fontSize: 16, 
+                                  fontWeight: FontWeight.w800, 
+                                ), 
+                              ), 
+                            ), 
+ 
+                            if (receiverIsVerified) ...[ 
+                              const SizedBox(width: 6), 
+                              Container( 
+                                width: 17, 
+                                height: 17, 
+                                decoration: 
+                                    const BoxDecoration( 
+                                  color: Color(0xFF2196F3), 
+                                  shape: BoxShape.circle, 
+                                ), 
+                                child: const Icon( 
+                                  Icons.check_rounded, 
+                                  color: Colors.white, 
+                                  size: 11, 
+                                ), 
+                              ), 
+                            ], 
+                          ], 
+                        ), 
+ 
+                        const SizedBox(height: 3), 
+ 
+                        Text( 
+                          receiverStatus, 
+                          style: TextStyle( 
+                            color: 
+                                receiverStatus == "Online" 
+                                    ? const Color(0xFF39FF88) 
+                                    : Colors.white54, 
+                            fontSize: 11, 
+                            fontWeight: FontWeight.w600, 
+                          ), 
+                        ), 
+                      ], 
+                    ), 
+                  ), 
+                ], 
+              ), 
+            ), 
+ 
+            const SizedBox(height: 15), 
+ 
+            const Divider( 
+              color: Colors.white10, 
+              height: 1, 
+            ), 
+ 
+            // ====================================================== 
+            // OPTIONS 
+            // ====================================================== 
+ 
+            Flexible( 
+              child: ListView( 
+                shrinkWrap: true, 
+                padding: const EdgeInsets.symmetric( 
+                  vertical: 6, 
+                ), 
+                children: [ 
+                  _chatOption( 
+                    icon: Icons.person_rounded, 
+                    title: "View contact", 
+                    subtitle: "Open this person's profile", 
+                    color: const Color(0xFF00D9FF), 
+                    onTap: () { 
+                      Navigator.pop(sheetContext); 
+ 
+                      Navigator.push( 
+                        context, 
+                        MaterialPageRoute( 
+                          builder: (_) => 
+                              UserProfileViewScreen( 
+                            userId: widget.receiverId, 
+                            userName: widget.receiverName, 
+                            userImage: widget.receiverImage, 
+                          ), 
+                        ), 
+                      ); 
+                    }, 
+                  ), 
+ 
+                  _chatOption( 
+                    icon: Icons.search_rounded, 
+                    title: "Search", 
+                    subtitle: "Search messages in this chat", 
+                    color: const Color(0xFF7B2FF7), 
+                    onTap: () { 
+                      Navigator.pop(sheetContext); 
+ 
+                      // Connect your chat search here. 
+                      _openChatSearch(); 
+                    }, 
+                  ), 
+ 
+                  _chatOption( 
+                    icon: Icons.photo_library_rounded, 
+                    title: "Media", 
+                    subtitle: "Photos and videos shared here", 
+                    color: const Color(0xFFB026FF), 
+                    onTap: () { 
+                      Navigator.pop(sheetContext); 
+ 
+                      _openChatMedia(); 
+                    }, 
+                  ), 
+ 
+                  _chatOption( 
+                    icon: Icons.insert_drive_file_rounded, 
+                    title: "Files", 
+                    subtitle: "Documents and files shared here", 
+                    color: const Color(0xFF00D9FF), 
+                    onTap: () { 
+                      Navigator.pop(sheetContext); 
+ 
+                      _openChatFiles(); 
+                    }, 
+                  ), 
+ 
+                  _chatOption( 
+                    icon: Icons.link_rounded, 
+                    title: "Links", 
+                    subtitle: "Links shared in this chat", 
+                    color: const Color(0xFF7B2FF7), 
+                    onTap: () { 
+                      Navigator.pop(sheetContext); 
+ 
+                      _openChatLinks(); 
+                    }, 
+                  ), 
+ 
+                  _chatOption( 
+                    icon: Icons.star_rounded, 
+                    title: "Starred messages", 
+                    subtitle: "Messages you've saved", 
+                    color: const Color(0xFFFFC857), 
+                    onTap: () { 
+                      Navigator.pop(sheetContext); 
+ 
+                      _openStarredMessages(); 
+                    }, 
+                  ), 
+ 
+                  const Padding( 
+                    padding: EdgeInsets.symmetric( 
+                      horizontal: 18, 
+                    ), 
+                    child: Divider( 
+                      color: Colors.white10, 
+                      height: 12, 
+                    ), 
+                  ), 
+ 
+                  _chatOption( 
+                    icon: 
+                        Icons.notifications_off_rounded, 
+                    title: "Mute notifications", 
+                    subtitle: 
+                        "Stop notifications from this chat", 
+                    color: const Color(0xFF00D9FF), 
+                    onTap: () { 
+                      Navigator.pop(sheetContext); 
+ 
+                      _toggleChatMute(); 
+                    }, 
+                  ), 
+ 
+                  _chatOption( 
+                    icon: Icons.auto_delete_rounded, 
+                    title: "Disappearing messages", 
+                    subtitle: 
+                        "Choose when messages disappear", 
+                    color: const Color(0xFFB026FF), 
+                    onTap: () { 
+                      Navigator.pop(sheetContext); 
+ 
+                      _openDisappearingMessages(); 
+                    }, 
+                  ), 
+ 
+                  _chatOption( 
+                    icon: Icons.push_pin_rounded, 
+                    title: "Pin chat", 
+                    subtitle: 
+                        "Keep this conversation at the top", 
+                    color: const Color(0xFF00D9FF), 
+                    onTap: () { 
+                      Navigator.pop(sheetContext); 
+ 
+                      _toggleChatPin(); 
+                    }, 
+                  ), 
+ 
+                  _chatOption( 
+                    icon: Icons.palette_rounded, 
+                    title: "Chat appearance", 
+                    subtitle: 
+                        "Wallpaper and chat appearance", 
+                    color: const Color(0xFF7B2FF7), 
+                    onTap: () { 
+                      Navigator.pop(sheetContext); 
+ 
+                      _openChatAppearance(); 
+                    }, 
+                  ), 
+ 
+                  const Padding( 
+                    padding: EdgeInsets.symmetric( 
+                      horizontal: 18, 
+                    ), 
+                    child: Divider( 
+                      color: Colors.white10, 
+                      height: 12, 
+                    ), 
+                  ), 
+ 
+                  _chatOption( 
+                    icon: Icons.lock_outline_rounded, 
+                    title: "Encryption", 
+                    subtitle: 
+                        "Learn how this conversation is protected", 
+                    color: const Color(0xFF00D9FF), 
+                    onTap: () { 
+                      Navigator.pop(sheetContext); 
+ 
+                      _showChatEncryption(); 
+                    }, 
+                  ), 
+ 
+                  _chatOption( 
+                    icon: Icons.verified_user_rounded, 
+                    title: "Security verification", 
+                    subtitle: 
+                        "Verify this contact", 
+                    color: const Color(0xFFB026FF), 
+                    onTap: () { 
+                      Navigator.pop(sheetContext); 
+ 
+                      _showChatSecurityVerification(); 
+                    }, 
+                  ), 
+ 
+                  const Padding( 
+                    padding: EdgeInsets.symmetric( 
+                      horizontal: 18, 
+                    ), 
+                    child: Divider( 
+                      color: Colors.white10, 
+                      height: 12, 
+                    ), 
+                  ), 
+ 
+                  _chatOption( 
+                    icon: Icons.block_rounded, 
+                    title: 
+                        "Block ${widget.receiverName}", 
+                    subtitle: 
+                        "Stop messages and calls", 
+                    color: Colors.redAccent, 
+                    onTap: () { 
+                      Navigator.pop(sheetContext); 
+ 
+                      _blockChatUser(); 
+                    }, 
+                  ), 
+ 
+                  _chatOption( 
+                    icon: Icons.flag_rounded, 
+                    title: "Report", 
+                    subtitle: 
+                        "Report this account", 
+                    color: Colors.redAccent, 
+                    onTap: () { 
+                      Navigator.pop(sheetContext); 
+ 
+                      _reportChatUser(); 
+                    }, 
+                  ), 
+ 
+                  _chatOption( 
+                    icon: Icons.delete_sweep_rounded, 
+                    title: "Clear chat", 
+                    subtitle: 
+                        "Remove messages from this device", 
+                    color: Colors.redAccent, 
+                    onTap: () { 
+                      Navigator.pop(sheetContext); 
+ 
+                      _clearCurrentChat(); 
+                    }, 
+                  ), 
+ 
+                  const SizedBox(height: 12), 
+                ], 
+              ), 
+            ), 
+          ], 
+        ), 
+      ); 
+    }, 
+  ); 
+} 
+ 
+Widget _chatOption({ 
+  required IconData icon, 
+  required String title, 
+  required String subtitle, 
+  required Color color, 
+  required VoidCallback onTap, 
+}) { 
+  return Material( 
+    color: Colors.transparent, 
+    child: InkWell( 
+      onTap: onTap, 
+      child: Padding( 
+        padding: const EdgeInsets.symmetric( 
+          horizontal: 18, 
+          vertical: 7, 
+        ), 
+        child: Row( 
+          children: [ 
+            Container( 
+              width: 43, 
+              height: 43, 
+              decoration: BoxDecoration( 
+                color: color.withValues(alpha: .10), 
+                borderRadius: BorderRadius.circular(13), 
+              ), 
+              child: Icon( 
+                icon, 
+                color: color, 
+                size: 20, 
+              ), 
+            ), 
+ 
+            const SizedBox(width: 13), 
+ 
+            Expanded( 
+              child: Column( 
+                crossAxisAlignment: 
+                    CrossAxisAlignment.start, 
+                children: [ 
+                  Text( 
+                    title, 
+                    maxLines: 1, 
+                    overflow: TextOverflow.ellipsis, 
+                    style: const TextStyle( 
+                      color: Colors.white, 
+                      fontSize: 13, 
+                      fontWeight: FontWeight.w700, 
+                    ), 
+                  ), 
+ 
+                  const SizedBox(height: 2), 
+ 
+                  Text( 
+                    subtitle, 
+                    maxLines: 1, 
+                    overflow: TextOverflow.ellipsis, 
+                    style: const TextStyle( 
+                      color: Colors.white54, 
+                      fontSize: 10, 
+                    ), 
+                  ), 
+                ], 
+              ), 
+            ), 
+ 
+            const Icon( 
+              Icons.chevron_right_rounded, 
+              color: Colors.white24, 
+              size: 19, 
+            ), 
+          ], 
+        ), 
+      ), 
+    ), 
+  ); 
+}
+
+ImageProvider? _chatOptionsImageProvider() {
+  final image = widget.receiverImage?.trim() ?? "";
+
+  if (image.isEmpty) {
+    return null;
+  }
+
+  if (image.startsWith("http://") ||
+      image.startsWith("https://")) {
+    return NetworkImage(image);
+  }
+
+  return AssetImage(image);
+}
+
+// ============================================================
+// CHATTªX — CHAT OPTIONS FUNCTIONALITY
+// ============================================================
+
+// ============================================================
+// SEARCH
+// ============================================================
+
+void _openChatSearch() {
+  if (!mounted) return;
+
+  final controller = TextEditingController();
+  String query = "";
+
+  showModalBottomSheet(
+    context: context,
+    backgroundColor: const Color(0xFF080D18),
+    isScrollControlled: true,
+    useSafeArea: true,
+    shape: const RoundedRectangleBorder(
+      borderRadius: BorderRadius.vertical(
+        top: Radius.circular(26),
+      ),
+    ),
+    builder: (sheetContext) {
+      return StatefulBuilder(
+        builder: (context, setSheetState) {
+          final results = query.trim().isEmpty
+              ? <Map<String, dynamic>>[]
+              : _messages.where((message) {
+                  final text =
+                      message["message"]?.toString() ?? "";
+
+                  return text
+                      .toLowerCase()
+                      .contains(query.toLowerCase());
+                }).toList();
+
+          return SafeArea(
+            child: SizedBox(
+              height:
+                  MediaQuery.of(context).size.height * 0.78,
+              child: Column(
+                children: [
+                  const SizedBox(height: 10),
+
+                  Container(
+                    width: 42,
+                    height: 4,
+                    decoration: BoxDecoration(
+                      color: Colors.white24,
+                      borderRadius:
+                          BorderRadius.circular(20),
+                    ),
+                  ),
+
+                  const SizedBox(height: 16),
+
+                  Padding(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 18,
+                    ),
+                    child: Row(
+                      children: [
+                        const Icon(
+                          Icons.search_rounded,
+                          color: Color(0xFF7B2FF7),
+                        ),
+                        const SizedBox(width: 10),
+
+                        Expanded(
+                          child: TextField(
+                            controller: controller,
+                            autofocus: true,
+                            onChanged: (value) {
+                              setSheetState(() {
+                                query = value;
+                              });
+                            },
+                            style: const TextStyle(
+                              color: Colors.white,
+                            ),
+                            decoration:
+                                InputDecoration(
+                              hintText:
+                                  "Search messages...",
+                              hintStyle:
+                                  const TextStyle(
+                                color: Colors.white38,
+                              ),
+                              filled: true,
+                              fillColor:
+                                  const Color(0xFF111827),
+                              border: OutlineInputBorder(
+                                borderRadius:
+                                    BorderRadius.circular(16),
+                                borderSide:
+                                    BorderSide.none,
+                              ),
+                              prefixIcon: const Icon(
+                                Icons.search_rounded,
+                                color:
+                                    Color(0xFF7B2FF7),
+                              ),
+                              suffixIcon:
+                                  controller.text
+                                          .isNotEmpty
+                                      ? IconButton(
+                                          icon:
+                                              const Icon(
+                                            Icons.clear,
+                                            color:
+                                                Colors.white54,
+                                          ),
+                                          onPressed: () {
+                                            controller.clear();
+
+                                            setSheetState(() {
+                                              query = "";
+                                            });
+                                          },
+                                        )
+                                      : null,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+
+                  const SizedBox(height: 12),
+
+                  Expanded(
+                    child: query.trim().isEmpty
+                        ? const Center(
+                            child: Column(
+                              mainAxisSize:
+                                  MainAxisSize.min,
+                              children: [
+                                Icon(
+                                  Icons.search_rounded,
+                                  color: Colors.white24,
+                                  size: 46,
+                                ),
+                                SizedBox(height: 12),
+                                Text(
+                                  "Search this conversation",
+                                  style: TextStyle(
+                                    color:
+                                        Colors.white70,
+                                    fontSize: 15,
+                                    fontWeight:
+                                        FontWeight.w700,
+                                  ),
+                                ),
+                                SizedBox(height: 5),
+                                Text(
+                                  "Find messages by typing a word or phrase.",
+                                  style: TextStyle(
+                                    color:
+                                        Colors.white38,
+                                    fontSize: 11,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          )
+                        : results.isEmpty
+                            ? const Center(
+                                child: Text(
+                                  "No messages found",
+                                  style: TextStyle(
+                                    color:
+                                        Colors.white54,
+                                    fontSize: 13,
+                                  ),
+                                ),
+                              )
+                            : ListView.builder(
+                                padding:
+                                    const EdgeInsets
+                                        .symmetric(
+                                  horizontal: 14,
+                                ),
+                                itemCount:
+                                    results.length,
+                                itemBuilder:
+                                    (context, index) {
+                                  final message =
+                                      results[index];
+
+                                  final text =
+                                      message["message"]
+                                              ?.toString() ??
+                                          "";
+
+                                  final senderId =
+                                      message["senderId"]
+                                              ?.toString() ??
+                                          "";
+
+                                  final date =
+                                      _messageDate(
+                                    message["timestamp"],
+                                  );
+
+                                  return ListTile(
+                                    contentPadding:
+                                        const EdgeInsets
+                                            .symmetric(
+                                      horizontal: 8,
+                                    ),
+                                    leading:
+                                        Container(
+                                      width: 42,
+                                      height: 42,
+                                      decoration:
+                                          BoxDecoration(
+                                        color: const Color(
+                                          0xFF7B2FF7,
+                                        ).withValues(
+                                          alpha: .10,
+                                        ),
+                                        borderRadius:
+                                            BorderRadius
+                                                .circular(
+                                          12,
+                                        ),
+                                      ),
+                                      child: Icon(
+                                        senderId ==
+                                                currentUser
+                                            ? Icons
+                                                .north_east_rounded
+                                            : Icons
+                                                .south_west_rounded,
+                                        color:
+                                            const Color(
+                                          0xFF7B2FF7,
+                                        ),
+                                        size: 19,
+                                      ),
+                                    ),
+                                    title: Text(
+                                      text,
+                                      maxLines: 2,
+                                      overflow:
+                                          TextOverflow
+                                              .ellipsis,
+                                      style:
+                                          const TextStyle(
+                                        color:
+                                            Colors.white,
+                                        fontSize: 13,
+                                      ),
+                                    ),
+                                    subtitle: date == null
+                                        ? null
+                                        : Text(
+                                            DateFormat(
+                                              "dd MMM yyyy • HH:mm",
+                                            ).format(date),
+                                            style:
+                                                const TextStyle(
+                                              color: Colors
+                                                  .white38,
+                                              fontSize: 10,
+                                            ),
+                                          ),
+                                    onTap: () {
+                                      Navigator.pop(
+                                        sheetContext,
+                                      );
+
+                                      _closeSelection();
+
+                                      ScaffoldMessenger
+                                              .of(context)
+                                          .showSnackBar(
+                                        SnackBar(
+                                          content: Text(
+                                            "Found: $text",
+                                            maxLines: 2,
+                                            overflow:
+                                                TextOverflow
+                                                    .ellipsis,
+                                          ),
+                                        ),
+                                      );
+                                    },
+                                  );
+                                },
+                              ),
+                  ),
+                ],
+              ),
+            ),
+          );
+        },
+      );
+    },
+  );
+}
+
+// ============================================================
+// MEDIA
+// ============================================================
+
+void _openChatMedia() {
+  final media = _messages.where((message) {
+    final type =
+        message["type"]?.toString().toLowerCase() ?? "";
+
+    return type == "image" || type == "video";
+  }).toList();
+
+  _openChatMediaViewer(
+    title: "Media",
+    messages: media,
+    emptyIcon: Icons.photo_library_rounded,
+    emptyText: "No media shared yet",
+  );
+}
+
+// ============================================================
+// FILES
+// ============================================================
+
+void _openChatFiles() {
+  final files = _messages.where((message) {
+    final type =
+        message["type"]?.toString().toLowerCase() ?? "";
+
+    return type == "document";
+  }).toList();
+
+  _openChatMediaViewer(
+    title: "Files",
+    messages: files,
+    emptyIcon: Icons.insert_drive_file_rounded,
+    emptyText: "No files shared yet",
+  );
+}
+
+// ============================================================
+// LINKS
+// ============================================================
+
+void _openChatLinks() {
+  final links = _messages.where((message) {
+    final text =
+        message["message"]?.toString() ?? "";
+
+    final url =
+        RegExp(
+          r'https?:\/\/[^\s]+',
+          caseSensitive: false,
+        );
+
+    return url.hasMatch(text);
+  }).toList();
+
+  _openChatMediaViewer(
+    title: "Links",
+    messages: links,
+    emptyIcon: Icons.link_rounded,
+    emptyText: "No links shared yet",
+  );
+}
+
+// ============================================================
+// SHARED MEDIA / FILE / LINK VIEW
+// ============================================================
+
+void _openChatMediaViewer({
+  required String title,
+  required List<Map<String, dynamic>> messages,
+  required IconData emptyIcon,
+  required String emptyText,
+}) {
+  if (!mounted) return;
+
+  showModalBottomSheet(
+    context: context,
+    backgroundColor: const Color(0xFF080D18),
+    isScrollControlled: true,
+    useSafeArea: true,
+    shape: const RoundedRectangleBorder(
+      borderRadius: BorderRadius.vertical(
+        top: Radius.circular(26),
+      ),
+    ),
+    builder: (sheetContext) {
+      return SafeArea(
+        child: SizedBox(
+          height:
+              MediaQuery.of(context).size.height * 0.78,
+          child: Column(
+            children: [
+              const SizedBox(height: 10),
+
+              Container(
+                width: 42,
+                height: 4,
+                decoration: BoxDecoration(
+                  color: Colors.white24,
+                  borderRadius:
+                      BorderRadius.circular(20),
+                ),
+              ),
+
+              const SizedBox(height: 14),
+
+              Padding(
+                padding:
+                    const EdgeInsets.symmetric(
+                  horizontal: 18,
+                ),
+                child: Row(
+                  children: [
+                    Text(
+                      title,
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 19,
+                        fontWeight: FontWeight.w800,
+                      ),
+                    ),
+                    const Spacer(),
+                    Text(
+                      "${messages.length}",
+                      style: const TextStyle(
+                        color: Colors.white38,
+                        fontSize: 12,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+
+              const SizedBox(height: 12),
+
+              Expanded(
+                child: messages.isEmpty
+                    ? Center(
+                        child: Column(
+                          mainAxisSize:
+                              MainAxisSize.min,
+                          children: [
+                            Icon(
+                              emptyIcon,
+                              color: Colors.white24,
+                              size: 48,
+                            ),
+                            const SizedBox(
+                              height: 12,
+                            ),
+                            Text(
+                              emptyText,
+                              style:
+                                  const TextStyle(
+                                color:
+                                    Colors.white54,
+                                fontSize: 13,
+                              ),
+                            ),
+                          ],
+                        ),
+                      )
+                    : ListView.builder(
+                        padding:
+                            const EdgeInsets
+                                .symmetric(
+                          horizontal: 14,
+                        ),
+                        itemCount:
+                            messages.length,
+                        itemBuilder:
+                            (context, index) {
+                          final message =
+                              messages[index];
+
+                          final type =
+                              message["type"]
+                                      ?.toString() ??
+                                  "";
+
+                          final text =
+                              message["message"]
+                                      ?.toString() ??
+                                  "";
+
+                          final fileName =
+                              message["fileName"]
+                                      ?.toString() ??
+                                  "";
+
+                          String displayText =
+                              text;
+
+                          if (type ==
+                                  "document" &&
+                              fileName.isNotEmpty) {
+                            displayText =
+                                fileName;
+                          }
+
+                          return Container(
+                            margin:
+                                const EdgeInsets
+                                    .only(
+                              bottom: 8,
+                            ),
+                            decoration:
+                                BoxDecoration(
+                              color:
+                                  const Color(
+                                0xFF111827,
+                              ),
+                              borderRadius:
+                                  BorderRadius
+                                      .circular(
+                                14,
+                              ),
+                            ),
+                            child: ListTile(
+                              leading:
+                                  Container(
+                                width: 44,
+                                height: 44,
+                                decoration:
+                                    BoxDecoration(
+                                  color:
+                                      const Color(
+                                    0xFF00D9FF,
+                                  ).withValues(
+                                    alpha: .10,
+                                  ),
+                                  borderRadius:
+                                      BorderRadius
+                                          .circular(
+                                    12,
+                                  ),
+                                ),
+                                child: Icon(
+                                  type == "image"
+                                      ? Icons
+                                          .image_rounded
+                                      : type ==
+                                              "video"
+                                          ? Icons
+                                              .play_circle_fill_rounded
+                                          : type ==
+                                                  "document"
+                                              ? Icons
+                                                  .description_rounded
+                                              : Icons
+                                                  .link_rounded,
+                                  color:
+                                      const Color(
+                                    0xFF00D9FF,
+                                  ),
+                                ),
+                              ),
+                              title: Text(
+                                displayText,
+                                maxLines: 2,
+                                overflow:
+                                    TextOverflow
+                                        .ellipsis,
+                                style:
+                                    const TextStyle(
+                                  color:
+                                      Colors.white,
+                                  fontSize: 13,
+                                  fontWeight:
+                                      FontWeight.w600,
+                                ),
+                              ),
+                              subtitle:
+                                  Text(
+                                message["senderId"]
+                                            ?.toString() ==
+                                        currentUser
+                                    ? "You"
+                                    : widget
+                                        .receiverName,
+                                style:
+                                    const TextStyle(
+                                  color:
+                                      Colors.white38,
+                                  fontSize: 10,
+                                ),
+                              ),
+                            ),
+                          );
+                        },
+                      ),
+              ),
+            ],
+          ),
+        ),
+      );
+    },
+  );
+}
+
+// ============================================================
+// STARRED MESSAGES
+// ============================================================
+
+void _openStarredMessages() {
+  final starred =
+      _messages.where(_isMessageStarred).toList();
+
+  if (!mounted) return;
+
+  showModalBottomSheet(
+    context: context,
+    backgroundColor: const Color(0xFF080D18),
+    isScrollControlled: true,
+    useSafeArea: true,
+    shape: const RoundedRectangleBorder(
+      borderRadius: BorderRadius.vertical(
+        top: Radius.circular(26),
+      ),
+    ),
+    builder: (sheetContext) {
+      return SafeArea(
+        child: SizedBox(
+          height:
+              MediaQuery.of(context).size.height * 0.72,
+          child: Column(
+            children: [
+              const SizedBox(height: 10),
+
+              Container(
+                width: 42,
+                height: 4,
+                decoration: BoxDecoration(
+                  color: Colors.white24,
+                  borderRadius:
+                      BorderRadius.circular(20),
+                ),
+              ),
+
+              const SizedBox(height: 16),
+
+              const Text(
+                "Starred messages",
+                style: TextStyle(
+                  color: Colors.white,
+                  fontSize: 19,
+                  fontWeight: FontWeight.w800,
+                ),
+              ),
+
+              const SizedBox(height: 12),
+
+              Expanded(
+                child: starred.isEmpty
+                    ? const Center(
+                        child: Column(
+                          mainAxisSize:
+                              MainAxisSize.min,
+                          children: [
+                            Icon(
+                              Icons.star_rounded,
+                              color: Colors.white24,
+                              size: 48,
+                            ),
+                            SizedBox(height: 12),
+                            Text(
+                              "No starred messages",
+                              style: TextStyle(
+                                color:
+                                    Colors.white54,
+                                fontSize: 13,
+                              ),
+                            ),
+                            SizedBox(height: 4),
+                            Text(
+                              "Star important messages to find them here.",
+                              style: TextStyle(
+                                color:
+                                    Colors.white30,
+                                fontSize: 10,
+                              ),
+                            ),
+                          ],
+                        ),
+                      )
+                    : ListView.builder(
+                        padding:
+                            const EdgeInsets
+                                .symmetric(
+                          horizontal: 14,
+                        ),
+                        itemCount: starred.length,
+                        itemBuilder:
+                            (context, index) {
+                          final message =
+                              starred[index];
+
+                          final text =
+                              message["message"]
+                                      ?.toString() ??
+                                  "";
+
+                          return Container(
+                            margin:
+                                const EdgeInsets
+                                    .only(
+                              bottom: 8,
+                            ),
+                            decoration:
+                                BoxDecoration(
+                              color:
+                                  const Color(
+                                0xFF111827,
+                              ),
+                              borderRadius:
+                                  BorderRadius
+                                      .circular(
+                                14,
+                              ),
+                            ),
+                            child: ListTile(
+                              leading:
+                                  const Icon(
+                                Icons.star_rounded,
+                                color:
+                                    Color(
+                                  0xFFFFC857,
+                                ),
+                              ),
+                              title: Text(
+                                text,
+                                maxLines: 3,
+                                overflow:
+                                    TextOverflow
+                                        .ellipsis,
+                                style:
+                                    const TextStyle(
+                                  color:
+                                      Colors.white,
+                                  fontSize: 13,
+                                ),
+                              ),
+                              subtitle:
+                                  const Text(
+                                "Starred by you",
+                                style:
+                                    TextStyle(
+                                  color:
+                                      Colors.white38,
+                                  fontSize: 10,
+                                ),
+                              ),
+                            ),
+                          );
+                        },
+                      ),
+              ),
+            ],
+          ),
+        ),
+      );
+    },
+  );
+}
+
+// ============================================================
+// MUTE NOTIFICATIONS
+// ============================================================
+
+Future<void> _toggleChatMute() async {
+  if (currentUser.isEmpty) return;
+
+  final roomRef = _firestore
+      .collection("chat_rooms")
+      .doc(chatId);
+
+  try {
+    final snapshot = await roomRef.get();
+
+    final data = snapshot.data() ?? {};
+
+    final key = "muted_$currentUser";
+
+    final currentlyMuted =
+        data[key] == true;
+
+    await roomRef.set(
+      {
+        key: !currentlyMuted,
+      },
+      SetOptions(merge: true),
+    );
+
+    if (!mounted) return;
+
+    ScaffoldMessenger.of(context)
+        .showSnackBar(
+      SnackBar(
+        content: Text(
+          !currentlyMuted
+              ? "Notifications muted"
+              : "Notifications unmuted",
+        ),
+      ),
+    );
+  } catch (e) {
+    debugPrint(
+      "ChattªX MUTE ERROR: $e",
+    );
+  }
+}
+
+// ============================================================
+// DISAPPEARING MESSAGES
+// ============================================================
+
+Future<void> _openDisappearingMessages() async {
+  if (!mounted) return;
+
+  final selected =
+      await showModalBottomSheet<String>(
+    context: context,
+    backgroundColor:
+        const Color(0xFF080D18),
+    shape:
+        const RoundedRectangleBorder(
+      borderRadius:
+          BorderRadius.vertical(
+        top: Radius.circular(26),
+      ),
+    ),
+    builder: (sheetContext) {
+      final options = <Map<String, String>>[
+        {
+          "value": "off",
+          "title": "Off",
+          "subtitle":
+              "Messages stay in the chat",
+        },
+        {
+          "value": "24h",
+          "title": "24 hours",
+          "subtitle":
+              "Messages disappear after 24 hours",
+        },
+        {
+          "value": "7d",
+          "title": "7 days",
+          "subtitle":
+              "Messages disappear after 7 days",
+        },
+        {
+          "value": "90d",
+          "title": "90 days",
+          "subtitle":
+              "Messages disappear after 90 days",
+        },
+      ];
+
+      return SafeArea(
+        child: Padding(
+          padding:
+              const EdgeInsets.fromLTRB(
+            16,
+            12,
+            16,
+            20,
+          ),
+          child: Column(
+            mainAxisSize:
+                MainAxisSize.min,
+            children: [
+              Container(
+                width: 42,
+                height: 4,
+                decoration:
+                    BoxDecoration(
+                  color: Colors.white24,
+                  borderRadius:
+                      BorderRadius.circular(
+                    20,
+                  ),
+                ),
+              ),
+              const SizedBox(height: 16),
+              const Text(
+                "Disappearing messages",
+                style: TextStyle(
+                  color: Colors.white,
+                  fontSize: 19,
+                  fontWeight:
+                      FontWeight.w800,
+                ),
+              ),
+              const SizedBox(height: 6),
+              const Text(
+                "Choose how long new messages remain.",
+                textAlign:
+                    TextAlign.center,
+                style: TextStyle(
+                  color: Colors.white54,
+                  fontSize: 11,
+                ),
+              ),
+              const SizedBox(height: 14),
+              ...options.map(
+                (option) {
+                  return ListTile(
+                    leading: const Icon(
+                      Icons
+                          .auto_delete_rounded,
+                      color:
+                          Color(0xFFB026FF),
+                    ),
+                    title: Text(
+                      option["title"]!,
+                      style:
+                          const TextStyle(
+                        color:
+                            Colors.white,
+                        fontWeight:
+                            FontWeight.w700,
+                      ),
+                    ),
+                    subtitle: Text(
+                      option["subtitle"]!,
+                      style:
+                          const TextStyle(
+                        color:
+                            Colors.white38,
+                        fontSize: 10,
+                      ),
+                    ),
+                    onTap: () {
+                      Navigator.pop(
+                        sheetContext,
+                        option["value"],
+                      );
+                    },
+                  );
+                },
+              ),
+            ],
+          ),
+        ),
+      );
+    },
+  );
+
+  if (selected == null ||
+      currentUser.isEmpty ||
+      !mounted) {
+    return;
+  }
+
+  try {
+    await _firestore
+        .collection("chat_rooms")
+        .doc(chatId)
+        .set(
+      {
+        "disappearingMessages":
+            selected,
+        "disappearingUpdatedBy":
+            currentUser,
+        "disappearingUpdatedAt":
+            FieldValue.serverTimestamp(),
+      },
+      SetOptions(merge: true),
+    );
+
+    if (!mounted) return;
+
+    ScaffoldMessenger.of(context)
+        .showSnackBar(
+      SnackBar(
+        content: Text(
+          selected == "off"
+              ? "Disappearing messages turned off"
+              : "Disappearing messages: $selected",
+        ),
+      ),
+    );
+  } catch (e) {
+    debugPrint(
+      "ChattªX DISAPPEARING ERROR: $e",
+    );
+  }
+}
+
+// ============================================================
+// PIN CHAT
+// ============================================================
+
+Future<void> _toggleChatPin() async {
+  if (currentUser.isEmpty) return;
+
+  final roomRef = _firestore
+      .collection("chat_rooms")
+      .doc(chatId);
+
+  try {
+    final snapshot = await roomRef.get();
+
+    final data = snapshot.data() ?? {};
+
+    final key = "pinned_$currentUser";
+
+    final currentlyPinned =
+        data[key] == true;
+
+    await roomRef.set(
+      {
+        key: !currentlyPinned,
+      },
+      SetOptions(merge: true),
+    );
+
+    if (!mounted) return;
+
+    ScaffoldMessenger.of(context)
+        .showSnackBar(
+      SnackBar(
+        content: Text(
+          !currentlyPinned
+              ? "Chat pinned"
+              : "Chat unpinned",
+        ),
+      ),
+    );
+  } catch (e) {
+    debugPrint(
+      "ChattªX PIN ERROR: $e",
+    );
+  }
+}
+
+// ============================================================
+// CHAT APPEARANCE
+// ============================================================
+
+void _openChatAppearance() {
+  if (!mounted) return;
+
+  showModalBottomSheet(
+    context: context,
+    backgroundColor: const Color(0xFF080D18),
+    shape: const RoundedRectangleBorder(
+      borderRadius: BorderRadius.vertical(
+        top: Radius.circular(26),
+      ),
+    ),
+    builder: (sheetContext) {
+      return SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(
+            18,
+            12,
+            18,
+            24,
+          ),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Container(
+                width: 42,
+                height: 4,
+                decoration: BoxDecoration(
+                  color: Colors.white24,
+                  borderRadius:
+                      BorderRadius.circular(20),
+                ),
+              ),
+
+              const SizedBox(height: 16),
+
+              const Text(
+                "Chat appearance",
+                style: TextStyle(
+                  color: Colors.white,
+                  fontSize: 19,
+                  fontWeight: FontWeight.w800,
+                ),
+              ),
+
+              const SizedBox(height: 8),
+
+              const Text(
+                "ChattªX chat appearance controls",
+                style: TextStyle(
+                  color: Colors.white54,
+                  fontSize: 11,
+                ),
+              ),
+
+              const SizedBox(height: 18),
+
+              ListTile(
+                leading: Container(
+                  width: 44,
+                  height: 44,
+                  decoration: BoxDecoration(
+                    color:
+                        const Color(0xFF7B2FF7)
+                            .withValues(
+                      alpha: .10,
+                    ),
+                    borderRadius:
+                        BorderRadius.circular(12),
+                  ),
+                  child: const Icon(
+                    Icons.wallpaper_rounded,
+                    color:
+                        Color(0xFF7B2FF7),
+                  ),
+                ),
+                title: const Text(
+                  "Wallpaper",
+                  style: TextStyle(
+                    color: Colors.white,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+                subtitle: const Text(
+                  "Current ChattªX wallpaper is active",
+                  style: TextStyle(
+                    color: Colors.white38,
+                    fontSize: 10,
+                  ),
+                ),
+                onTap: () {
+                  Navigator.pop(sheetContext);
+
+                  ScaffoldMessenger.of(context)
+                      .showSnackBar(
+                    const SnackBar(
+                      content: Text(
+                        "Wallpaper customization is coming next.",
+                      ),
+                    ),
+                  );
+                },
+              ),
+
+              ListTile(
+                leading: Container(
+                  width: 44,
+                  height: 44,
+                  decoration: BoxDecoration(
+                    color:
+                        const Color(0xFF00D9FF)
+                            .withValues(
+                      alpha: .10,
+                    ),
+                    borderRadius:
+                        BorderRadius.circular(12),
+                  ),
+                  child: const Icon(
+                    Icons.text_fields_rounded,
+                    color:
+                        Color(0xFF00D9FF),
+                  ),
+                ),
+                title: const Text(
+                  "Chat text",
+                  style: TextStyle(
+                    color: Colors.white,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+                subtitle: const Text(
+                  "Message size and display",
+                  style: TextStyle(
+                    color: Colors.white38,
+                    fontSize: 10,
+                  ),
+                ),
+                onTap: () {
+                  Navigator.pop(sheetContext);
+
+                  ScaffoldMessenger.of(context)
+                      .showSnackBar(
+                    const SnackBar(
+                      content: Text(
+                        "ChattªX message styling is already optimized.",
+                      ),
+                    ),
+                  );
+                },
+              ),
+            ],
+          ),
+        ),
+      );
+    },
+  );
+}
+
+// ============================================================
+// ENCRYPTION INFORMATION
+// ============================================================
+
+void _showChatEncryption() {
+  if (!mounted) return;
+
+  showDialog(
+    context: context,
+    builder: (dialogContext) {
+      return AlertDialog(
+        backgroundColor:
+            const Color(0xFF111827),
+        shape: RoundedRectangleBorder(
+          borderRadius:
+              BorderRadius.circular(20),
+        ),
+        title: const Row(
+          children: [
+            Icon(
+              Icons.lock_outline_rounded,
+              color:
+                  Color(0xFF00D9FF),
+            ),
+            SizedBox(width: 10),
+            Text(
+              "Encryption",
+              style: TextStyle(
+                color: Colors.white,
+                fontWeight:
+                    FontWeight.w800,
+              ),
+            ),
+          ],
+        ),
+        content: const Text(
+          "Your ChattªX messages are protected while being transferred between the app and Firebase services. This screen does not claim end-to-end encryption unless ChattªX's messaging system has been configured for true end-to-end encryption.",
+          style: TextStyle(
+            color: Colors.white70,
+            height: 1.45,
+            fontSize: 13,
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () {
+              Navigator.pop(
+                dialogContext,
+              );
+            },
+            child: const Text(
+              "Done",
+              style: TextStyle(
+                color:
+                    Color(0xFF00D9FF),
+              ),
+            ),
+          ),
+        ],
+      );
+    },
+  );
+}
+
+// ============================================================
+// SECURITY VERIFICATION
+// ============================================================
+
+void _showChatSecurityVerification() {
+  if (!mounted) return;
+
+  showDialog(
+    context: context,
+    builder: (dialogContext) {
+      return AlertDialog(
+        backgroundColor:
+            const Color(0xFF111827),
+        shape: RoundedRectangleBorder(
+          borderRadius:
+              BorderRadius.circular(20),
+        ),
+        title: const Row(
+          children: [
+            Icon(
+              Icons.verified_user_rounded,
+              color:
+                  Color(0xFFB026FF),
+            ),
+            SizedBox(width: 10),
+            Expanded(
+              child: Text(
+                "Security verification",
+                style: TextStyle(
+                  color: Colors.white,
+                  fontWeight:
+                      FontWeight.w800,
+                ),
+              ),
+            ),
+          ],
+        ),
+        content: Text(
+          "You're chatting with ${widget.receiverName}. A future ChattªX security-verification system can compare a security code between both devices.",
+          style: const TextStyle(
+            color: Colors.white70,
+            height: 1.45,
+            fontSize: 13,
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () {
+              Navigator.pop(
+                dialogContext,
+              );
+            },
+            child: const Text(
+              "Close",
+              style: TextStyle(
+                color:
+                    Color(0xFFB026FF),
+              ),
+            ),
+          ),
+        ],
+      );
+    },
+  );
+}
+
+// ============================================================
+// BLOCK USER
+// ============================================================
+
+Future<void> _blockChatUser() async {
+  if (currentUser.isEmpty ||
+      !mounted) {
+    return;
+  }
+
+  final confirmed =
+      await showDialog<bool>(
+    context: context,
+    builder: (dialogContext) {
+      return AlertDialog(
+        backgroundColor:
+            const Color(0xFF111827),
+        title: Text(
+          "Block ${widget.receiverName}?",
+          style: const TextStyle(
+            color: Colors.white,
+            fontWeight: FontWeight.w800,
+          ),
+        ),
+        content: const Text(
+          "They will no longer be able to contact you through ChattªX.",
+          style: TextStyle(
+            color: Colors.white70,
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () {
+              Navigator.pop(
+                dialogContext,
+                false,
+              );
+            },
+            child:
+                const Text("Cancel"),
+          ),
+          TextButton(
+            onPressed: () {
+              Navigator.pop(
+                dialogContext,
+                true,
+              );
+            },
+            child: const Text(
+              "Block",
+              style: TextStyle(
+                color: Colors.redAccent,
+                fontWeight:
+                    FontWeight.w700,
+              ),
+            ),
+          ),
+        ],
+      );
+    },
+  );
+
+  if (confirmed != true) {
+    return;
+  }
+
+  try {
+    await _firestore
+        .collection("users")
+        .doc(currentUser)
+        .collection("blocked_users")
+        .doc(widget.receiverId)
+        .set({
+      "userId": widget.receiverId,
+      "blockedAt":
+          FieldValue.serverTimestamp(),
+    });
+
+    if (!mounted) return;
+
+    ScaffoldMessenger.of(context)
+        .showSnackBar(
+      SnackBar(
+        content: Text(
+          "${widget.receiverName} blocked",
+        ),
+      ),
+    );
+  } catch (e) {
+    debugPrint(
+      "ChattªX BLOCK ERROR: $e",
+    );
+
+    if (!mounted) return;
+
+    ScaffoldMessenger.of(context)
+        .showSnackBar(
+      const SnackBar(
+        content: Text(
+          "Couldn't block this user.",
+        ),
+      ),
+    );
+  }
+}
+
+// ============================================================
+// REPORT USER
+// ============================================================
+
+Future<void> _reportChatUser() async {
+  if (currentUser.isEmpty ||
+      !mounted) {
+    return;
+  }
+
+  final reason =
+      await showModalBottomSheet<String>(
+    context: context,
+    backgroundColor:
+        const Color(0xFF080D18),
+    shape:
+        const RoundedRectangleBorder(
+      borderRadius:
+          BorderRadius.vertical(
+        top: Radius.circular(26),
+      ),
+    ),
+    builder: (sheetContext) {
+      final reasons = [
+        "Spam",
+        "Harassment",
+        "Scam or fraud",
+        "Inappropriate content",
+        "Other",
+      ];
+
+      return SafeArea(
+        child: Padding(
+          padding:
+              const EdgeInsets.fromLTRB(
+            18,
+            12,
+            18,
+            24,
+          ),
+          child: Column(
+            mainAxisSize:
+                MainAxisSize.min,
+            children: [
+              Container(
+                width: 42,
+                height: 4,
+                decoration:
+                    BoxDecoration(
+                  color: Colors.white24,
+                  borderRadius:
+                      BorderRadius.circular(
+                    20,
+                  ),
+                ),
+              ),
+
+              const SizedBox(height: 16),
+
+              const Text(
+                "Report account",
+                style: TextStyle(
+                  color: Colors.white,
+                  fontSize: 19,
+                  fontWeight:
+                      FontWeight.w800,
+                ),
+              ),
+
+              const SizedBox(height: 6),
+
+              const Text(
+                "Why are you reporting this account?",
+                style: TextStyle(
+                  color: Colors.white54,
+                  fontSize: 11,
+                ),
+              ),
+
+              const SizedBox(height: 12),
+
+              ...reasons.map(
+                (reason) {
+                  return ListTile(
+                    leading: const Icon(
+                      Icons.flag_rounded,
+                      color:
+                          Colors.redAccent,
+                    ),
+                    title: Text(
+                      reason,
+                      style:
+                          const TextStyle(
+                        color:
+                            Colors.white,
+                        fontWeight:
+                            FontWeight.w600,
+                      ),
+                    ),
+                    onTap: () {
+                      Navigator.pop(
+                        sheetContext,
+                        reason,
+                      );
+                    },
+                  );
+                },
+              ),
+            ],
+          ),
+        ),
+      );
+    },
+  );
+
+  if (reason == null ||
+      reason.isEmpty) {
+    return;
+  }
+
+  try {
+    await _firestore
+        .collection("reports")
+        .add({
+      "reporterId": currentUser,
+      "reportedUserId":
+          widget.receiverId,
+      "reason": reason,
+      "chatId": chatId,
+      "createdAt":
+          FieldValue.serverTimestamp(),
+      "status": "pending",
+    });
+
+    if (!mounted) return;
+
+    ScaffoldMessenger.of(context)
+        .showSnackBar(
+      const SnackBar(
+        content: Text(
+          "Report submitted. Thank you.",
+        ),
+      ),
+    );
+  } catch (e) {
+    debugPrint(
+      "ChattªX REPORT ERROR: $e",
+    );
+
+    if (!mounted) return;
+
+    ScaffoldMessenger.of(context)
+        .showSnackBar(
+      const SnackBar(
+        content: Text(
+          "Couldn't submit report.",
+        ),
+      ),
+    );
+  }
+}
+
+// ============================================================
+// CLEAR CHAT
+// ============================================================
+
+Future<void> _clearCurrentChat() async {
+  if (currentUser.isEmpty ||
+      !mounted) {
+    return;
+  }
+
+  final confirmed =
+      await showDialog<bool>(
+    context: context,
+    builder: (dialogContext) {
+      return AlertDialog(
+        backgroundColor:
+            const Color(0xFF111827),
+        shape: RoundedRectangleBorder(
+          borderRadius:
+              BorderRadius.circular(20),
+        ),
+        title: const Text(
+          "Clear chat?",
+          style: TextStyle(
+            color: Colors.white,
+            fontWeight:
+                FontWeight.w800,
+          ),
+        ),
+        content: const Text(
+          "This removes the conversation from this device's ChattªX cache. It does not delete the other person's copy.",
+          style: TextStyle(
+            color: Colors.white70,
+            height: 1.4,
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () {
+              Navigator.pop(
+                dialogContext,
+                false,
+              );
+            },
+            child:
+                const Text("Cancel"),
+          ),
+          TextButton(
+            onPressed: () {
+              Navigator.pop(
+                dialogContext,
+                true,
+              );
+            },
+            child: const Text(
+              "Clear",
+              style: TextStyle(
+                color: Colors.redAccent,
+                fontWeight:
+                    FontWeight.w700,
+              ),
+            ),
+          ),
+        ],
+      );
+    },
+  );
+
+  if (confirmed != true) {
+    return;
+  }
+
+  try {
+    // ==========================================================
+    // REMOVE LOCAL CACHE
+    // ==========================================================
+
+    await _messageCache.saveMessages(
+      chatId,
+      <Map<String, dynamic>>[],
+    );
+
+    if (!mounted) return;
+
+    setState(() {
+      _messages =
+          <Map<String, dynamic>>[];
+    });
+
+    _currentDateLabel.value = "";
+
+    ScaffoldMessenger.of(context)
+        .showSnackBar(
+      const SnackBar(
+        content: Text(
+          "Chat cleared from this device.",
+        ),
+      ),
+    );
+  } catch (e) {
+    debugPrint(
+      "ChattªX CLEAR CHAT ERROR: $e",
+    );
+
+    if (!mounted) return;
+
+    ScaffoldMessenger.of(context)
+        .showSnackBar(
+      const SnackBar(
+        content: Text(
+          "Couldn't clear the chat.",
+        ),
+      ),
+    );
+  }
+}
+
   // ============================================================
   // BUILD
   // ============================================================
 
   @override
-  Widget build(
-    BuildContext context,
-  ) {
+  Widget build(BuildContext context) {
     if (currentUser.isEmpty) {
       return const Scaffold(
         backgroundColor:
@@ -2343,90 +5407,61 @@ class _ChatScreenState extends State<ChatScreen> {
               ),
             ),
 
-            SafeArea(
-              child: Column(
-                children: [
-                  ChatHeader(
-  name: widget.receiverName,
-  status: receiverStatus,
-  image: widget.receiverImage ?? "",
-  userId: widget.receiverId,
-  isVerified: receiverIsVerified,
-  isOnline: receiverStatus == "Online",
-  isTyping: typing,
-  showQuickActions: showQuickActions,
+            Column(
+  children: [
+    // ============================================================
+    // CHAT HEADER — ABSOLUTE TOP
+    // ============================================================
 
-  onBack: () {
-    Navigator.pop(context);
-  },
+    ChatHeader(
+      name: widget.receiverName,
+      status: receiverStatus,
+      image: widget.receiverImage ?? "",
+      userId: widget.receiverId,
+      isVerified: receiverIsVerified,
+      isOnline: receiverStatus == "Online",
+      isTyping: typing,
+      showQuickActions: showQuickActions,
 
-  onNameTap: () {
-    Navigator.push(
-      context,
-      MaterialPageRoute(
-        builder: (_) => UserProfileViewScreen(
-          userId: widget.receiverId,
-          userName: widget.receiverName,
-          userImage: widget.receiverImage,
-        ),
-      ),
-    );
-  },
+      onBack: () {
+        Navigator.pop(context);
+      },
 
-  onVoiceCall: _startOutgoingVoiceCall,
+      onNameTap: () {
+        Navigator.push(
+          context,
+          MaterialPageRoute(
+            builder: (_) => UserProfileViewScreen(
+              userId: widget.receiverId,
+              userName: widget.receiverName,
+              userImage: widget.receiverImage,
+            ),
+          ),
+        );
+      },
 
-  onVideoCall: () {},
+      onVoiceCall: _startOutgoingVoiceCall,
 
-  onMenu: () {},
+      onVideoCall: () {},
+
+      onMenu: _showChatOptions,
+    ),
+
+    // ============================================================
+    // MESSAGES
+    // ============================================================
+
+    Expanded(
+      child: _buildMessageArea(),
+    ),
+
+    // ============================================================
+    // MESSAGE COMPOSER
+    // ============================================================
+
+    _buildComposer(),
+  ],
 ),
-              
-
-                  Expanded(
-                    child:
-                        _buildMessageArea(),
-                  ),
-
-                  _buildComposer(),
-                ],
-              ),
-            ),
-
-            // ==================================================
-            // HIDDEN EMOJI INPUT
-            // ==================================================
-
-            Positioned(
-              left: 0,
-              bottom: 0,
-              child: SizedBox(
-                width: 1,
-                height: 1,
-                child: Opacity(
-                  opacity: 0.01,
-                  child: TextField(
-                    controller:
-                        _reactionEmojiController,
-                    focusNode:
-                        _reactionEmojiFocusNode,
-                    keyboardType:
-                        TextInputType.text,
-                    textInputAction:
-                        TextInputAction.done,
-                    autocorrect: false,
-                    enableSuggestions:
-                        false,
-                    onChanged:
-                        _handleReactionEmojiInput,
-                    decoration:
-                        const InputDecoration(
-                      border:
-                          InputBorder.none,
-                      isCollapsed: true,
-                    ),
-                  ),
-                ),
-              ),
-            ),
           ],
         ),
       ),
@@ -2438,13 +5473,11 @@ class _ChatScreenState extends State<ChatScreen> {
   // ============================================================
 
   Widget _buildMessageArea() {
-    if (_currentMessages.isNotEmpty) {
-      return _buildMessageList(
-        _currentMessages,
-      );
+    if (_messages.isNotEmpty) {
+      return _buildMessageList();
     }
 
-    if (_firestoreHasLoadedMessages) {
+    if (_firestoreLoaded) {
       return const Center(
         child: Text(
           "No messages yet",
@@ -2459,222 +5492,270 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   // ============================================================
-  // MESSAGE LIST
-  // ============================================================
+// MESSAGE LIST
+// ============================================================
 
-  Widget _buildMessageList(
-    List<Map<String, dynamic>> messages,
-  ) {
-    _prepareMessageKeys(messages);
+Widget _buildMessageList() {
+  final selectedId = _selectedMessageId;
 
-    WidgetsBinding.instance
-        .addPostFrameCallback(
-      (_) {
-        if (mounted) {
-          _updateCurrentDateLabel();
-        }
-      },
-    );
+  Map<String, dynamic>? selectedMessage;
 
-    return Stack(
-      children: [
-        ListView.builder(
-          key: _messageListKey,
-          controller:
-              _scrollController,
-          reverse: true,
-          padding:
-              const EdgeInsets.only(
-            top: 8,
-            bottom: 10,
-          ),
-          itemCount: messages.length,
-          itemBuilder:
-              (context, index) {
-            final actualIndex =
-                messages.length -
-                    1 -
-                    index;
+  if (selectedId != null && selectedId.isNotEmpty) {
+    for (final message in _messages) {
+      final id = message["_id"]?.toString() ?? "";
 
-            final message =
-                messages[actualIndex];
+      if (id == selectedId) {
+        selectedMessage = message;
+        break;
+      }
+    }
+  }
 
-            return _buildMessageItem(
-              messages: messages,
-              message: message,
-              actualIndex:
-                  actualIndex,
-            );
-          },
+  return Stack(
+    clipBehavior: Clip.none,
+    children: [
+      // ==========================================================
+      // REAL MESSAGE LIST
+      //
+      // NOTHING is added to the selected message's height.
+      // Therefore long-pressing NEVER creates extra space.
+      // ==========================================================
+
+      ListView.builder(
+        controller: _scrollController,
+        reverse: true,
+        padding: const EdgeInsets.only(
+          top: 8,
+          bottom: 10,
         ),
+        itemCount: _messages.length,
+        itemBuilder: (context, index) {
+          final actualIndex =
+              _messages.length -
+                  1 -
+                  index;
 
-        if (currentDateLabel.isNotEmpty)
-          Positioned(
-            top: 8,
-            left: 0,
-            right: 0,
-            child: IgnorePointer(
-              child: Center(
-                child: Container(
-                  padding:
-                      const EdgeInsets.symmetric(
-                    horizontal: 14,
-                    vertical: 6,
-                  ),
-                  decoration:
-                      BoxDecoration(
-                    color:
-                        const Color(0xff151515),
-                    borderRadius:
-                        BorderRadius.circular(
-                      14,
-                    ),
-                  ),
-                  child: Text(
-                    currentDateLabel,
-                    style:
-                        const TextStyle(
-                      color:
-                          Colors.white70,
-                      fontSize: 11,
-                      fontWeight:
-                          FontWeight.w600,
-                    ),
-                  ),
-                ),
+          final message =
+              _messages[actualIndex];
+
+          final id =
+              message["_id"]
+                      ?.toString() ??
+                  "";
+
+          return KeyedSubtree(
+            key: ValueKey<String>(
+              id.isNotEmpty
+                  ? id
+                  : "message_$actualIndex",
+            ),
+            child: _buildMessageItem(
+              message: message,
+              actualIndex: actualIndex,
+            ),
+          );
+        },
+      ),
+
+      // ==========================================================
+// FLOATING DATE LABEL
+// ==========================================================
+//
+// IMPORTANT:
+// This is isolated from the ChatScreen's setState().
+// Scrolling therefore does NOT rebuild the entire chat.
+//
+ValueListenableBuilder<String>(
+  valueListenable: _currentDateLabel,
+  builder: (
+    context,
+    dateLabel,
+    child,
+  ) {
+    if (dateLabel.isEmpty) {
+      return const SizedBox.shrink();
+    }
+
+    return Positioned(
+      top: 8,
+      left: 0,
+      right: 0,
+      child: IgnorePointer(
+        child: Center(
+          child: Container(
+            padding: const EdgeInsets.symmetric(
+              horizontal: 14,
+              vertical: 6,
+            ),
+            decoration: BoxDecoration(
+              color: const Color(0xff151515),
+              borderRadius: BorderRadius.circular(14),
+            ),
+            child: Text(
+              dateLabel,
+              style: const TextStyle(
+                color: Colors.white70,
+                fontSize: 11,
+                fontWeight: FontWeight.w600,
               ),
             ),
           ),
-      ],
+        ),
+      ),
     );
-  }
+  },
+),
 
-  // ============================================================
-  // MESSAGE KEYS
-  // ============================================================
+      // ==========================================================
+      // FLOATING SELECTION CONTROLS
+      //
+      // These are NOT inside the ListView.
+      //
+      // Therefore they DO NOT consume space.
+      // ==========================================================
 
-  void _prepareMessageKeys(
-    List<Map<String, dynamic>> messages,
-  ) {
-    final existingIds = <String>{};
+      if (selectedMessage != null)
+        CompositedTransformFollower(
+          link: _selectionLayerLink,
 
-    for (final message in messages) {
-      final id =
-          message["_id"]?.toString() ?? "";
+          // Attach the overlay to the bottom-center of the
+          // selected message.
+          targetAnchor:
+              Alignment.bottomCenter,
 
-      if (id.isEmpty) {
-        continue;
-      }
+          // Put the top-center of the reaction/menu stack
+          // at that point.
+          followerAnchor:
+              Alignment.topCenter,
 
-      existingIds.add(id);
-
-      _messageKeys.putIfAbsent(
-        id,
-        GlobalKey.new,
-      );
-    }
-
-    _messageKeys.removeWhere(
-      (id, key) =>
-          !existingIds.contains(id),
-    );
-  }
-
-  // ============================================================
-  // MESSAGE ITEM
-  // ============================================================
-
-  Widget _buildMessageItem({
-    required List<Map<String, dynamic>>
-        messages,
-    required Map<String, dynamic>
-        message,
-    required int actualIndex,
-  }) {
-    final messageId =
-        message["_id"]?.toString() ?? "";
-
-    final isMe =
-        message["senderId"] ==
-            currentUser;
-
-    final type =
-        message["type"]?.toString() ??
-            "text";
-
-    final messageDate =
-        _messageDate(
-      message["timestamp"],
-    );
-
-    final showDateSeparator =
-        _shouldShowDateSeparator(
-      messages,
-      actualIndex,
-    );
-
-    final isSelected =
-        _selectedMessageId ==
-            messageId;
-
-    final anotherSelected =
-        hasSelectedMessage &&
-            !isSelected;
-
-    return Column(
-      key: _messageKeys[messageId],
-      children: [
-        if (showDateSeparator &&
-            messageDate != null)
-          _buildDateSeparator(
-            messageDate,
+          offset: const Offset(
+            0,
+            8,
           ),
 
-        GestureDetector(
-          behavior:
-              HitTestBehavior.opaque,
-          onLongPress: () {
-            _selectMessage(
-              messageId,
-            );
-          },
-          child: AnimatedOpacity(
-            duration:
-                const Duration(
-              milliseconds: 180,
+          showWhenUnlinked: false,
+
+          child: Material(
+            color: Colors.transparent,
+            child: _buildFloatingSelectedControls(
+              map: selectedMessage,
+              messageId: selectedId!,
+              isMe:
+                  selectedMessage["senderId"] ==
+                      currentUser,
+              type:
+                  selectedMessage["type"]
+                          ?.toString() ??
+                      "text",
             ),
-            opacity:
-                anotherSelected
-                    ? 0.35
-                    : 1,
-            child: ImageFiltered(
-              imageFilter:
-                  anotherSelected
-                      ? ui.ImageFilter.blur(
-                          sigmaX: 5.5,
-                          sigmaY: 5.5,
-                        )
-                      : ui.ImageFilter.blur(
-                          sigmaX: 0,
-                          sigmaY: 0,
-                        ),
-              child: GestureDetector(
-                behavior:
-                    HitTestBehavior.opaque,
-                onTap:
-                    type == "location" ||
-                            type ==
-                                "live_location"
-                        ? () {
-                            _openLocationMessage(
-                              message,
-                            );
-                          }
-                        : null,
-                child:
-                    _buildMessageBubble(
-                  message:
-                      message,
+          ),
+        ),
+    ],
+  );
+}
+
+  // ============================================================
+// MESSAGE ITEM
+// ============================================================
+
+Widget _buildMessageItem({
+  required Map<String, dynamic> message,
+  required int actualIndex,
+}) {
+  final messageId =
+      message["_id"]?.toString() ?? "";
+
+  final isMe =
+      message["senderId"] ==
+          currentUser;
+
+  final type =
+      message["type"]?.toString() ??
+          "text";
+
+  final messageDate =
+      _messageDate(
+    message["timestamp"],
+  );
+
+  final selected =
+      _selectedMessageId ==
+          messageId;
+
+  final showDate =
+      _shouldShowDateSeparator(
+    actualIndex,
+  );
+
+  // ==========================================================
+  // ORIGINAL MESSAGE CONTENT
+  // ==========================================================
+
+  Widget messageContent = Column(
+    mainAxisSize:
+        MainAxisSize.min,
+    children: [
+      if (showDate &&
+          messageDate != null)
+        _buildDateSeparator(
+          messageDate,
+        ),
+
+      GestureDetector(
+        behavior:
+            HitTestBehavior.opaque,
+
+        onLongPress: () {
+          _selectMessage(
+            messageId,
+          );
+        },
+
+        onTap: () {
+          if (hasSelectedMessage) {
+            if (selected) {
+              return;
+            }
+
+            _closeSelection();
+            return;
+          }
+
+          if (type == "location" ||
+              type == "live_location") {
+            _openLocationMessage(
+              message,
+            );
+          }
+        },
+
+        child: AnimatedContainer(
+          duration:
+              const Duration(
+            milliseconds: 120,
+          ),
+          padding:
+              const EdgeInsets.symmetric(
+            vertical: 1,
+          ),
+
+          child: selected
+              ? CompositedTransformTarget(
+                  link:
+                      _selectionLayerLink,
+                  child:
+                      _buildMessageBubble(
+                    message: message,
+                    messageId:
+                        messageId,
+                    isMe: isMe,
+                    type: type,
+                    messageDate:
+                        messageDate,
+                  ),
+                )
+              : _buildMessageBubble(
+                  message: message,
                   messageId:
                       messageId,
                   isMe: isMe,
@@ -2682,63 +5763,59 @@ class _ChatScreenState extends State<ChatScreen> {
                   messageDate:
                       messageDate,
                 ),
-              ),
-            ),
-          ),
         ),
+      ),
+    ],
+  );
 
-        if (isSelected)
-          Padding(
-            padding:
-                const EdgeInsets.only(
-              top: 4,
-              bottom: 4,
-            ),
-            child:
-                _buildSelectedControls(
-              map: message,
-              messageId: messageId,
-              isMe: isMe,
-              type: type,
-            ),
-          ),
-      ],
+  // ==========================================================
+  // BLUR EVERYTHING EXCEPT THE SELECTED MESSAGE
+  // ==========================================================
+
+  if (hasSelectedMessage &&
+      !selected) {
+    messageContent = ImageFiltered(
+      imageFilter: ui.ImageFilter.blur(
+        sigmaX: 3.8,
+        sigmaY: 3.8,
+      ),
+      child: messageContent,
     );
   }
+
+  return messageContent;
+}
 
   // ============================================================
   // DATE SEPARATOR
   // ============================================================
 
   bool _shouldShowDateSeparator(
-    List<Map<String, dynamic>> messages,
     int index,
   ) {
-    if (index <= 0) {
+    if (index <= 0 ||
+        index >= _messages.length) {
       return false;
     }
 
-    final currentDate =
+    final current =
         _messageDate(
-      messages[index]["timestamp"],
+      _messages[index]["timestamp"],
     );
 
-    final previousDate =
+    final previous =
         _messageDate(
-      messages[index - 1]["timestamp"],
+      _messages[index - 1]["timestamp"],
     );
 
-    if (currentDate == null ||
-        previousDate == null) {
+    if (current == null ||
+        previous == null) {
       return false;
     }
 
-    return currentDate.year !=
-            previousDate.year ||
-        currentDate.month !=
-            previousDate.month ||
-        currentDate.day !=
-            previousDate.day;
+    return current.year != previous.year ||
+        current.month != previous.month ||
+        current.day != previous.day;
   }
 
   Widget _buildDateSeparator(
@@ -2802,14 +5879,15 @@ class _ChatScreenState extends State<ChatScreen> {
       message["voiceDuration"],
     );
 
-    // ==========================================================
-    // IMPORTANT:
-    // Always provide MessageBubble with a proper Map<String,dynamic>
-    // for reactions.
-    // ==========================================================
+    // Real waveform saved when the voice note was sent
+    // (falls back to an empty list, which MessageBubble
+    // treats as "no data" and draws a flat line for).
+    final voiceWaveform =
+        _toDoubleList(
+      message["voiceWaveform"],
+    );
 
-    final Map<String, dynamic>
-        reactions =
+    final reactions =
         _normaliseReactions(
       message["reactions"],
     );
@@ -2818,6 +5896,35 @@ class _ChatScreenState extends State<ChatScreen> {
       type: type,
       message:
           message["message"] ?? "",
+          imageUrl:
+    message["imageUrl"]
+            ?.toString() ??
+        "",
+
+videoUrl:
+    message["videoUrl"]
+            ?.toString() ??
+        "",
+
+documentUrl:
+    message["documentUrl"]
+            ?.toString() ??
+        "",
+
+fileName:
+    message["fileName"]
+            ?.toString() ??
+        "",
+
+mimeType:
+    message["mimeType"]
+            ?.toString() ??
+        "",
+
+fileSize:
+    _toInt(
+  message["fileSize"],
+),
       latitude:
           _toDouble(
         message["latitude"],
@@ -2829,6 +5936,7 @@ class _ChatScreenState extends State<ChatScreen> {
       voiceUrl: voiceUrl,
       voiceDuration:
           voiceDuration,
+      voiceWaveform: voiceWaveform,
       time: messageDate != null
           ? TimeOfDay.fromDateTime(
               messageDate,
@@ -2839,6 +5947,14 @@ class _ChatScreenState extends State<ChatScreen> {
           message["seen"] == true,
       isDelivered:
           message["delivered"] == true,
+          // ============================================================
+      // VOICE CALL HISTORY
+      // ============================================================
+
+      callStatus:
+          message["callStatus"]?.toString() ?? "",
+      callDuration:
+          _toInt(message["callDuration"]),
       isReply:
           message["replyTo"] != null,
       replyTo:
@@ -2847,13 +5963,13 @@ class _ChatScreenState extends State<ChatScreen> {
           message["isFrozen"] == true,
       isMelted:
           message["isMelted"] == true,
-
-      // ========================================================
-      // FIXED REACTIONS
-      // ========================================================
-
       reactions: reactions,
-
+      onReaction: (emoji) async {
+        await _addReaction(
+          messageId,
+          emoji,
+        );
+      },
       onMelt: () async {
         if (messageId.isEmpty) {
           return;
@@ -2880,14 +5996,15 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   // ============================================================
-  // NORMALISE REACTIONS
+  // REACTION NORMALISATION
   // ============================================================
 
-  Map<String, dynamic> _normaliseReactions(
+  Map<String, dynamic>
+      _normaliseReactions(
     dynamic raw,
   ) {
-    final Map<String, dynamic>
-        result = {};
+    final result =
+        <String, dynamic>{};
 
     if (raw is! Map) {
       return result;
@@ -2902,8 +6019,8 @@ class _ChatScreenState extends State<ChatScreen> {
           result[emoji] =
               value
                   .map(
-                    (user) =>
-                        user.toString(),
+                    (item) =>
+                        item.toString(),
                   )
                   .toList();
         } else if (value is String) {
@@ -2918,18 +6035,60 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   int _toInt(dynamic value) {
-    if (value is int) {
-      return value;
+  if (value == null) {
+    return 0;
+  }
+
+  if (value is int) {
+    return value;
+  }
+
+  if (value is double) {
+    return value.toInt();
+  }
+
+  return int.tryParse(
+        value.toString(),
+      ) ??
+      0;
+}
+
+  // ============================================================
+  // WAVEFORM FIELD PARSING
+  // ============================================================
+  //
+  // Firestore returns the stored "voiceWaveform" array as
+  // List<dynamic> (num values). This converts it safely into
+  // List<double> for MessageBubble, tolerating legacy messages
+  // that don't have the field at all.
+  // ============================================================
+
+  List<double> _toDoubleList(dynamic raw) {
+    if (raw is! List) {
+      return const [];
     }
 
-    if (value is num) {
-      return value.toInt();
+    final result = <double>[];
+
+    for (final value in raw) {
+      double? parsed;
+
+      if (value is num) {
+        parsed = value.toDouble();
+      } else if (value is String) {
+        parsed = double.tryParse(value);
+      }
+
+      if (parsed == null ||
+          parsed.isNaN ||
+          parsed.isInfinite) {
+        continue;
+      }
+
+      result.add(parsed.clamp(0.0, 1.0));
     }
 
-    return int.tryParse(
-          value?.toString() ?? "",
-        ) ??
-        0;
+    return result;
   }
 
   // ============================================================
@@ -2943,43 +6102,85 @@ class _ChatScreenState extends State<ChatScreen> {
     required bool isMe,
     required String type,
   }) {
-    return Column(
-      mainAxisSize:
-          MainAxisSize.min,
+    return Padding(
+      padding:
+          const EdgeInsets.only(
+        top: 4,
+        bottom: 4,
+      ),
+      child: Column(
+        mainAxisSize:
+            MainAxisSize.min,
+        children: [
+          ReactionBar(
+            onReactionSelected:
+                (emoji) async {
+              await _addReaction(
+                messageId,
+                emoji,
+              );
+            },
+            onAddEmoji: () {
+              _showCustomReactionDialog(
+                messageId,
+              );
+            },
+          ),
+
+          const SizedBox(height: 5),
+
+          _buildMessageMenu(
+            map: map,
+            messageId: messageId,
+            isMe: isMe,
+            type: type,
+          ),
+        ],
+      ),
+    );
+  }
+
+  // ============================================================
+// FLOATING SELECTED CONTROLS
+// ============================================================
+
+Widget _buildFloatingSelectedControls({
+  required Map<String, dynamic> map,
+  required String messageId,
+  required bool isMe,
+  required String type,
+}) {
+  return Padding(
+    padding: const EdgeInsets.symmetric(
+      horizontal: 8,
+    ),
+    child: Column(
+      mainAxisSize: MainAxisSize.min,
       children: [
+        // ======================================================
+        // REACTION BAR
+        // ======================================================
+
         ReactionBar(
           onReactionSelected:
               (emoji) async {
-            final cleanEmoji =
-                emoji.trim();
-
-            if (messageId.isEmpty ||
-                cleanEmoji.isEmpty ||
-                _processingReactionEmoji) {
-              return;
-            }
-
-            _processingReactionEmoji =
-                true;
-
-            try {
-              await _addReaction(
-                messageId,
-                cleanEmoji,
-              );
-            } finally {
-              _processingReactionEmoji =
-                  false;
-            }
+            await _addReaction(
+              messageId,
+              emoji,
+            );
           },
           onAddEmoji: () {
-            _openReactionEmojiKeyboard(
+            _showCustomReactionDialog(
               messageId,
             );
           },
         ),
 
         const SizedBox(height: 5),
+
+        // ======================================================
+        // MESSAGE MENU
+        // ======================================================
 
         _buildMessageMenu(
           map: map,
@@ -2988,8 +6189,9 @@ class _ChatScreenState extends State<ChatScreen> {
           type: type,
         ),
       ],
-    );
-  }
+    ),
+  );
+}
 
   // ============================================================
   // MESSAGE MENU
@@ -3013,35 +6215,72 @@ class _ChatScreenState extends State<ChatScreen> {
       },
 
       onCopy: () async {
-        if (type == "text") {
-          await Clipboard.setData(
-            ClipboardData(
-              text:
-                  map["message"]
-                      ?.toString() ??
-                      "",
-            ),
-          );
+  final String text =
+      map["message"]
+              ?.toString()
+              .trim() ??
+          "";
 
-          if (mounted) {
-            ScaffoldMessenger.of(context)
-                .showSnackBar(
-              const SnackBar(
-                content: Text(
-                  "Message copied",
-                ),
-              ),
-            );
-          }
-        }
+  if (text.isEmpty) {
+    if (mounted) {
+      ScaffoldMessenger.of(context)
+          .showSnackBar(
+        const SnackBar(
+          content: Text(
+            "Nothing to copy",
+          ),
+        ),
+      );
+    }
 
-        _closeSelection();
-      },
+    _closeSelection();
+    return;
+  }
+
+  try {
+    await Clipboard.setData(
+      ClipboardData(
+        text: text,
+      ),
+    );
+
+    if (!mounted) return;
+
+    _closeSelection();
+
+    ScaffoldMessenger.of(context)
+        .hideCurrentSnackBar();
+
+    ScaffoldMessenger.of(context)
+        .showSnackBar(
+      const SnackBar(
+        content: Text(
+          "Message copied",
+        ),
+        duration:
+            Duration(seconds: 1),
+      ),
+    );
+  } catch (e) {
+    debugPrint(
+      "ChattªX COPY ERROR: $e",
+    );
+
+    if (!mounted) return;
+
+    ScaffoldMessenger.of(context)
+        .showSnackBar(
+      const SnackBar(
+        content: Text(
+          "Couldn't copy message",
+        ),
+      ),
+    );
+  }
+},
 
       onPin: () async {
-        if (messageId.isEmpty) {
-          return;
-        }
+        if (messageId.isEmpty) return;
 
         try {
           await _firestore
@@ -3062,9 +6301,8 @@ class _ChatScreenState extends State<ChatScreen> {
             ScaffoldMessenger.of(context)
                 .showSnackBar(
               const SnackBar(
-                content: Text(
-                  "Message pinned",
-                ),
+                content:
+                    Text("Message pinned"),
               ),
             );
           }
@@ -3115,14 +6353,12 @@ class _ChatScreenState extends State<ChatScreen> {
     Map<String, dynamic> map,
     String messageId,
   ) async {
-    if (messageId.isEmpty) {
-      return;
-    }
+    if (messageId.isEmpty) return;
 
     final confirm =
         await showDialog<bool>(
       context: context,
-      builder: (_) {
+      builder: (dialogContext) {
         return AlertDialog(
           backgroundColor:
               const Color(0xff111827),
@@ -3142,7 +6378,7 @@ class _ChatScreenState extends State<ChatScreen> {
             TextButton(
               onPressed: () {
                 Navigator.pop(
-                  context,
+                  dialogContext,
                   false,
                 );
               },
@@ -3152,7 +6388,7 @@ class _ChatScreenState extends State<ChatScreen> {
             TextButton(
               onPressed: () {
                 Navigator.pop(
-                  context,
+                  dialogContext,
                   true,
                 );
               },
@@ -3169,9 +6405,7 @@ class _ChatScreenState extends State<ChatScreen> {
       },
     );
 
-    if (confirm != true) {
-      return;
-    }
+    if (confirm != true) return;
 
     try {
       await _firestore
@@ -3213,9 +6447,7 @@ class _ChatScreenState extends State<ChatScreen> {
   Future<void> _deleteForMe(
     String messageId,
   ) async {
-    if (messageId.isEmpty) {
-      return;
-    }
+    if (messageId.isEmpty) return;
 
     try {
       await _firestore
@@ -3268,9 +6500,7 @@ class _ChatScreenState extends State<ChatScreen> {
     String messageId,
     bool isMe,
   ) async {
-    if (messageId.isEmpty) {
-      return;
-    }
+    if (messageId.isEmpty) return;
 
     if (!isMe) {
       if (mounted) {
@@ -3290,7 +6520,7 @@ class _ChatScreenState extends State<ChatScreen> {
     final confirm =
         await showDialog<bool>(
       context: context,
-      builder: (_) {
+      builder: (dialogContext) {
         return AlertDialog(
           backgroundColor:
               const Color(0xff111827),
@@ -3310,7 +6540,7 @@ class _ChatScreenState extends State<ChatScreen> {
             TextButton(
               onPressed: () {
                 Navigator.pop(
-                  context,
+                  dialogContext,
                   false,
                 );
               },
@@ -3320,7 +6550,7 @@ class _ChatScreenState extends State<ChatScreen> {
             TextButton(
               onPressed: () {
                 Navigator.pop(
-                  context,
+                  dialogContext,
                   true,
                 );
               },
@@ -3337,9 +6567,7 @@ class _ChatScreenState extends State<ChatScreen> {
       },
     );
 
-    if (confirm != true) {
-      return;
-    }
+    if (confirm != true) return;
 
     try {
       await _firestore
@@ -3376,68 +6604,32 @@ class _ChatScreenState extends State<ChatScreen> {
     if (recording) {
       return VoiceRecorder(
         onCancel: () {
+          if (!mounted) return;
+
           setState(() {
             recording = false;
           });
         },
         onSend:
             (path, duration, waveform) async {
+          if (!mounted) return;
+
           setState(() {
             recording = false;
           });
 
-          try {
-            final url =
-                await CloudinaryService
-                    .uploadVoice(
-              File(path),
-            );
-
-            if (url == null) {
-              return;
-            }
-
-            await _chatService
-                .sendVoiceMessage(
-              widget.receiverId,
-              widget.receiverName,
-              url,
-              duration,
-            );
-
-            await _firestore
-                .collection("chat_rooms")
-                .doc(chatId)
-                .set(
-              {
-                "participants": [
-                  currentUser,
-                  widget.receiverId,
-                ],
-                "lastMessage":
-                    "🎤 Voice message",
-                "lastMessageTime":
-                    FieldValue
-                        .serverTimestamp(),
-                "lastSenderId":
-                    currentUser,
-                "lastInfinity":
-                    "sent",
-              },
-              SetOptions(
-                merge: true,
-              ),
-            );
-          } catch (e) {
-            debugPrint(
-              "ChattªX VOICE SEND ERROR: $e",
-            );
-          }
+          await _sendVoiceRecording(
+            path,
+            duration,
+            waveform,
+          );
         },
       );
     }
 
     return Column(
+      mainAxisSize:
+          MainAxisSize.min,
       children: [
         if (typing)
           const Padding(
@@ -3459,8 +6651,10 @@ class _ChatScreenState extends State<ChatScreen> {
           _buildReplyPreview(),
 
         MessageInput(
-          controller: _controller,
-          onChanged: handleTyping,
+          controller:
+              _controller,
+          onChanged:
+              handleTyping,
           onSend: () {
             sendMessage();
           },
@@ -3473,6 +6667,12 @@ class _ChatScreenState extends State<ChatScreen> {
               openAttachments,
           onEmoji: () {},
           onVoiceStart: () {
+            if (!mounted ||
+                _sendingMessage ||
+                _sendingVoice) {
+              return;
+            }
+
             setState(() {
               recording = true;
             });
@@ -3481,6 +6681,10 @@ class _ChatScreenState extends State<ChatScreen> {
       ],
     );
   }
+
+  // ============================================================
+  // REPLY PREVIEW
+  // ============================================================
 
   Widget _buildReplyPreview() {
     return Container(
@@ -3530,6 +6734,8 @@ class _ChatScreenState extends State<ChatScreen> {
           ),
           IconButton(
             onPressed: () {
+              if (!mounted) return;
+
               setState(() {
                 replyingMessage = null;
               });
@@ -3545,65 +6751,139 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   // ============================================================
-  // ATTACHMENTS
-  // ============================================================
+// ATTACHMENTS
+// ============================================================
 
-  void openAttachments() {
-    showModalBottomSheet(
-      context: context,
-      backgroundColor:
-          Colors.transparent,
-      isScrollControlled: true,
-      builder: (_) {
-        return AttachmentSheet(
-          onCamera: () {
-            debugPrint(
-              "ChattªX CAMERA TAPPED",
-            );
-          },
-          onGallery: () {
-            debugPrint(
-              "ChattªX GALLERY TAPPED",
-            );
-          },
-          onVideo: () {
-            debugPrint(
-              "ChattªX VIDEO TAPPED",
-            );
-          },
-          onAudio: () {
-            debugPrint(
-              "ChattªX AUDIO TAPPED",
-            );
-          },
-          onDocument: () {
-            debugPrint(
-              "ChattªX DOCUMENT TAPPED",
-            );
-          },
-          onLocation: () {
-            Navigator.pop(context);
-            _showLocationOptions();
-          },
-          onContact: () {
-            debugPrint(
-              "ChattªX CONTACT TAPPED",
-            );
-          },
-          onPoll: () {
-            debugPrint(
-              "ChattªX POLL TAPPED",
-            );
-          },
-          onPay: () {
-            debugPrint(
-              "ChattªX PAY TAPPED",
-            );
-          },
-        );
-      },
-    );
-  }
+void openAttachments() {
+  showModalBottomSheet(
+    context: context,
+    backgroundColor: Colors.transparent,
+    isScrollControlled: true,
+    builder: (sheetContext) {
+      return AttachmentSheet(
+        // ========================================================
+        // CAMERA
+        // ========================================================
+
+        onCamera: (XFile file) async {
+          Navigator.pop(sheetContext);
+
+          await _sendImageMessage(file);
+        },
+
+        // ========================================================
+        // GALLERY
+        // ========================================================
+
+        onGallery: () async {
+          Navigator.pop(sheetContext);
+
+          final picker = ImagePicker();
+
+          final XFile? file =
+              await picker.pickImage(
+            source: ImageSource.gallery,
+            imageQuality: 92,
+          );
+
+          if (file == null || !mounted) {
+            return;
+          }
+
+          await _sendImageMessage(file);
+        },
+
+        // ========================================================
+        // VIDEO
+        // ========================================================
+
+        onVideo: () async {
+          Navigator.pop(sheetContext);
+
+          final picker = ImagePicker();
+
+          final XFile? file =
+              await picker.pickVideo(
+            source: ImageSource.gallery,
+          );
+
+          if (file == null || !mounted) {
+            return;
+          }
+
+          await _sendVideoMessage(file);
+        },
+
+        // ========================================================
+        // AUDIO
+        // ========================================================
+
+        onAudio: () {
+          debugPrint(
+            "ChattªX AUDIO TAPPED",
+          );
+        },
+
+        // ========================================================
+        // DOCUMENT
+        // ========================================================
+
+        onDocument: () async {
+          Navigator.pop(sheetContext);
+
+          await _pickAndSendDocument();
+        },
+
+        // ========================================================
+        // LOCATION
+        // ========================================================
+
+        onLocation: () {
+          Navigator.pop(sheetContext);
+
+          WidgetsBinding.instance
+              .addPostFrameCallback(
+            (_) {
+              if (!mounted) return;
+
+              _showLocationOptions();
+            },
+          );
+        },
+
+        // ========================================================
+        // CONTACT
+        // ========================================================
+
+        onContact: () {
+          debugPrint(
+            "ChattªX CONTACT TAPPED",
+          );
+        },
+
+        // ========================================================
+        // POLL
+        // ========================================================
+
+        onPoll: () {
+          debugPrint(
+            "ChattªX POLL TAPPED",
+          );
+        },
+
+        // ========================================================
+        // PAY
+        // ========================================================
+
+        onPay: () {
+          debugPrint(
+            "ChattªX PAY TAPPED",
+          );
+        },
+      );
+    },
+  );
+}
 
   // ============================================================
   // DISPOSE
@@ -3611,33 +6891,34 @@ class _ChatScreenState extends State<ChatScreen> {
 
   @override
   void dispose() {
-    _chatService.setOffline();
-
-    _messagesSubscription?.cancel();
-
-    _typingSubscription?.cancel();
-
-    _receiverStatusSubscription?.cancel();
-
-    _currentUserVerificationSubscription
-        ?.cancel();
-
-    _receiverVerificationSubscription
-        ?.cancel();
-
-    _liveLocationSubscription?.cancel();
-
     _typingTimer?.cancel();
 
-    _liveLocationController.dispose();
+    _messagesSubscription?.cancel();
+    _typingSubscription?.cancel();
+    _receiverStatusSubscription?.cancel();
+    _currentVerificationSubscription?.cancel();
+    _receiverVerificationSubscription?.cancel();
+    _liveLocationSubscription?.cancel();
+
+    _scrollController.removeListener(
+      _onScroll,
+    );
 
     _controller.dispose();
+_scrollController.dispose();
+_currentDateLabel.dispose();
 
-    _reactionEmojiController.dispose();
+    /*
+     * Stop local services before destroying
+     * the controller tree.
+     */
+    try {
+      _chatService.setOffline();
+    } catch (_) {}
 
-    _reactionEmojiFocusNode.dispose();
-
-    _scrollController.dispose();
+    try {
+      _liveLocationController.dispose();
+    } catch (_) {}
 
     super.dispose();
   }

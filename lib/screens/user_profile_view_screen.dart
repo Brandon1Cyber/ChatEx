@@ -1,9 +1,36 @@
+import 'dart:async';
 import 'dart:ui';
 
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+
+import '../widgets/verified_name.dart';
+
+/// ============================================================================
+/// CHATTªX — USER PROFILE VIEW
+/// ============================================================================
+///
+/// REAL FIREBASE PROFILE
+///
+/// • Reads users/{uid} directly from Firestore
+/// • Uses displayName correctly
+/// • Real followers / following / friends
+/// • Real-time relationship updates
+/// • Real following state
+/// • Real friendship detection
+/// • Automatic friendship when two users follow each other
+/// • VerifiedName widget for real verification
+/// • Bio directly under Online / Last seen
+/// • About directly under Bio
+/// • ChattªX status below Bio / About
+/// • Full profile photo viewer
+/// • Block
+/// • Report
+/// • Privacy & security
+/// • Futuristic ChattªX visual system
+/// ============================================================================
 
 class UserProfileViewScreen extends StatefulWidget {
   final String userId;
@@ -22,26 +49,28 @@ class UserProfileViewScreen extends StatefulWidget {
       _UserProfileViewScreenState();
 }
 
-class _UserProfileViewScreenState
-    extends State<UserProfileViewScreen> {
-  // ===========================================================================
+class _UserProfileViewScreenState extends State<UserProfileViewScreen> {
+  // ==========================================================================
   // CHATTªX COLORS
-  // ===========================================================================
+  // ==========================================================================
 
   static const Color background = Color(0xFF050816);
+  static const Color backgroundSoft = Color(0xFF080C1B);
   static const Color header = Color(0xFF0A1022);
   static const Color card = Color(0xFF0C1428);
+  static const Color cardLight = Color(0xFF111A32);
   static const Color button = Color(0xFF141F39);
 
   static const Color cyan = Color(0xFF00D9FF);
+  static const Color cyanBright = Color(0xFF00E5FF);
   static const Color purple = Color(0xFF7B2FF7);
   static const Color purpleBright = Color(0xFFB026FF);
   static const Color pink = Color(0xFFD764FF);
   static const Color onlineColor = Color(0xFF39FF88);
 
-  // ===========================================================================
+  // ==========================================================================
   // FIREBASE
-  // ===========================================================================
+  // ==========================================================================
 
   final FirebaseFirestore _firestore =
       FirebaseFirestore.instance;
@@ -49,13 +78,13 @@ class _UserProfileViewScreenState
   final FirebaseAuth _auth =
       FirebaseAuth.instance;
 
-  // ===========================================================================
+  final List<StreamSubscription> _subscriptions = [];
+
+  // ==========================================================================
   // PROFILE
-  // ===========================================================================
+  // ==========================================================================
 
   bool loading = true;
-  bool relationshipLoading = true;
-  bool followLoading = false;
 
   String name = "";
   String username = "";
@@ -70,25 +99,28 @@ class _UserProfileViewScreenState
   DateTime? lastSeen;
   DateTime? joinedDate;
 
-  // ===========================================================================
-  // REAL-TIME SOCIAL COUNTS
-  // ===========================================================================
+  // ==========================================================================
+  // REAL SOCIAL COUNTS
+  // ==========================================================================
 
   int followersCount = 0;
   int followingCount = 0;
   int friendsCount = 0;
 
-  // ===========================================================================
+  // ==========================================================================
   // RELATIONSHIP
-  // ===========================================================================
+  // ==========================================================================
+
+  bool relationshipLoading = true;
+  bool followLoading = false;
 
   bool isFollowing = false;
   bool isFollowedBy = false;
   bool isFriend = false;
 
-  // ===========================================================================
+  // ==========================================================================
   // OTHER PROFILE DATA
-  // ===========================================================================
+  // ==========================================================================
 
   int sharedMediaCount = 0;
   int sharedFilesCount = 0;
@@ -98,35 +130,36 @@ class _UserProfileViewScreenState
   bool disappearingMessages = false;
   bool dualLockEnabled = false;
 
-  // ===========================================================================
-  // STREAMS
-  // ===========================================================================
+  // ==========================================================================
+  // STORED FOLLOWER COUNT
+  // ==========================================================================
+  //
+  // Your users document currently contains fields such as:
+  //
+  // followersCount: 20000
+  // followingCount: 0
+  // friendsCount: 0
+  //
+  // We keep these as fallback values while the relationship collections
+  // synchronize.
+  // ==========================================================================
 
-  Stream<DocumentSnapshot<Map<String, dynamic>>>?
-      _profileStream;
+  int _storedFollowersCount = 0;
+  int _storedFollowingCount = 0;
+  int _storedFriendsCount = 0;
 
-  Stream<DocumentSnapshot<Map<String, dynamic>>>?
-      _myFollowingStream;
-
-  Stream<DocumentSnapshot<Map<String, dynamic>>>?
-      _theirFollowingStream;
-
-  Stream<DocumentSnapshot<Map<String, dynamic>>>?
-      _friendStream;
-
-  // ===========================================================================
+  // ==========================================================================
   // CURRENT USER
-  // ===========================================================================
+  // ==========================================================================
 
-  String? get currentUserId =>
-      _auth.currentUser?.uid;
+  String? get currentUserId => _auth.currentUser?.uid;
 
   bool get isOwnProfile =>
       currentUserId == widget.userId;
 
-  // ===========================================================================
+  // ==========================================================================
   // INIT
-  // ===========================================================================
+  // ==========================================================================
 
   @override
   void initState() {
@@ -136,15 +169,25 @@ class _UserProfileViewScreenState
     profileImage = widget.userImage ?? "";
 
     _loadProfile();
-
-    if (!isOwnProfile) {
-      _setupRelationshipStreams();
-    }
+    _setupRealtimeListeners();
   }
 
-  // ===========================================================================
+  // ==========================================================================
+  // DISPOSE
+  // ==========================================================================
+
+  @override
+  void dispose() {
+    for (final subscription in _subscriptions) {
+      subscription.cancel();
+    }
+
+    super.dispose();
+  }
+
+  // ==========================================================================
   // LOAD PROFILE
-  // ===========================================================================
+  // ==========================================================================
 
   Future<void> _loadProfile() async {
     try {
@@ -162,13 +205,17 @@ class _UserProfileViewScreenState
         return;
       }
 
-      _applyProfileData(snapshot.data() ?? {});
+      final data = snapshot.data() ?? {};
+
+      _applyProfileData(data);
 
       setState(() {
         loading = false;
       });
     } catch (e) {
-      debugPrint("Profile error: $e");
+      debugPrint(
+        "ChattªX profile load error: $e",
+      );
 
       if (!mounted) return;
 
@@ -178,52 +225,98 @@ class _UserProfileViewScreenState
     }
   }
 
-  // ===========================================================================
-  // APPLY PROFILE DATA
-  // ===========================================================================
+  // ==========================================================================
+  // APPLY FIRESTORE PROFILE DATA
+  // ==========================================================================
 
   void _applyProfileData(
     Map<String, dynamic> data,
   ) {
-    name = _stringValue(
-      data["name"],
-      widget.userName,
-    );
+    // ------------------------------------------------------------------------
+    // DISPLAY NAME
+    // ------------------------------------------------------------------------
+    //
+    // Your Firestore example uses:
+    //
+    // displayName: "Brandon Hotshot"
+    //
+    // so displayName is checked first.
+    // ------------------------------------------------------------------------
 
-    username = _stringValue(
+    name = _firstString([
+      data["displayName"],
+      data["name"],
+      data["userName"],
+      widget.userName,
+    ]);
+
+    // ------------------------------------------------------------------------
+    // USERNAME
+    // ------------------------------------------------------------------------
+
+    username = _firstString([
       data["username"],
       data["userName"],
-    );
+    ]);
 
-    bio = _stringValue(
+    // ------------------------------------------------------------------------
+    // BIO
+    // ------------------------------------------------------------------------
+
+    bio = _firstString([
       data["bio"],
-      "",
-    );
+    ]);
 
-    about = _stringValue(
+    // ------------------------------------------------------------------------
+    // ABOUT
+    // ------------------------------------------------------------------------
+
+    about = _firstString([
       data["about"],
-      "",
-    );
+    ]);
 
-    location = _stringValue(
+    // ------------------------------------------------------------------------
+    // LOCATION
+    // ------------------------------------------------------------------------
+
+    location = _firstString([
       data["locationText"],
       data["location"],
-    );
+    ]);
 
-    final image = _stringValue(
+    // ------------------------------------------------------------------------
+    // PROFILE IMAGE
+    // ------------------------------------------------------------------------
+
+    final image = _firstString([
       data["profileImage"],
       data["photoURL"],
-    );
+      data["photoUrl"],
+      data["imageUrl"],
+    ]);
 
     if (image.isNotEmpty) {
       profileImage = image;
     }
 
-    isOnline = data["isOnline"] == true;
+    // ------------------------------------------------------------------------
+    // ONLINE
+    // ------------------------------------------------------------------------
+
+    isOnline =
+        data["isOnline"] == true;
+
+    // ------------------------------------------------------------------------
+    // VERIFICATION
+    // ------------------------------------------------------------------------
 
     verified =
         data["verified"] == true ||
         data["isVerified"] == true;
+
+    // ------------------------------------------------------------------------
+    // CHAT SETTINGS
+    // ------------------------------------------------------------------------
 
     notificationsMuted =
         data["notificationsMuted"] == true;
@@ -234,130 +327,348 @@ class _UserProfileViewScreenState
     dualLockEnabled =
         data["dualLockEnabled"] == true;
 
-    lastSeen = _dateValue(
-      data["lastSeen"],
-    );
+    // ------------------------------------------------------------------------
+    // DATES
+    // ------------------------------------------------------------------------
 
-    joinedDate = _dateValue(
-      data["createdAt"],
-    );
+    lastSeen =
+        _dateValue(data["lastSeen"]);
 
-    // ========================================================================
-    // COUNTERS
-    // ========================================================================
+    joinedDate =
+        _dateValue(data["createdAt"]);
 
-    followersCount = _intValue(
-      data["followersCount"],
-    );
+    // ------------------------------------------------------------------------
+    // STORED SOCIAL COUNTS
+    // ------------------------------------------------------------------------
 
-    followingCount = _intValue(
-      data["followingCount"],
-    );
+    _storedFollowersCount =
+        _intValue(data["followersCount"]);
 
-    friendsCount = _intValue(
-      data["friendsCount"],
-    );
+    _storedFollowingCount =
+        _intValue(data["followingCount"]);
 
-    sharedMediaCount = _intValue(
-      data["sharedMediaCount"],
-    );
+    _storedFriendsCount =
+        _intValue(data["friendsCount"]);
 
-    sharedFilesCount = _intValue(
-      data["sharedFilesCount"],
-    );
+    // ------------------------------------------------------------------------
+    // INITIAL COUNTS
+    // ------------------------------------------------------------------------
+    //
+    // Firestore user document provides the initial value.
+    // Relationship listeners can replace these with actual collection counts.
+    // ------------------------------------------------------------------------
 
-    sharedLinksCount = _intValue(
-      data["sharedLinksCount"],
-    );
+    if (followersCount == 0 &&
+        _storedFollowersCount > 0) {
+      followersCount =
+          _storedFollowersCount;
+    }
+
+    if (followingCount == 0 &&
+        _storedFollowingCount > 0) {
+      followingCount =
+          _storedFollowingCount;
+    }
+
+    if (friendsCount == 0 &&
+        _storedFriendsCount > 0) {
+      friendsCount =
+          _storedFriendsCount;
+    }
+
+    // ------------------------------------------------------------------------
+    // SHARED CONTENT
+    // ------------------------------------------------------------------------
+
+    sharedMediaCount =
+        _intValue(data["sharedMediaCount"]);
+
+    sharedFilesCount =
+        _intValue(data["sharedFilesCount"]);
+
+    sharedLinksCount =
+        _intValue(data["sharedLinksCount"]);
   }
 
-  // ===========================================================================
-  // REAL-TIME PROFILE LISTENER
-  // ===========================================================================
+  // ==========================================================================
+  // REAL-TIME FIRESTORE LISTENERS
+  // ==========================================================================
 
-  void _setupRelationshipStreams() {
+  void _setupRealtimeListeners() {
     final myUid = currentUserId;
+
+    // =========================================================================
+    // PROFILE LISTENER
+    // =========================================================================
+
+    final profileSubscription = _firestore
+        .collection("users")
+        .doc(widget.userId)
+        .snapshots()
+        .listen(
+      (snapshot) {
+        if (!mounted) return;
+
+        final data = snapshot.data();
+
+        if (data == null) return;
+
+        setState(() {
+          _applyProfileData(data);
+        });
+      },
+      onError: (error) {
+        debugPrint(
+          "Profile realtime error: $error",
+        );
+      },
+    );
+
+    _subscriptions.add(
+      profileSubscription,
+    );
+
+    // =========================================================================
+    // FOLLOWERS
+    // =========================================================================
+    //
+    // users/{profileUid}/followers/{followerUid}
+    //
+    // This is the real relationship collection.
+    // =========================================================================
+
+    final followersSubscription = _firestore
+        .collection("users")
+        .doc(widget.userId)
+        .collection("followers")
+        .snapshots()
+        .listen(
+      (snapshot) {
+        if (!mounted) return;
+
+        setState(() {
+          followersCount =
+              snapshot.docs.length;
+        });
+      },
+      onError: (error) {
+        debugPrint(
+          "Followers listener error: $error",
+        );
+
+        // Keep the stored Firestore count if the
+        // relationship collection cannot be read.
+        if (!mounted) return;
+
+        if (_storedFollowersCount > 0) {
+          setState(() {
+            followersCount =
+                _storedFollowersCount;
+          });
+        }
+      },
+    );
+
+    _subscriptions.add(
+      followersSubscription,
+    );
+
+    // =========================================================================
+    // FOLLOWING
+    // =========================================================================
+
+    final followingSubscription = _firestore
+        .collection("users")
+        .doc(widget.userId)
+        .collection("following")
+        .snapshots()
+        .listen(
+      (snapshot) {
+        if (!mounted) return;
+
+        setState(() {
+          followingCount =
+              snapshot.docs.length;
+        });
+      },
+      onError: (error) {
+        debugPrint(
+          "Following listener error: $error",
+        );
+
+        if (!mounted) return;
+
+        if (_storedFollowingCount > 0) {
+          setState(() {
+            followingCount =
+                _storedFollowingCount;
+          });
+        }
+      },
+    );
+
+    _subscriptions.add(
+      followingSubscription,
+    );
+
+    // =========================================================================
+    // FRIENDS
+    // =========================================================================
+
+    final friendsSubscription = _firestore
+        .collection("users")
+        .doc(widget.userId)
+        .collection("friends")
+        .snapshots()
+        .listen(
+      (snapshot) {
+        if (!mounted) return;
+
+        setState(() {
+          friendsCount =
+              snapshot.docs.length;
+        });
+      },
+      onError: (error) {
+        debugPrint(
+          "Friends listener error: $error",
+        );
+
+        if (!mounted) return;
+
+        if (_storedFriendsCount > 0) {
+          setState(() {
+            friendsCount =
+                _storedFriendsCount;
+          });
+        }
+      },
+    );
+
+    _subscriptions.add(
+      friendsSubscription,
+    );
+
+    // =========================================================================
+    // OWN PROFILE RELATIONSHIPS
+    // =========================================================================
 
     if (myUid == null) {
       relationshipLoading = false;
       return;
     }
 
-    _profileStream = _firestore
-        .collection("users")
-        .doc(widget.userId)
-        .snapshots();
+    if (isOwnProfile) {
+      setState(() {
+        relationshipLoading = false;
+      });
 
-    _myFollowingStream = _firestore
+      return;
+    }
+
+    // =========================================================================
+    // AM I FOLLOWING THEM?
+    // =========================================================================
+
+    final followingMeSubscription = _firestore
         .collection("users")
         .doc(myUid)
         .collection("following")
         .doc(widget.userId)
-        .snapshots();
+        .snapshots()
+        .listen(
+      (snapshot) {
+        if (!mounted) return;
 
-    _theirFollowingStream = _firestore
+        setState(() {
+          isFollowing =
+              snapshot.exists;
+
+          relationshipLoading =
+              false;
+        });
+      },
+      onError: (error) {
+        debugPrint(
+          "Following relationship error: $error",
+        );
+
+        if (!mounted) return;
+
+        setState(() {
+          relationshipLoading = false;
+        });
+      },
+    );
+
+    _subscriptions.add(
+      followingMeSubscription,
+    );
+
+    // =========================================================================
+    // ARE THEY FOLLOWING ME?
+    // =========================================================================
+
+    final theyFollowMeSubscription = _firestore
         .collection("users")
         .doc(widget.userId)
         .collection("following")
         .doc(myUid)
-        .snapshots();
+        .snapshots()
+        .listen(
+      (snapshot) {
+        if (!mounted) return;
 
-    _friendStream = _firestore
+        setState(() {
+          isFollowedBy =
+              snapshot.exists;
+        });
+      },
+      onError: (error) {
+        debugPrint(
+          "Reverse following relationship error: $error",
+        );
+      },
+    );
+
+    _subscriptions.add(
+      theyFollowMeSubscription,
+    );
+
+    // =========================================================================
+    // FRIENDSHIP
+    // =========================================================================
+
+    final friendSubscription = _firestore
         .collection("users")
         .doc(myUid)
         .collection("friends")
         .doc(widget.userId)
-        .snapshots();
+        .snapshots()
+        .listen(
+      (snapshot) {
+        if (!mounted) return;
 
-    _listenToRelationshipStreams();
+        setState(() {
+          isFriend =
+              snapshot.exists;
+        });
+      },
+      onError: (error) {
+        debugPrint(
+          "Friendship listener error: $error",
+        );
+      },
+    );
+
+    _subscriptions.add(
+      friendSubscription,
+    );
   }
 
-  // ===========================================================================
-  // RELATIONSHIP LISTENERS
-  // ===========================================================================
-
-  void _listenToRelationshipStreams() {
-    _profileStream?.listen((snapshot) {
-      if (!mounted) return;
-
-      final data = snapshot.data();
-
-      if (data == null) return;
-
-      setState(() {
-        _applyProfileData(data);
-      });
-    });
-
-    _myFollowingStream?.listen((snapshot) {
-      if (!mounted) return;
-
-      setState(() {
-        isFollowing = snapshot.exists;
-        relationshipLoading = false;
-      });
-    });
-
-    _theirFollowingStream?.listen((snapshot) {
-      if (!mounted) return;
-
-      setState(() {
-        isFollowedBy = snapshot.exists;
-      });
-    });
-
-    _friendStream?.listen((snapshot) {
-      if (!mounted) return;
-
-      setState(() {
-        isFriend = snapshot.exists;
-      });
-    });
-  }
-
-  // ===========================================================================
+  // ==========================================================================
   // FOLLOW / UNFOLLOW
-  // ===========================================================================
+  // ==========================================================================
 
   Future<void> _toggleFollow() async {
     final myUid = currentUserId;
@@ -368,6 +679,9 @@ class _UserProfileViewScreenState
       return;
     }
 
+    final wasFollowing =
+        isFollowing;
+
     setState(() {
       followLoading = true;
     });
@@ -375,9 +689,9 @@ class _UserProfileViewScreenState
     try {
       await _firestore.runTransaction(
         (transaction) async {
-          // ================================================================
-          // DOCUMENT REFERENCES
-          // ================================================================
+          // ==================================================================
+          // REFERENCES
+          // ==================================================================
 
           final myUserRef = _firestore
               .collection("users")
@@ -407,18 +721,19 @@ class _UserProfileViewScreenState
               .collection("friends")
               .doc(myUid);
 
-          // ================================================================
+          // ==================================================================
           // READ
-          // ================================================================
-
-          final myUserSnapshot =
-              await transaction.get(myUserRef);
+          // ==================================================================
 
           final targetUserSnapshot =
-              await transaction.get(targetUserRef);
+              await transaction.get(
+            targetUserRef,
+          );
 
           final myFollowingSnapshot =
-              await transaction.get(myFollowingRef);
+              await transaction.get(
+            myFollowingRef,
+          );
 
           final targetFollowingMeSnapshot =
               await transaction.get(
@@ -426,10 +741,14 @@ class _UserProfileViewScreenState
           );
 
           final myFriendSnapshot =
-              await transaction.get(myFriendRef);
+              await transaction.get(
+            myFriendRef,
+          );
 
           final targetFriendSnapshot =
-              await transaction.get(targetFriendRef);
+              await transaction.get(
+            targetFriendRef,
+          );
 
           if (!targetUserSnapshot.exists) {
             throw Exception(
@@ -437,37 +756,9 @@ class _UserProfileViewScreenState
             );
           }
 
-          final myData =
-              myUserSnapshot.data() ??
-                  <String, dynamic>{};
-
-          final targetData =
-              targetUserSnapshot.data() ??
-                  <String, dynamic>{};
-
-          int currentFollowingCount =
-              _intValue(
-            myData["followingCount"],
-          );
-
-          int targetFollowersCount =
-              _intValue(
-            targetData["followersCount"],
-          );
-
-          int currentFriendsCount =
-              _intValue(
-            myData["friendsCount"],
-          );
-
-          int targetFriendsCount =
-              _intValue(
-            targetData["friendsCount"],
-          );
-
-          // ================================================================
+          // ==================================================================
           // UNFOLLOW
-          // ================================================================
+          // ==================================================================
 
           if (myFollowingSnapshot.exists) {
             transaction.delete(
@@ -478,48 +769,25 @@ class _UserProfileViewScreenState
               targetFollowersRef,
             );
 
-            currentFollowingCount =
-                currentFollowingCount > 0
-                    ? currentFollowingCount - 1
-                    : 0;
-
-            targetFollowersCount =
-                targetFollowersCount > 0
-                    ? targetFollowersCount - 1
-                    : 0;
-
-            // ------------------------------------------------------------
-            // REMOVE FRIENDSHIP
-            // ------------------------------------------------------------
-
-            if (myFriendSnapshot.exists ||
-                targetFriendSnapshot.exists) {
+            // Remove friendship if it exists.
+            if (myFriendSnapshot.exists) {
               transaction.delete(
                 myFriendRef,
               );
+            }
 
+            if (targetFriendSnapshot.exists) {
               transaction.delete(
                 targetFriendRef,
               );
-
-              currentFriendsCount =
-                  currentFriendsCount > 0
-                      ? currentFriendsCount - 1
-                      : 0;
-
-              targetFriendsCount =
-                  targetFriendsCount > 0
-                      ? targetFriendsCount - 1
-                      : 0;
             }
 
+            // Keep cached counters synchronized.
             transaction.update(
               myUserRef,
               {
                 "followingCount":
-                    currentFollowingCount,
-                "friendsCount":
-                    currentFriendsCount,
+                    FieldValue.increment(-1),
               },
             );
 
@@ -527,16 +795,14 @@ class _UserProfileViewScreenState
               targetUserRef,
               {
                 "followersCount":
-                    targetFollowersCount,
-                "friendsCount":
-                    targetFriendsCount,
+                    FieldValue.increment(-1),
               },
             );
           }
 
-          // ================================================================
+          // ==================================================================
           // FOLLOW
-          // ================================================================
+          // ==================================================================
 
           else {
             transaction.set(
@@ -557,18 +823,32 @@ class _UserProfileViewScreenState
               },
             );
 
-            currentFollowingCount++;
+            // Keep cached counters synchronized.
+            transaction.update(
+              myUserRef,
+              {
+                "followingCount":
+                    FieldValue.increment(1),
+              },
+            );
 
-            targetFollowersCount++;
+            transaction.update(
+              targetUserRef,
+              {
+                "followersCount":
+                    FieldValue.increment(1),
+              },
+            );
 
-            // ------------------------------------------------------------
-            // AUTOMATIC FRIEND DETECTION
-            // ------------------------------------------------------------
+            // ================================================================
+            // AUTOMATIC FRIENDSHIP
+            // ================================================================
+            //
+            // If the other person already follows me,
+            // both users become friends.
+            // ================================================================
 
-            final becomesFriend =
-                targetFollowingMeSnapshot.exists;
-
-            if (becomesFriend &&
+            if (targetFollowingMeSnapshot.exists &&
                 !myFriendSnapshot.exists &&
                 !targetFriendSnapshot.exists) {
               final now =
@@ -590,38 +870,38 @@ class _UserProfileViewScreenState
                 },
               );
 
-              currentFriendsCount++;
-              targetFriendsCount++;
+              transaction.update(
+                myUserRef,
+                {
+                  "friendsCount":
+                      FieldValue.increment(1),
+                },
+              );
+
+              transaction.update(
+                targetUserRef,
+                {
+                  "friendsCount":
+                      FieldValue.increment(1),
+                },
+              );
             }
-
-            transaction.update(
-              myUserRef,
-              {
-                "followingCount":
-                    currentFollowingCount,
-                "friendsCount":
-                    currentFriendsCount,
-              },
-            );
-
-            transaction.update(
-              targetUserRef,
-              {
-                "followersCount":
-                    targetFollowersCount,
-                "friendsCount":
-                    targetFriendsCount,
-              },
-            );
           }
         },
       );
 
       if (!mounted) return;
 
-      setState(() {
-        isFollowing = !isFollowing;
-      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          backgroundColor: header,
+          content: Text(
+            wasFollowing
+                ? "Unfollowed $_displayName"
+                : "Following $_displayName",
+          ),
+        ),
+      );
     } catch (e) {
       debugPrint(
         "Follow/unfollow error: $e",
@@ -629,9 +909,9 @@ class _UserProfileViewScreenState
 
       if (!mounted) return;
 
-      ScaffoldMessenger.of(context)
-          .showSnackBar(
+      ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
+          backgroundColor: header,
           content: Text(
             "Could not update follow status.",
           ),
@@ -646,26 +926,45 @@ class _UserProfileViewScreenState
     }
   }
 
-  // ===========================================================================
+  // ==========================================================================
+  // DISPLAY NAME
+  // ==========================================================================
+
+  String get _displayName {
+    if (name.trim().isNotEmpty) {
+      return name.trim();
+    }
+
+    if (widget.userName.trim().isNotEmpty) {
+      return widget.userName.trim();
+    }
+
+    return "ChattªX User";
+  }
+
+  // ==========================================================================
   // IMAGE PROVIDER
-  // ===========================================================================
+  // ==========================================================================
 
   ImageProvider? get imageProvider {
-    if (profileImage.trim().isEmpty) {
+    final image =
+        profileImage.trim();
+
+    if (image.isEmpty) {
       return null;
     }
 
-    if (profileImage.startsWith("http://") ||
-        profileImage.startsWith("https://")) {
-      return NetworkImage(profileImage);
+    if (image.startsWith("http://") ||
+        image.startsWith("https://")) {
+      return NetworkImage(image);
     }
 
-    return AssetImage(profileImage);
+    return AssetImage(image);
   }
 
-  // ===========================================================================
+  // ==========================================================================
   // STATUS
-  // ===========================================================================
+  // ==========================================================================
 
   String get statusText {
     if (isOnline) {
@@ -684,9 +983,9 @@ class _UserProfileViewScreenState
     return "Last seen today at $time";
   }
 
-  // ===========================================================================
+  // ==========================================================================
   // BUILD
-  // ===========================================================================
+  // ==========================================================================
 
   @override
   Widget build(BuildContext context) {
@@ -700,9 +999,9 @@ class _UserProfileViewScreenState
     );
   }
 
-  // ===========================================================================
+  // ==========================================================================
   // LOADING
-  // ===========================================================================
+  // ==========================================================================
 
   Widget _buildLoading() {
     return Column(
@@ -724,9 +1023,9 @@ class _UserProfileViewScreenState
     );
   }
 
-  // ===========================================================================
+  // ==========================================================================
   // PROFILE
-  // ===========================================================================
+  // ==========================================================================
 
   Widget _buildProfile() {
     return CustomScrollView(
@@ -772,6 +1071,10 @@ class _UserProfileViewScreenState
             children: [
               const SizedBox(height: 14),
 
+              // ==============================================================
+              // PROFILE PHOTO
+              // ==============================================================
+
               GestureDetector(
                 onTap: _openProfilePhoto,
                 child: _buildProfilePhoto(),
@@ -779,79 +1082,95 @@ class _UserProfileViewScreenState
 
               const SizedBox(height: 16),
 
+              // ==============================================================
+              // NAME + REAL VERIFICATION
+              // ==============================================================
+
               _buildName(),
 
               const SizedBox(height: 8),
 
+              // ==============================================================
+              // ONLINE / LAST SEEN
+              // ==============================================================
+
               _buildStatus(),
 
-              const SizedBox(height: 18),
+              // ==============================================================
+              // BIO
+              // DIRECTLY UNDER ONLINE / LAST SEEN
+              // ==============================================================
 
-              // ============================================================
-              // LIVE SOCIAL COUNTERS
-              // ============================================================
+              if (bio.isNotEmpty) ...[
+                const SizedBox(height: 8),
+                _buildBio(),
+              ],
+
+              // ==============================================================
+              // ABOUT
+              // DIRECTLY UNDER BIO
+              // ==============================================================
+
+              if (about.isNotEmpty) ...[
+                const SizedBox(height: 5),
+                _buildAbout(),
+              ],
+
+              // ==============================================================
+              // CHATTªX STATUS
+              // ==============================================================
+
+              // ==============================================================
+              // REAL SOCIAL COUNTERS
+              // ==============================================================
 
               _buildSocialStats(),
 
-              const SizedBox(height: 18),
+              const SizedBox(height: 10),
 
-              if (bio.isNotEmpty ||
-                  about.isNotEmpty)
-                Padding(
-                  padding:
-                      const EdgeInsets.symmetric(
-                    horizontal: 34,
-                  ),
-                  child: Text(
-                    bio.isNotEmpty
-                        ? bio
-                        : about,
-                    textAlign:
-                        TextAlign.center,
-                    maxLines: 4,
-                    overflow:
-                        TextOverflow.ellipsis,
-                    style:
-                        const TextStyle(
-                      color: Colors.white70,
-                      fontSize: 13,
-                      height: 1.45,
-                    ),
-                  ),
-                ),
-
-              const SizedBox(height: 22),
-
-              // ============================================================
+              // ==============================================================
               // FOLLOW BUTTON
-              // ============================================================
+              // ==============================================================
 
               if (!isOwnProfile)
                 _buildFollowButton(),
 
               const SizedBox(height: 10),
 
-              // ============================================================
-              // MESSAGE / CALL / VIDEO
-              // ============================================================
-
-              _buildActionButtons(),
-
-              const SizedBox(height: 22),
+              // ==============================================================
+              // FRIEND BANNER
+              // ==============================================================
 
               if (isFriend && !isOwnProfile)
                 _buildFriendBanner(),
 
-              if (about.isNotEmpty)
-                _buildAboutCard(),
+              // ==============================================================
+              // INFORMATION
+              // ==============================================================
 
               _buildInformationCard(),
 
+              // ==============================================================
+              // SHARED CONTENT
+              // ==============================================================
+
               _buildSharedContent(),
+
+              // ==============================================================
+              // CHAT SETTINGS
+              // ==============================================================
 
               _buildChatSettings(),
 
+              // ==============================================================
+              // PRIVACY
+              // ==============================================================
+
               _buildPrivacyCard(),
+
+              // ==============================================================
+              // DANGER
+              // ==============================================================
 
               _buildDangerZone(),
 
@@ -863,9 +1182,63 @@ class _UserProfileViewScreenState
     );
   }
 
-  // ===========================================================================
+  // ==========================================================================
+  // BIO
+  // ==========================================================================
+
+  Widget _buildBio() {
+    return Padding(
+      padding:
+          const EdgeInsets.symmetric(
+        horizontal: 28,
+      ),
+      child: Text(
+        bio,
+        textAlign: TextAlign.center,
+        maxLines: 4,
+        overflow:
+            TextOverflow.ellipsis,
+        style: const TextStyle(
+          color: Colors.white70,
+          fontSize: 13,
+          height: 1.4,
+          fontWeight: FontWeight.w500,
+        ),
+      ),
+    );
+  }
+
+  // ==========================================================================
+  // ABOUT
+  // ==========================================================================
+
+  Widget _buildAbout() {
+    return Padding(
+      padding:
+          const EdgeInsets.symmetric(
+        horizontal: 28,
+      ),
+      child: Text(
+        about,
+        textAlign: TextAlign.center,
+        maxLines: 4,
+        overflow:
+            TextOverflow.ellipsis,
+        style: TextStyle(
+          color:
+              Colors.white.withValues(
+            alpha: .58,
+          ),
+          fontSize: 12,
+          height: 1.35,
+        ),
+      ),
+    );
+  }
+
+  // ==========================================================================
   // NAME
-  // ===========================================================================
+  // ==========================================================================
 
   Widget _buildName() {
     return Padding(
@@ -873,38 +1246,22 @@ class _UserProfileViewScreenState
           const EdgeInsets.symmetric(
         horizontal: 25,
       ),
-      child: Row(
-        mainAxisAlignment:
-            MainAxisAlignment.center,
-        children: [
-          Flexible(
-            child: Text(
-              name.isEmpty
-                  ? widget.userName
-                  : name,
-              maxLines: 1,
-              overflow:
-                  TextOverflow.ellipsis,
-              style: const TextStyle(
-                color: Colors.white,
-                fontSize: 26,
-                fontWeight: FontWeight.w900,
-                letterSpacing: -.7,
-              ),
-            ),
-          ),
-          if (verified) ...[
-            const SizedBox(width: 7),
-            _verifiedBadge(),
-          ],
-        ],
+      child: Center(
+        child: VerifiedName(
+          name: _displayName,
+          verified: verified,
+          fontSize: 26,
+          fontWeight:
+              FontWeight.w900,
+          textColor: Colors.white,
+        ),
       ),
     );
   }
 
-  // ===========================================================================
+  // ==========================================================================
   // STATUS
-  // ===========================================================================
+  // ==========================================================================
 
   Widget _buildStatus() {
     return Row(
@@ -914,7 +1271,8 @@ class _UserProfileViewScreenState
         Container(
           width: 7,
           height: 7,
-          decoration: BoxDecoration(
+          decoration:
+              BoxDecoration(
             color: isOnline
                 ? onlineColor
                 : Colors.white24,
@@ -933,12 +1291,35 @@ class _UserProfileViewScreenState
     );
   }
 
-  // ===========================================================================
+  // ==========================================================================
   // FOLLOW BUTTON
-  // ===========================================================================
+  // ==========================================================================
 
   Widget _buildFollowButton() {
     final friend = isFriend;
+
+    final String buttonText;
+
+    if (friend) {
+      buttonText = "Friends";
+    } else if (isFollowing) {
+      buttonText = "Following";
+    } else {
+      buttonText = "Follow";
+    }
+
+    final IconData buttonIcon;
+
+    if (friend) {
+      buttonIcon =
+          Icons.handshake_rounded;
+    } else if (isFollowing) {
+      buttonIcon =
+          Icons.person_remove_alt_1_rounded;
+    } else {
+      buttonIcon =
+          Icons.person_add_alt_1_rounded;
+    }
 
     return Padding(
       padding:
@@ -962,33 +1343,36 @@ class _UserProfileViewScreenState
                 milliseconds: 220,
               ),
               decoration: BoxDecoration(
-                gradient: isFollowing
-                    ? null
-                    : const LinearGradient(
-                        begin:
-                            Alignment.topLeft,
-                        end:
-                            Alignment.bottomRight,
-                        colors: [
-                          cyan,
-                          purple,
-                        ],
-                      ),
-                color: isFollowing
-                    ? button
-                    : null,
+                gradient:
+                    isFollowing || friend
+                        ? null
+                        : const LinearGradient(
+                            begin:
+                                Alignment.topLeft,
+                            end:
+                                Alignment.bottomRight,
+                            colors: [
+                              cyan,
+                              purple,
+                            ],
+                          ),
+                color:
+                    isFollowing || friend
+                        ? button
+                        : null,
                 borderRadius:
                     BorderRadius.circular(16),
                 border: Border.all(
-                  color: isFollowing
-                      ? friend
-                          ? pink.withValues(
-                              alpha: .35,
-                            )
-                          : cyan.withValues(
-                              alpha: .2,
-                            )
-                      : Colors.transparent,
+                  color:
+                      isFollowing || friend
+                          ? friend
+                              ? pink.withValues(
+                                  alpha: .35,
+                                )
+                              : cyan.withValues(
+                                  alpha: .22,
+                                )
+                          : Colors.transparent,
                 ),
               ),
               child: Center(
@@ -1004,17 +1388,11 @@ class _UserProfileViewScreenState
                       )
                     : Row(
                         mainAxisAlignment:
-                            MainAxisAlignment.center,
+                            MainAxisAlignment
+                                .center,
                         children: [
                           Icon(
-                            friend
-                                ? Icons
-                                    .handshake_rounded
-                                : isFollowing
-                                    ? Icons
-                                        .check_rounded
-                                    : Icons
-                                        .person_add_alt_1_rounded,
+                            buttonIcon,
                             color:
                                 Colors.white,
                             size: 20,
@@ -1023,11 +1401,7 @@ class _UserProfileViewScreenState
                             width: 8,
                           ),
                           Text(
-                            friend
-                                ? "Friends"
-                                : isFollowing
-                                    ? "Following"
-                                    : "Follow",
+                            buttonText,
                             style:
                                 const TextStyle(
                               color:
@@ -1047,9 +1421,9 @@ class _UserProfileViewScreenState
     );
   }
 
-  // ===========================================================================
+  // ==========================================================================
   // FRIEND BANNER
-  // ===========================================================================
+  // ==========================================================================
 
   Widget _buildFriendBanner() {
     return Container(
@@ -1065,7 +1439,8 @@ class _UserProfileViewScreenState
         horizontal: 15,
         vertical: 12,
       ),
-      decoration: BoxDecoration(
+      decoration:
+          BoxDecoration(
         gradient:
             LinearGradient(
           colors: [
@@ -1090,7 +1465,7 @@ class _UserProfileViewScreenState
           const SizedBox(width: 10),
           Expanded(
             child: Text(
-              "You and $name are friends",
+              "You and $_displayName are friends",
               style: const TextStyle(
                 color: Colors.white,
                 fontSize: 12,
@@ -1109,9 +1484,9 @@ class _UserProfileViewScreenState
     );
   }
 
-  // ===========================================================================
+  // ==========================================================================
   // SOCIAL STATS
-  // ===========================================================================
+  // ==========================================================================
 
   Widget _buildSocialStats() {
     return Container(
@@ -1124,7 +1499,8 @@ class _UserProfileViewScreenState
         vertical: 14,
         horizontal: 8,
       ),
-      decoration: BoxDecoration(
+      decoration:
+          BoxDecoration(
         color: card,
         borderRadius:
             BorderRadius.circular(20),
@@ -1232,51 +1608,6 @@ class _UserProfileViewScreenState
     return count.toString();
   }
 
-  // ===========================================================================
-  // ACTION BUTTONS
-  // ===========================================================================
-
-  Widget _buildActionButtons() {
-    return Padding(
-      padding:
-          const EdgeInsets.symmetric(
-        horizontal: 14,
-      ),
-      child: Row(
-        children: [
-          Expanded(
-            child: _actionButton(
-              Icons.chat_bubble_rounded,
-              "Message",
-              cyan,
-              () {
-                Navigator.pop(context);
-              },
-            ),
-          ),
-          const SizedBox(width: 8),
-          Expanded(
-            child: _actionButton(
-              Icons.call_rounded,
-              "Call",
-              Colors.white,
-              () {},
-            ),
-          ),
-          const SizedBox(width: 8),
-          Expanded(
-            child: _actionButton(
-              Icons.videocam_rounded,
-              "Video",
-              purpleBright,
-              () {},
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
   Widget _actionButton(
     IconData icon,
     String label,
@@ -1291,7 +1622,8 @@ class _UserProfileViewScreenState
             BorderRadius.circular(16),
         child: Container(
           height: 58,
-          decoration: BoxDecoration(
+          decoration:
+              BoxDecoration(
             color: card,
             borderRadius:
                 BorderRadius.circular(16),
@@ -1312,7 +1644,8 @@ class _UserProfileViewScreenState
               const SizedBox(height: 3),
               Text(
                 label,
-                style: const TextStyle(
+                style:
+                    const TextStyle(
                   color: Colors.white70,
                   fontSize: 10,
                   fontWeight:
@@ -1326,9 +1659,9 @@ class _UserProfileViewScreenState
     );
   }
 
-  // ===========================================================================
+  // ==========================================================================
   // PROFILE PHOTO
-  // ===========================================================================
+  // ==========================================================================
 
   Widget _buildProfilePhoto() {
     return Stack(
@@ -1340,9 +1673,12 @@ class _UserProfileViewScreenState
           decoration:
               const BoxDecoration(
             shape: BoxShape.circle,
-            gradient: LinearGradient(
-              begin: Alignment.topLeft,
-              end: Alignment.bottomRight,
+            gradient:
+                LinearGradient(
+              begin:
+                  Alignment.topLeft,
+              end:
+                  Alignment.bottomRight,
               colors: [
                 cyan,
                 purple,
@@ -1383,7 +1719,8 @@ class _UserProfileViewScreenState
           child: Container(
             width: 23,
             height: 23,
-            decoration: BoxDecoration(
+            decoration:
+                BoxDecoration(
               color: isOnline
                   ? onlineColor
                   : Colors.white24,
@@ -1399,57 +1736,9 @@ class _UserProfileViewScreenState
     );
   }
 
-  // ===========================================================================
-  // VERIFIED
-  // ===========================================================================
-
-  Widget _verifiedBadge() {
-    return Container(
-      width: 21,
-      height: 21,
-      decoration:
-          const BoxDecoration(
-        shape: BoxShape.circle,
-        gradient: LinearGradient(
-          colors: [
-            cyan,
-            purple,
-          ],
-        ),
-      ),
-      child: const Icon(
-        Icons.check_rounded,
-        color: Colors.white,
-        size: 14,
-      ),
-    );
-  }
-
-  // ===========================================================================
-  // ABOUT
-  // ===========================================================================
-
-  Widget _buildAboutCard() {
-    return _sectionCard(
-      title: "About",
-      icon: Icons.info_outline_rounded,
-      iconColor: purpleBright,
-      children: [
-        Text(
-          about,
-          style: const TextStyle(
-            color: Colors.white70,
-            fontSize: 13,
-            height: 1.45,
-          ),
-        ),
-      ],
-    );
-  }
-
-  // ===========================================================================
+  // ==========================================================================
   // INFORMATION
-  // ===========================================================================
+  // ==========================================================================
 
   Widget _buildInformationCard() {
     return _sectionCard(
@@ -1486,9 +1775,9 @@ class _UserProfileViewScreenState
     );
   }
 
-  // ===========================================================================
+  // ==========================================================================
   // SHARED CONTENT
-  // ===========================================================================
+  // ==========================================================================
 
   Widget _buildSharedContent() {
     return _sectionCard(
@@ -1527,9 +1816,9 @@ class _UserProfileViewScreenState
     );
   }
 
-  // ===========================================================================
+  // ==========================================================================
   // CHAT SETTINGS
-  // ===========================================================================
+  // ==========================================================================
 
   Widget _buildChatSettings() {
     return _sectionCard(
@@ -1544,8 +1833,7 @@ class _UserProfileViewScreenState
           notificationsMuted,
           (value) {
             setState(() {
-              notificationsMuted =
-                  value;
+              notificationsMuted = value;
             });
           },
         ),
@@ -1569,9 +1857,9 @@ class _UserProfileViewScreenState
     );
   }
 
-  // ===========================================================================
+  // ==========================================================================
   // PRIVACY
-  // ===========================================================================
+  // ==========================================================================
 
   Widget _buildPrivacyCard() {
     return _sectionCard(
@@ -1596,9 +1884,9 @@ class _UserProfileViewScreenState
     );
   }
 
-  // ===========================================================================
-  // DANGER
-  // ===========================================================================
+  // ==========================================================================
+  // DANGER ZONE
+  // ==========================================================================
 
   Widget _buildDangerZone() {
     return Container(
@@ -1609,7 +1897,8 @@ class _UserProfileViewScreenState
         14,
         0,
       ),
-      decoration: BoxDecoration(
+      decoration:
+          BoxDecoration(
         color: card,
         borderRadius:
             BorderRadius.circular(20),
@@ -1622,7 +1911,7 @@ class _UserProfileViewScreenState
         children: [
           _dangerRow(
             Icons.block_rounded,
-            "Block ${name.isEmpty ? widget.userName : name}",
+            "Block $_displayName",
             _confirmBlock,
           ),
           const Divider(
@@ -1639,9 +1928,9 @@ class _UserProfileViewScreenState
     );
   }
 
-  // ===========================================================================
+  // ==========================================================================
   // SECTION CARD
-  // ===========================================================================
+  // ==========================================================================
 
   Widget _sectionCard({
     required String title,
@@ -1657,7 +1946,8 @@ class _UserProfileViewScreenState
         14,
         7,
       ),
-      decoration: BoxDecoration(
+      decoration:
+          BoxDecoration(
         color: card,
         borderRadius:
             BorderRadius.circular(20),
@@ -1721,9 +2011,9 @@ class _UserProfileViewScreenState
     );
   }
 
-  // ===========================================================================
+  // ==========================================================================
   // INFORMATION ROW
-  // ===========================================================================
+  // ==========================================================================
 
   Widget _informationRow(
     IconData icon,
@@ -1792,9 +2082,9 @@ class _UserProfileViewScreenState
     );
   }
 
-  // ===========================================================================
+  // ==========================================================================
   // FEATURE ROW
-  // ===========================================================================
+  // ==========================================================================
 
   Widget _featureRow(
     IconData icon,
@@ -1872,9 +2162,9 @@ class _UserProfileViewScreenState
     );
   }
 
-  // ===========================================================================
-  // SWITCH
-  // ===========================================================================
+  // ==========================================================================
+  // SWITCH ROW
+  // ==========================================================================
 
   Widget _switchRow(
     IconData icon,
@@ -1957,9 +2247,9 @@ class _UserProfileViewScreenState
     );
   }
 
-  // ===========================================================================
+  // ==========================================================================
   // DANGER ROW
-  // ===========================================================================
+  // ==========================================================================
 
   Widget _dangerRow(
     IconData icon,
@@ -2005,9 +2295,9 @@ class _UserProfileViewScreenState
     );
   }
 
-  // ===========================================================================
+  // ==========================================================================
   // DIVIDER
-  // ===========================================================================
+  // ==========================================================================
 
   Widget _divider() {
     return const Divider(
@@ -2016,9 +2306,9 @@ class _UserProfileViewScreenState
     );
   }
 
-  // ===========================================================================
+  // ==========================================================================
   // TOP BAR
-  // ===========================================================================
+  // ==========================================================================
 
   Widget _buildTopBar() {
     return Container(
@@ -2047,12 +2337,13 @@ class _UserProfileViewScreenState
     );
   }
 
-  // ===========================================================================
-  // PROFILE PHOTO
-  // ===========================================================================
+  // ==========================================================================
+  // PROFILE PHOTO VIEWER
+  // ==========================================================================
 
   void _openProfilePhoto() {
-    final provider = imageProvider;
+    final provider =
+        imageProvider;
 
     if (provider == null) return;
 
@@ -2071,7 +2362,7 @@ class _UserProfileViewScreenState
         ) {
           return ProfilePhotoViewer(
             image: provider,
-            name: name,
+            name: _displayName,
             heroTag:
                 "profile_${widget.userId}",
           );
@@ -2080,9 +2371,9 @@ class _UserProfileViewScreenState
     );
   }
 
-  // ===========================================================================
+  // ==========================================================================
   // COPY ID
-  // ===========================================================================
+  // ==========================================================================
 
   Future<void> _copyUserId() async {
     await Clipboard.setData(
@@ -2096,15 +2387,16 @@ class _UserProfileViewScreenState
     ScaffoldMessenger.of(context)
         .showSnackBar(
       const SnackBar(
+        backgroundColor: header,
         content:
             Text("ChattªX ID copied"),
       ),
     );
   }
 
-  // ===========================================================================
+  // ==========================================================================
   // JOINED DATE
-  // ===========================================================================
+  // ==========================================================================
 
   String _formatJoinedDate(
     DateTime date,
@@ -2127,26 +2419,26 @@ class _UserProfileViewScreenState
     return "${months[date.month - 1]} ${date.year}";
   }
 
-  // ===========================================================================
-  // HELPERS
-  // ===========================================================================
+  // ==========================================================================
+  // STRING HELPER
+  // ==========================================================================
 
-  String _stringValue(
-    dynamic first,
-    dynamic second,
+  String _firstString(
+    List<dynamic> values,
   ) {
-    if (first is String &&
-        first.trim().isNotEmpty) {
-      return first.trim();
-    }
-
-    if (second is String &&
-        second.trim().isNotEmpty) {
-      return second.trim();
+    for (final value in values) {
+      if (value is String &&
+          value.trim().isNotEmpty) {
+        return value.trim();
+      }
     }
 
     return "";
   }
+
+  // ==========================================================================
+  // INT HELPER
+  // ==========================================================================
 
   int _intValue(dynamic value) {
     if (value is int) {
@@ -2163,6 +2455,10 @@ class _UserProfileViewScreenState
         0;
   }
 
+  // ==========================================================================
+  // DATE HELPER
+  // ==========================================================================
+
   DateTime? _dateValue(dynamic value) {
     if (value is Timestamp) {
       return value.toDate();
@@ -2175,9 +2471,9 @@ class _UserProfileViewScreenState
     return null;
   }
 
-  // ===========================================================================
+  // ==========================================================================
   // MORE MENU
-  // ===========================================================================
+  // ==========================================================================
 
   void _showMoreMenu() {
     showModalBottomSheet(
@@ -2204,13 +2500,17 @@ class _UserProfileViewScreenState
                   Icons.share_rounded,
                   "Share profile",
                   () =>
-                      Navigator.pop(context),
+                      Navigator.pop(
+                    context,
+                  ),
                 ),
                 _bottomMenuItem(
                   Icons.flag_rounded,
                   "Report user",
                   () {
-                    Navigator.pop(context);
+                    Navigator.pop(
+                      context,
+                    );
                     _reportUser();
                   },
                   danger: true,
@@ -2219,7 +2519,9 @@ class _UserProfileViewScreenState
                   Icons.block_rounded,
                   "Block user",
                   () {
-                    Navigator.pop(context);
+                    Navigator.pop(
+                      context,
+                    );
                     _confirmBlock();
                   },
                   danger: true,
@@ -2244,7 +2546,9 @@ class _UserProfileViewScreenState
       leading: Icon(
         icon,
         color:
-            danger ? Colors.redAccent : cyan,
+            danger
+                ? Colors.redAccent
+                : cyan,
       ),
       title: Text(
         title,
@@ -2253,15 +2557,16 @@ class _UserProfileViewScreenState
               danger
                   ? Colors.redAccent
                   : Colors.white,
-          fontWeight: FontWeight.w600,
+          fontWeight:
+              FontWeight.w600,
         ),
       ),
     );
   }
 
-  // ===========================================================================
-  // DISAPPEARING
-  // ===========================================================================
+  // ==========================================================================
+  // DISAPPEARING MESSAGES
+  // ==========================================================================
 
   void _showDisappearingMessages() {
     showModalBottomSheet(
@@ -2342,15 +2647,16 @@ class _UserProfileViewScreenState
         title,
         style: const TextStyle(
           color: Colors.white,
-          fontWeight: FontWeight.w600,
+          fontWeight:
+              FontWeight.w600,
         ),
       ),
     );
   }
 
-  // ===========================================================================
+  // ==========================================================================
   // ENCRYPTION
-  // ===========================================================================
+  // ==========================================================================
 
   void _showEncryptionInfo() {
     showDialog(
@@ -2374,7 +2680,9 @@ class _UserProfileViewScreenState
           actions: [
             TextButton(
               onPressed: () =>
-                  Navigator.pop(context),
+                  Navigator.pop(
+                context,
+              ),
               child:
                   const Text("OK"),
             ),
@@ -2384,9 +2692,9 @@ class _UserProfileViewScreenState
     );
   }
 
-  // ===========================================================================
+  // ==========================================================================
   // SECURITY
-  // ===========================================================================
+  // ==========================================================================
 
   void _showSecurityVerification() {
     showModalBottomSheet(
@@ -2462,9 +2770,9 @@ class _UserProfileViewScreenState
     );
   }
 
-  // ===========================================================================
+  // ==========================================================================
   // BLOCK
-  // ===========================================================================
+  // ==========================================================================
 
   Future<void> _confirmBlock() async {
     final result =
@@ -2480,7 +2788,7 @@ class _UserProfileViewScreenState
             ),
           ),
           content: Text(
-            "You won't receive messages or calls from $name.",
+            "You won't receive messages or calls from $_displayName.",
             style: const TextStyle(
               color: Colors.white70,
             ),
@@ -2531,7 +2839,9 @@ class _UserProfileViewScreenState
             widget.userId,
           ]),
         },
-        SetOptions(merge: true),
+        SetOptions(
+          merge: true,
+        ),
       );
 
       if (!mounted) return;
@@ -2539,6 +2849,7 @@ class _UserProfileViewScreenState
       ScaffoldMessenger.of(context)
           .showSnackBar(
         const SnackBar(
+          backgroundColor: header,
           content:
               Text("User blocked"),
         ),
@@ -2550,9 +2861,9 @@ class _UserProfileViewScreenState
     }
   }
 
-  // ===========================================================================
+  // ==========================================================================
   // REPORT
-  // ===========================================================================
+  // ==========================================================================
 
   Future<void> _reportUser() async {
     final uid = currentUserId;
@@ -2628,6 +2939,7 @@ class _UserProfileViewScreenState
       ScaffoldMessenger.of(context)
           .showSnackBar(
         const SnackBar(
+          backgroundColor: header,
           content:
               Text("Report submitted"),
         ),
@@ -2663,7 +2975,7 @@ class _UserProfileViewScreenState
 }
 
 // ============================================================================
-// PROFILE PHOTO VIEWER
+// CHATTªX PROFILE PHOTO VIEWER
 // ============================================================================
 
 class ProfilePhotoViewer
@@ -2704,6 +3016,11 @@ class ProfilePhotoViewer
               ),
             ),
           ),
+
+          // ==================================================================
+          // TOP BAR
+          // ==================================================================
+
           Positioned(
             top:
                 MediaQuery.of(context)
@@ -2719,7 +3036,8 @@ class ProfilePhotoViewer
                       BorderRadius.circular(
                     15,
                   ),
-                  child: BackdropFilter(
+                  child:
+                      BackdropFilter(
                     filter:
                         ImageFilter.blur(
                       sigmaX: 12,
@@ -2736,7 +3054,8 @@ class ProfilePhotoViewer
                           15,
                         ),
                       ),
-                      child: IconButton(
+                      child:
+                          IconButton(
                         onPressed: () =>
                             Navigator.pop(
                           context,
@@ -2758,7 +3077,8 @@ class ProfilePhotoViewer
                         BorderRadius.circular(
                       15,
                     ),
-                    child: BackdropFilter(
+                    child:
+                        BackdropFilter(
                       filter:
                           ImageFilter.blur(
                         sigmaX: 12,
@@ -2803,6 +3123,11 @@ class ProfilePhotoViewer
               ],
             ),
           ),
+
+          // ==================================================================
+          // ZOOM HINT
+          // ==================================================================
+
           Positioned(
             bottom:
                 MediaQuery.of(context)

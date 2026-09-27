@@ -75,20 +75,16 @@ class ChatHeader extends StatelessWidget {
   static const Color online =
       Color(0xff16F15D);
 
+  // ============================================================
+  // HEADER TOP SPACE
+  //
+  // Increase this value if you want the header even lower.
+  // ============================================================
+
+  static const double topSpace = 10;
+
   @override
   Widget build(BuildContext context) {
-    // ============================================================
-    // LOAD VERIFICATION STATUS FROM FIRESTORE
-    // ============================================================
-    //
-    // The blue tick is shown when either:
-    //
-    // 1. isVerified was already passed as true
-    // OR
-    // 2. users/{userId}/verified is true
-    //
-    // ============================================================
-
     return StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
       stream: userId.isEmpty
           ? null
@@ -113,433 +109,409 @@ class ChatHeader extends StatelessWidget {
             isVerified || firestoreVerified;
 
         return AnimatedContainer(
-          duration:
-              const Duration(milliseconds: 250),
+          duration: const Duration(milliseconds: 250),
+          curve: Curves.easeOut,
 
-          curve:
-              Curves.easeOut,
-
-          padding:
-              const EdgeInsets.only(
-            top: 4,
-            bottom: 0,
+          decoration: const BoxDecoration(
+            color: header,
           ),
 
-          decoration:
-              const BoxDecoration(
-            color:
-                background,
-          ),
+          // ======================================================
+          // THIS CREATES THE SPACE ABOVE THE HEADER
+          // USING THE EXACT SAME HEADER COLOR
+          // ======================================================
 
-          child:
-              SizedBox(
-            height: 78,
+          child: Padding(
+            padding: const EdgeInsets.only(
+              top: topSpace,
+            ),
 
-            child:
-                Stack(
-              clipBehavior:
-                  Clip.none,
+            child: SizedBox(
+              height: 78,
 
-              children: [
+              child: Stack(
+                clipBehavior: Clip.none,
 
-                // ======================================================
-                // HEADER BACKGROUND
-                // ======================================================
+                children: [
 
-                ClipPath(
-                  clipper:
-                      _ChatHeaderClipper(),
+                  // ==================================================
+                  // HEADER BACKGROUND
+                  // ==================================================
 
-                  child:
-                      BackdropFilter(
-                    filter:
-                        ImageFilter.blur(
-                      sigmaX: 18,
-                      sigmaY: 18,
-                    ),
+                  ClipPath(
+                    clipper: _ChatHeaderClipper(),
 
-                    child:
-                        Container(
-                      height: 78,
+                    child: BackdropFilter(
+                      filter: ImageFilter.blur(
+                        sigmaX: 18,
+                        sigmaY: 18,
+                      ),
 
-                      decoration:
-                          const BoxDecoration(
-                        gradient:
-                            LinearGradient(
-                          begin:
-                              Alignment.topCenter,
+                      child: Container(
+                        height: 78,
 
-                          end:
-                              Alignment.bottomCenter,
+                        decoration:
+                            const BoxDecoration(
+                          gradient:
+                              LinearGradient(
+                            begin:
+                                Alignment.topCenter,
 
-                          colors: [
-                            Color(
-                              0xff020714,
-                            ),
-                            Color(
-                              0xff03091A,
-                            ),
-                            Color(
-                              0xff020611,
-                            ),
-                          ],
+                            end:
+                                Alignment.bottomCenter,
+
+                            colors: [
+                              Color(0xff020714),
+                              Color(0xff03091A),
+                              Color(0xff020611),
+                            ],
+                          ),
                         ),
                       ),
                     ),
                   ),
-                ),
 
-                // ======================================================
-                // SUBTLE NEON EDGE
-                // ======================================================
+                  // ==================================================
+                  // SUBTLE NEON EDGE
+                  // ==================================================
 
-                Positioned.fill(
-                  child:
-                      IgnorePointer(
-                    child:
-                        CustomPaint(
-                      painter:
-                          _HeaderGlowPainter(),
+                  Positioned.fill(
+                    child: IgnorePointer(
+                      child: CustomPaint(
+                        painter:
+                            _HeaderGlowPainter(),
+                      ),
                     ),
                   ),
-                ),
 
-                // ======================================================
-                // HEADER CONTENT
-                // ======================================================
+                  // ==================================================
+                  // HEADER CONTENT
+                  // ==================================================
 
-                Row(
-                  children: [
+                  Row(
+                    children: [
 
-                    // ==================================================
-                    // BACK BUTTON
-                    // ==================================================
+                      // ==============================================
+                      // BACK BUTTON
+                      // ==============================================
 
-                    GestureDetector(
-                      onTap:
-                          onBack,
+                      GestureDetector(
+                        onTap: onBack,
 
-                      child:
-                          _circleButton(
-                        icon:
-                            Icons.arrow_back_rounded,
+                        child: _circleButton(
+                          icon:
+                              Icons.arrow_back_rounded,
 
-                        iconColor:
-                            Colors.white,
+                          iconColor:
+                              Colors.white,
 
-                        size:
-                            28,
+                          size: 28,
+                        ),
                       ),
-                    ),
 
-                    // ==================================================
-                    // PROFILE AREA
-                    // ==================================================
+                      // ==============================================
+                      // PROFILE AREA
+                      // ==============================================
 
-                    Expanded(
-                      child:
-                          GestureDetector(
-                        behavior:
-                            HitTestBehavior.opaque,
+                      Expanded(
+                        child: GestureDetector(
+                          behavior:
+                              HitTestBehavior.opaque,
 
-                        onTap:
-                            onProfileTap,
+                          onTap: onProfileTap,
 
-                        child:
-                            Row(
-                          children: [
+                          child: Row(
+                            children: [
 
-                            const SizedBox(
-                              width: 5,
-                            ),
-
-                            // ==================================================
-                            // PROFILE IMAGE
-                            // ==================================================
-
-                            Padding(
-                              padding:
-                                  const EdgeInsets.only(
-                                right: 6,
+                              const SizedBox(
+                                width: 5,
                               ),
 
-                              child:
-                                  Stack(
-                                alignment:
-                                    Alignment.center,
+                              // ======================================
+                              // PROFILE IMAGE
+                              // ======================================
 
-                                children: [
+                              Padding(
+                                padding:
+                                    const EdgeInsets.only(
+                                  right: 6,
+                                ),
 
-                                  // ==================================================
-                                  // OUTER PROFILE RING
-                                  // ==================================================
+                                child: Stack(
+                                  alignment:
+                                      Alignment.center,
 
-                                  Container(
-                                    width: 48,
-                                    height: 48,
+                                  children: [
 
-                                    decoration:
-                                        const BoxDecoration(
-                                      shape:
-                                          BoxShape.circle,
+                                    // =================================
+                                    // OUTER PROFILE RING
+                                    // =================================
 
-                                      gradient:
-                                          LinearGradient(
-                                        begin:
-                                            Alignment.topLeft,
+                                    Container(
+                                      width: 48,
+                                      height: 48,
 
-                                        end:
-                                            Alignment.bottomRight,
+                                      decoration:
+                                          const BoxDecoration(
+                                        shape:
+                                            BoxShape.circle,
 
-                                        colors: [
-                                          cyan,
-                                          blue,
-                                          purple,
-                                          pink,
-                                        ],
-                                      ),
-                                    ),
-                                  ),
+                                        gradient:
+                                            LinearGradient(
+                                          begin:
+                                              Alignment.topLeft,
 
-                                  // ==================================================
-                                  // INNER DARK RING
-                                  // ==================================================
+                                          end:
+                                              Alignment
+                                                  .bottomRight,
 
-                                  Container(
-                                    width: 45,
-                                    height: 45,
-
-                                    decoration:
-                                        const BoxDecoration(
-                                      color:
-                                          header,
-
-                                      shape:
-                                          BoxShape.circle,
-                                    ),
-                                  ),
-
-                                  // ==================================================
-                                  // PROFILE IMAGE
-                                  // ==================================================
-
-                                  CircleAvatar(
-                                    radius: 21,
-
-                                    backgroundColor:
-                                        buttonBackground,
-
-                                    backgroundImage:
-                                        image.isNotEmpty
-                                            ? image.startsWith(
-                                                "http",
-                                              )
-                                                ? NetworkImage(
-                                                    image,
-                                                  )
-                                                : AssetImage(
-                                                    image,
-                                                  ) as ImageProvider
-                                            : null,
-
-                                    child:
-                                        image.isEmpty
-                                            ? const Icon(
-                                                Icons.person,
-
-                                                color:
-                                                    Colors.white54,
-
-                                                size:
-                                                    23,
-                                              )
-                                            : null,
-                                  ),
-                                ],
-                              ),
-                            ),
-
-                            // ==================================================
-                            // NAME + STATUS
-                            // ==================================================
-
-                            Expanded(
-                              child:
-                                  Column(
-                                mainAxisAlignment:
-                                    MainAxisAlignment.center,
-
-                                crossAxisAlignment:
-                                    CrossAxisAlignment.start,
-
-                                children: [
-
-                                  // ==================================================
-                                  // NAME + VERIFIED
-                                  // ==================================================
-
-                                  GestureDetector(
-  onTap: onNameTap,
-  behavior: HitTestBehavior.opaque,
-  child: VerifiedName(
-    name: name,
-    verified: verified,
-    fontSize: 18,
-    fontWeight: FontWeight.w700,
-    textColor: primaryText,
-  ),
-),
-
-                                  const SizedBox(
-                                    height: 3,
-                                  ),
-
-                                  // ==================================================
-                                  // STATUS
-                                  // ==================================================
-
-                                  Row(
-                                    children: [
-
-                                      if (isOnline)
-                                        Container(
-                                          width: 6,
-                                          height: 6,
-
-                                          decoration:
-                                              const BoxDecoration(
-                                            color:
-                                                online,
-
-                                            shape:
-                                                BoxShape.circle,
-                                          ),
-                                        ),
-
-                                      if (isOnline)
-                                        const SizedBox(
-                                          width: 6,
-                                        ),
-
-                                      Flexible(
-                                        child:
-                                            Text(
-                                          isTyping
-                                              ? 'typing...'
-                                              : status,
-
-                                          maxLines:
-                                              1,
-
-                                          overflow:
-                                              TextOverflow.ellipsis,
-
-                                          style:
-                                              TextStyle(
-                                            color:
-                                                isTyping
-                                                    ? cyan
-                                                    : secondaryText,
-
-                                            fontSize:
-                                                11,
-
-                                            fontWeight:
-                                                isTyping
-                                                    ? FontWeight.w600
-                                                    : FontWeight.w500,
-                                          ),
+                                          colors: [
+                                            cyan,
+                                            blue,
+                                            purple,
+                                            pink,
+                                          ],
                                         ),
                                       ),
-                                    ],
-                                  ),
-                                ],
+                                    ),
+
+                                    // =================================
+                                    // INNER DARK RING
+                                    // =================================
+
+                                    Container(
+                                      width: 45,
+                                      height: 45,
+
+                                      decoration:
+                                          const BoxDecoration(
+                                        color: header,
+
+                                        shape:
+                                            BoxShape.circle,
+                                      ),
+                                    ),
+
+                                    // =================================
+                                    // PROFILE IMAGE
+                                    // =================================
+
+                                    CircleAvatar(
+                                      radius: 21,
+
+                                      backgroundColor:
+                                          buttonBackground,
+
+                                      backgroundImage:
+                                          image.isNotEmpty
+                                              ? image.startsWith(
+                                                  "http",
+                                                )
+                                                  ? NetworkImage(
+                                                      image,
+                                                    )
+                                                  : AssetImage(
+                                                      image,
+                                                    ) as ImageProvider
+                                              : null,
+
+                                      child: image.isEmpty
+                                          ? const Icon(
+                                              Icons.person,
+
+                                              color:
+                                                  Colors.white54,
+
+                                              size: 23,
+                                            )
+                                          : null,
+                                    ),
+                                  ],
+                                ),
                               ),
-                            ),
-                          ],
+
+                              // ======================================
+                              // NAME + STATUS
+                              // ======================================
+
+                              Expanded(
+                                child: Column(
+                                  mainAxisAlignment:
+                                      MainAxisAlignment
+                                          .center,
+
+                                  crossAxisAlignment:
+                                      CrossAxisAlignment
+                                          .start,
+
+                                  children: [
+
+                                    // ===============================
+                                    // NAME + VERIFIED
+                                    // ===============================
+
+                                    GestureDetector(
+                                      onTap: onNameTap,
+
+                                      behavior:
+                                          HitTestBehavior
+                                              .opaque,
+
+                                      child: VerifiedName(
+                                        name: name,
+                                        verified:
+                                            verified,
+                                        fontSize: 18,
+                                        fontWeight:
+                                            FontWeight.w700,
+                                        textColor:
+                                            primaryText,
+                                      ),
+                                    ),
+
+                                    const SizedBox(
+                                      height: 3,
+                                    ),
+
+                                    // ===============================
+                                    // STATUS
+                                    // ===============================
+
+                                    Row(
+                                      children: [
+
+                                        if (isOnline)
+                                          Container(
+                                            width: 6,
+                                            height: 6,
+
+                                            decoration:
+                                                const BoxDecoration(
+                                              color: online,
+                                              shape:
+                                                  BoxShape
+                                                      .circle,
+                                            ),
+                                          ),
+
+                                        if (isOnline)
+                                          const SizedBox(
+                                            width: 6,
+                                          ),
+
+                                        Flexible(
+                                          child: Text(
+                                            isTyping
+                                                ? 'typing...'
+                                                : status,
+
+                                            maxLines: 1,
+
+                                            overflow:
+                                                TextOverflow
+                                                    .ellipsis,
+
+                                            style:
+                                                TextStyle(
+                                              color: isTyping
+                                                  ? cyan
+                                                  : secondaryText,
+
+                                              fontSize: 11,
+
+                                              fontWeight: isTyping
+                                                  ? FontWeight
+                                                      .w600
+                                                  : FontWeight
+                                                      .w500,
+                                            ),
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ],
+                          ),
                         ),
                       ),
-                    ),
 
-                    if (showQuickActions) ...[
-                      const SizedBox(
-                        width: 6,
-                      ),
+                      // =================================================
+                      // QUICK ACTIONS
+                      // =================================================
 
-                      // ==================================================
-                      // VIDEO CALL
-                      // ==================================================
-
-                      GestureDetector(
-                        onTap:
-                            onVideoCall,
-
-                        child:
-                            _circleButton(
-                          icon:
-                              Icons.videocam_rounded,
-
-                          iconColor:
-                              Colors.white,
-
-                          size:
-                              28,
+                      if (showQuickActions) ...[
+                        const SizedBox(
+                          width: 6,
                         ),
-                      ),
 
-                      const SizedBox(
-                        width: 6,
-                      ),
+                        // ==============================================
+                        // VIDEO CALL
+                        // ==============================================
 
-                      // ==================================================
-                      // VOICE CALL
-                      // ==================================================
+                        GestureDetector(
+                          onTap: onVideoCall,
 
-                      GestureDetector(
-                        onTap:
-                            onVoiceCall,
+                          child: _circleButton(
+                            icon:
+                                Icons.videocam_rounded,
 
-                        child:
-                            _circleButton(
-                          icon:
-                              Icons.call_rounded,
+                            iconColor:
+                                Colors.white,
 
-                          iconColor:
-                              Colors.white,
-
-                          size:
-                              28,
+                            size: 28,
+                          ),
                         ),
-                      ),
 
-                      const SizedBox(
-                        width: 6,
-                      ),
-
-                      // ==================================================
-                      // MENU
-                      // ==================================================
-
-                      GestureDetector(
-                        onTap:
-                            onMenu,
-
-                        child:
-                            _circleButton(
-                          icon:
-                              Icons.more_vert_rounded,
-
-                          iconColor:
-                              Colors.white,
-
-                          size:
-                              28,
+                        const SizedBox(
+                          width: 6,
                         ),
-                      ),
+
+                        // ==============================================
+                        // VOICE CALL
+                        // ==============================================
+
+                        GestureDetector(
+                          onTap: onVoiceCall,
+
+                          child: _circleButton(
+                            icon:
+                                Icons.call_rounded,
+
+                            iconColor:
+                                Colors.white,
+
+                            size: 28,
+                          ),
+                        ),
+
+                        const SizedBox(
+                          width: 6,
+                        ),
+
+                        // ==============================================
+                        // MENU
+                        // ==============================================
+
+                        GestureDetector(
+                          onTap: onMenu,
+
+                          child: _circleButton(
+                            icon:
+                                Icons.more_vert_rounded,
+
+                            iconColor:
+                                Colors.white,
+
+                            size: 28,
+                          ),
+                        ),
+                      ],
                     ],
-                  ],
-                ),
-              ],
+                  ),
+                ],
+              ),
             ),
           ),
         );
@@ -557,75 +529,54 @@ class ChatHeader extends StatelessWidget {
     required double size,
   }) {
     return Container(
-      width:
-          size,
+      width: size,
+      height: size,
 
-      height:
-          size,
-
-      decoration:
-          BoxDecoration(
-        color:
-            buttonBackground,
+      decoration: BoxDecoration(
+        color: buttonBackground,
 
         borderRadius:
-            BorderRadius.circular(
-          12,
-        ),
+            BorderRadius.circular(12),
 
-        border:
-            Border.all(
-          color:
-              const Color(
+        border: Border.all(
+          color: const Color(
             0xff5538FF,
           ).withValues(
             alpha: 0.48,
           ),
 
-          width:
-              1,
+          width: 1,
         ),
 
         boxShadow: [
-          // VERY SMALL BLUE GLOW
           BoxShadow(
-            color:
-                cyan.withValues(
+            color: cyan.withValues(
               alpha: 0.045,
             ),
 
-            blurRadius:
-                7,
+            blurRadius: 7,
 
-            spreadRadius:
-                0,
+            spreadRadius: 0,
           ),
 
-          // VERY SMALL PURPLE GLOW
           BoxShadow(
-            color:
-                purple.withValues(
+            color: purple.withValues(
               alpha: 0.055,
             ),
 
-            blurRadius:
-                8,
+            blurRadius: 8,
 
-            spreadRadius:
-                0,
+            spreadRadius: 0,
           ),
         ],
       ),
 
-      child:
-          Icon(
+      child: Icon(
         icon,
 
-        size:
-            20,
+        size: 20,
 
-        color:
-            iconColor,
+        color: iconColor,
       ),
     );
   }
@@ -642,8 +593,7 @@ class _ChatHeaderClipper
   Path getClip(
     Size size,
   ) {
-    final Path path =
-        Path();
+    final Path path = Path();
 
     path.moveTo(
       0,
@@ -712,8 +662,7 @@ class _HeaderGlowPainter
     Canvas canvas,
     Size size,
   ) {
-    final Path path =
-        Path();
+    final Path path = Path();
 
     path.moveTo(
       0,
@@ -757,35 +706,27 @@ class _HeaderGlowPainter
     // VERY SUBTLE OUTER GLOW
     // ============================================================
 
-    final Paint softGlow =
-        Paint()
-          ..style =
-              PaintingStyle.stroke
-
-          ..strokeWidth =
-              1.5
-
-          ..maskFilter =
-              const MaskFilter.blur(
-            BlurStyle.normal,
-            3,
-          )
-
-          ..shader =
-              const LinearGradient(
-            colors: [
-              Color(0xff00D9FF),
-              Color(0xff168EFF),
-              Color(0xff762CFF),
-            ],
-          ).createShader(
-            Rect.fromLTWH(
-              0,
-              0,
-              size.width,
-              size.height,
-            ),
-          );
+    final Paint softGlow = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 1.5
+      ..maskFilter = const MaskFilter.blur(
+        BlurStyle.normal,
+        3,
+      )
+      ..shader = const LinearGradient(
+        colors: [
+          Color(0xff00D9FF),
+          Color(0xff168EFF),
+          Color(0xff762CFF),
+        ],
+      ).createShader(
+        Rect.fromLTWH(
+          0,
+          0,
+          size.width,
+          size.height,
+        ),
+      );
 
     canvas.drawPath(
       path,
@@ -796,30 +737,24 @@ class _HeaderGlowPainter
     // MAIN SHARP LINE
     // ============================================================
 
-    final Paint linePaint =
-        Paint()
-          ..style =
-              PaintingStyle.stroke
-
-          ..strokeWidth =
-              0.9
-
-          ..shader =
-              const LinearGradient(
-            colors: [
-              Color(0xff00D9FF),
-              Color(0xff168EFF),
-              Color(0xff762CFF),
-              Color(0xffB64DFF),
-            ],
-          ).createShader(
-            Rect.fromLTWH(
-              0,
-              0,
-              size.width,
-              size.height,
-            ),
-          );
+    final Paint linePaint = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 0.9
+      ..shader = const LinearGradient(
+        colors: [
+          Color(0xff00D9FF),
+          Color(0xff168EFF),
+          Color(0xff762CFF),
+          Color(0xffB64DFF),
+        ],
+      ).createShader(
+        Rect.fromLTWH(
+          0,
+          0,
+          size.width,
+          size.height,
+        ),
+      );
 
     canvas.drawPath(
       path,

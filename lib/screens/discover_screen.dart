@@ -24,7 +24,6 @@ class DiscoverScreen extends StatefulWidget {
 }
 
 class _DiscoverScreenState extends State<DiscoverScreen> {
-  int _selectedBottomIndex = 3;
 
   // ==========================================================================
   // COLORS
@@ -48,33 +47,24 @@ class _DiscoverScreenState extends State<DiscoverScreen> {
   // BUILD
   // ==========================================================================
 
-  @override
-  Widget build(BuildContext context) {
-    final size = MediaQuery.sizeOf(context);
-
-    return Scaffold(
-      backgroundColor: background,
-      body: SafeArea(
-        bottom: false,
-        child: LayoutBuilder(
-          builder: (context, constraints) {
-            return Column(
-              children: [
-                Expanded(
-                  child: _buildDiscoverContent(
-                    context,
-                    constraints.maxWidth,
-                    constraints.maxHeight,
-                  ),
-                ),
-                _buildBottomNavigation(size.width),
-              ],
-            );
-          },
-        ),
+ @override
+Widget build(BuildContext context) {
+  return Scaffold(
+    backgroundColor: background,
+    body: SafeArea(
+      bottom: false,
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          return _buildDiscoverContent(
+            context,
+            constraints.maxWidth,
+            constraints.maxHeight,
+          );
+        },
       ),
-    );
-  }
+    ),
+  );
+}
 
   // ==========================================================================
   // MAIN CONTENT
@@ -110,52 +100,52 @@ class _DiscoverScreenState extends State<DiscoverScreen> {
           const SizedBox(height: 7),
 
           Expanded(
-            child: Column(
-              children: [
-                // =================================================================
-                // FEATURE CARDS
-                // =================================================================
+  child: Column(
+    children: [
+      // =================================================================
+      // FEATURE CARDS
+      // =================================================================
 
-                Expanded(
-                  flex: 25,
-                  child: _buildFeatureGrid(width),
-                ),
+      Expanded(
+        flex: 18,
+        child: _buildFeatureGrid(width),
+      ),
 
-                const SizedBox(height: 4),
+      const SizedBox(height: 4),
 
-                // =================================================================
-                // TRENDING
-                // =================================================================
+      // =================================================================
+      // TRENDING
+      // =================================================================
 
-                Expanded(
-                  flex: 9,
-                  child: _buildTrendingSection(width),
-                ),
+      Expanded(
+        flex: 11,
+        child: _buildTrendingSection(width),
+      ),
 
-                const SizedBox(height: 4),
+      const SizedBox(height: 4),
 
-                // =================================================================
-                // EVENTS
-                // =================================================================
+      // =================================================================
+      // EVENTS
+      // =================================================================
 
-                Expanded(
-                  flex: 20,
-                  child: _buildEventsSection(width),
-                ),
+      Expanded(
+        flex: 23,
+        child: _buildEventsSection(width),
+      ),
 
-                const SizedBox(height: 4),
+      const SizedBox(height: 4),
 
-                // =================================================================
-                // POPULAR COMMUNITIES
-                // =================================================================
+      // =================================================================
+      // POPULAR COMMUNITIES
+      // =================================================================
 
-                Expanded(
-                  flex: 10,
-                  child: _buildPopularCommunities(width),
-                ),
-              ],
-            ),
-          ),
+      Expanded(
+        flex: 8,
+        child: _buildPopularCommunities(width),
+      ),
+    ],
+  ),
+),
         ],
       ),
     );
@@ -485,74 +475,86 @@ class _DiscoverScreenState extends State<DiscoverScreen> {
   // ==========================================================================
 
   Widget _buildFeatureGrid(double width) {
-    return Row(
-      children: [
-        Expanded(
-          child: _featureCard(
-            title: 'ChattªX World',
-            subtitle: 'Discover people',
-            icon: Icons.public_rounded,
-            color: violet,
-          ),
+  return Column(
+    children: [
+      Expanded(
+        child: Row(
+          children: [
+            Expanded(
+              child: _featureCard(
+                title: 'ChattªX World',
+                subtitle: 'Discover people',
+                icon: Icons.public_rounded,
+                color: violet,
+              ),
+            ),
+
+            const SizedBox(width: 4),
+
+            Expanded(
+              child: _featureCard(
+                title: 'Communities',
+                subtitle: 'Join interests',
+                icon: Icons.groups_rounded,
+                color: purple,
+              ),
+            ),
+
+            const SizedBox(width: 4),
+
+            Expanded(
+              child: _featureCard(
+                title: "Who's Nearby",
+                subtitle: 'People near you',
+                icon: Icons.location_on_rounded,
+                color: pink,
+              ),
+            ),
+          ],
         ),
+      ),
 
-        const SizedBox(width: 4),
+      const SizedBox(height: 4),
 
-        Expanded(
-          child: _featureCard(
-            title: 'Communities',
-            subtitle: 'Join interests',
-            icon: Icons.groups_rounded,
-            color: purple,
-          ),
+      Expanded(
+        child: Row(
+          children: [
+            Expanded(
+              child: _featureCard(
+                title: 'Events',
+                subtitle: 'Things happening',
+                icon: Icons.event_available_rounded,
+                color: eventAccent,
+              ),
+            ),
+
+            const SizedBox(width: 4),
+
+            Expanded(
+              child: _featureCard(
+                title: 'Places',
+                subtitle: 'Explore nearby',
+                icon: Icons.location_pin,
+                color: cyan,
+              ),
+            ),
+
+            const SizedBox(width: 4),
+
+            Expanded(
+              child: _featureCard(
+                title: 'Music',
+                subtitle: 'Songs & artists',
+                icon: Icons.music_note_rounded,
+                color: violet,
+              ),
+            ),
+          ],
         ),
-
-        const SizedBox(width: 4),
-
-        Expanded(
-          child: _featureCard(
-            title: "Who's Nearby",
-            subtitle: 'People near you',
-            icon: Icons.location_on_rounded,
-            color: pink,
-          ),
-        ),
-
-        const SizedBox(width: 4),
-
-        Expanded(
-          child: _featureCard(
-            title: 'Events',
-            subtitle: 'Things happening',
-            icon: Icons.event_available_rounded,
-            color: eventAccent,
-          ),
-        ),
-
-        const SizedBox(width: 4),
-
-        Expanded(
-          child: _featureCard(
-            title: 'Places',
-            subtitle: 'Explore nearby',
-            icon: Icons.location_pin,
-            color: cyan,
-          ),
-        ),
-
-        const SizedBox(width: 4),
-
-        Expanded(
-          child: _featureCard(
-            title: 'Music',
-            subtitle: 'Songs & artists',
-            icon: Icons.music_note_rounded,
-            color: violet,
-          ),
-        ),
-      ],
-    );
-  }
+      ),
+    ],
+  );
+}
 
   // ==========================================================================
   // FEATURE CARD
@@ -576,9 +578,9 @@ class _DiscoverScreenState extends State<DiscoverScreen> {
       child: LayoutBuilder(
         builder: (context, constraints) {
           final iconSize = math.min(
-            constraints.maxWidth * 0.48,
-            41.0,
-          );
+  constraints.maxWidth * 0.24,
+  42.0,
+);
 
           return Padding(
             padding: const EdgeInsets.symmetric(
@@ -1185,147 +1187,6 @@ class _DiscoverScreenState extends State<DiscoverScreen> {
               ),
             ),
           ],
-        ),
-      ),
-    );
-  }
-
-  // ==========================================================================
-  // BOTTOM NAVIGATION
-  // ==========================================================================
-
-  Widget _buildBottomNavigation(double width) {
-    return Container(
-      height: 70,
-      width: double.infinity,
-      decoration: const BoxDecoration(
-        color: Color(0xFF080E1E),
-        border: Border(
-          top: BorderSide(
-            color: Color(0xFF172442),
-            width: 1,
-          ),
-        ),
-      ),
-      child: Row(
-        children: [
-          _navItem(
-            icon: Icons.chat_bubble_rounded,
-            label: 'Chats',
-            index: 0,
-          ),
-
-          _navItem(
-            icon: Icons.dynamic_feed_rounded,
-            label: 'Feed',
-            index: 1,
-          ),
-
-          _navItem(
-            icon: Icons.call_rounded,
-            label: 'Calls',
-            index: 2,
-          ),
-
-          _navItem(
-            icon: Icons.explore_rounded,
-            label: 'Discover',
-            index: 3,
-          ),
-
-          _navItem(
-            icon: Icons.play_circle_fill_rounded,
-            label: 'Reels',
-            index: 4,
-          ),
-        ],
-      ),
-    );
-  }
-
-  // ==========================================================================
-  // NAV ITEM
-  // ==========================================================================
-
-  Widget _navItem({
-    required IconData icon,
-    required String label,
-    required int index,
-  }) {
-    final selected = _selectedBottomIndex == index;
-
-    return Expanded(
-      child: GestureDetector(
-        behavior: HitTestBehavior.opaque,
-        onTap: () {
-          setState(() {
-            _selectedBottomIndex = index;
-          });
-        },
-        child: Center(
-          child: AnimatedContainer(
-            duration: const Duration(
-              milliseconds: 220,
-            ),
-            width: selected ? 68 : 53,
-            height: selected ? 60 : 55,
-            decoration: BoxDecoration(
-              borderRadius: BorderRadius.circular(30),
-              gradient: selected
-                  ? const LinearGradient(
-                      begin: Alignment.topLeft,
-                      end: Alignment.bottomRight,
-                      colors: [
-                        purple,
-                        Color(0xFF4213B8),
-                      ],
-                    )
-                  : null,
-              border: selected
-                  ? Border.all(
-                      color: violet,
-                      width: 1,
-                    )
-                  : null,
-              boxShadow: selected
-                  ? const [
-                      BoxShadow(
-                        color: Color(0x507B2FFF),
-                        blurRadius: 18,
-                        spreadRadius: -3,
-                      ),
-                    ]
-                  : null,
-            ),
-            child: Column(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                Icon(
-                  icon,
-                  size: selected ? 24 : 21,
-                  color: selected
-                      ? Colors.white
-                      : const Color(0xFF8792A9),
-                ),
-
-                const SizedBox(height: 2),
-
-                Text(
-                  label,
-                  maxLines: 1,
-                  style: TextStyle(
-                    color: selected
-                        ? Colors.white
-                        : const Color(0xFF8792A9),
-                    fontSize: 8,
-                    fontWeight: selected
-                        ? FontWeight.w800
-                        : FontWeight.w500,
-                  ),
-                ),
-              ],
-            ),
-          ),
         ),
       ),
     );

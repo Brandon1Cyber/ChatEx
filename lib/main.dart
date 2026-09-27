@@ -6,6 +6,7 @@ import 'package:hive_flutter/hive_flutter.dart';
 
 import 'firebase_options.dart';
 import 'services/push_notification_service.dart';
+import 'services/chat_message_cache_service.dart';
 import 'screens/welcome_screen.dart';
 import 'screens/main_navigation_screen.dart';
 
@@ -24,6 +25,10 @@ Future<void> main() async {
   try {
     await Firebase.initializeApp(
       options: DefaultFirebaseOptions.currentPlatform,
+    );
+
+    debugPrint(
+      'CHATTªX FIREBASE: initialized successfully',
     );
   } catch (error, stackTrace) {
     debugPrint(
@@ -45,6 +50,10 @@ Future<void> main() async {
     FirebaseFirestore.instance.settings = const Settings(
       persistenceEnabled: true,
     );
+
+    debugPrint(
+      'CHATTªX FIRESTORE: offline persistence enabled',
+    );
   } catch (error) {
     debugPrint(
       'CHATTªX FIRESTORE: settings error: $error',
@@ -58,9 +67,42 @@ Future<void> main() async {
   try {
     await Hive.initFlutter();
 
-    await Hive.openBox('chat_cache');
-    await Hive.openBox('chat_message_cache');
-    await Hive.openBox('users_cache');
+    // ------------------------------------------------------------------------
+    // Existing ChattªX cache boxes
+    // ------------------------------------------------------------------------
+
+    if (!Hive.isBoxOpen('chat_cache')) {
+      await Hive.openBox('chat_cache');
+    }
+
+    if (!Hive.isBoxOpen('users_cache')) {
+      await Hive.openBox('users_cache');
+    }
+
+    // ------------------------------------------------------------------------
+    // IMPORTANT:
+    //
+    // ChatMessageCacheService uses:
+    //
+    //     chat_message_cache
+    //
+    // Make sure this box is opened BEFORE the app starts.
+    // This allows ChatScreen to read cached messages immediately.
+    // ------------------------------------------------------------------------
+
+    if (!Hive.isBoxOpen('chat_message_cache')) {
+      await Hive.openBox('chat_message_cache');
+    }
+
+    // ------------------------------------------------------------------------
+    // Initialize ChatMessageCacheService
+    // ------------------------------------------------------------------------
+
+    await ChatMessageCacheService.initialize();
+
+    debugPrint(
+      'CHATTªX HIVE: initialized successfully',
+    );
   } catch (error, stackTrace) {
     debugPrint(
       'CHATTªX HIVE: initialization error: $error',
@@ -90,7 +132,7 @@ Future<void> main() async {
       '$stackTrace',
     );
 
-    // Push notifications failing should NOT prevent the app from opening.
+    // Push notification failure must NOT prevent ChattªX from opening.
   }
 
   // ==========================================================================
@@ -120,6 +162,7 @@ class ChatExApp extends StatelessWidget {
 
       theme: ThemeData(
         brightness: Brightness.dark,
+
         scaffoldBackgroundColor:
             const Color(0xFF050816),
 
@@ -140,7 +183,7 @@ class ChatExApp extends StatelessWidget {
 /// AUTH GATE
 /// ============================================================================
 ///
-/// This widget decides whether the user should see:
+/// Decides whether the user sees:
 ///
 ///     WelcomeScreen
 ///          OR
@@ -148,17 +191,9 @@ class ChatExApp extends StatelessWidget {
 ///
 /// IMPORTANT:
 ///
-/// The incoming call listener is NOT started here.
+/// Incoming call listeners are NOT started here.
 ///
-/// MainNavigationScreen is responsible for:
-///
-///     incomingCalls.listen(...)
-///              ↓
-///     listenForIncomingCalls()
-///              ↓
-///     IncomingVoiceCallScreen
-///
-/// This prevents duplicate call listeners.
+/// MainNavigationScreen remains responsible for the incoming call listener.
 /// ============================================================================
 
 class AuthGate extends StatelessWidget {

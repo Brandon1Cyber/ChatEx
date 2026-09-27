@@ -34,12 +34,25 @@ class VoiceRecorder extends StatefulWidget {
 class _VoiceRecorderState extends State<VoiceRecorder>
     with SingleTickerProviderStateMixin {
   // ============================================================
+  // COLORS
+  // ============================================================
+
+  static const Color _bgColor = Color(0xFF0B0B14);
+  static const Color _borderColor = Color(0xFF8A5CFF);
+  static const Color _pink = Color(0xFFFF2D95);
+  static const Color _purple = Color(0xFFB026FF);
+  static const Color _deepPurple = Color(0xFF6C2BFF);
+  static const Color _cyan = Color(0xFF00E5FF);
+  static const Color _red = Color(0xFFFF496C);
+
+  // ============================================================
   // RECORDER
   // ============================================================
 
   final AudioRecorder recorder = AudioRecorder();
 
   Timer? amplitudeTimer;
+  Timer? durationTimer;
 
   final Stopwatch _recordingStopwatch = Stopwatch();
 
@@ -60,12 +73,10 @@ class _VoiceRecorderState extends State<VoiceRecorder>
   // REAL AUDIO DATA
   // ============================================================
 
-  /// Real microphone amplitude samples.
-  ///
-  /// Each value comes from recorder.getAmplitude().
+  /// Real microphone amplitude samples (raw, one per ~60ms tick).
   final List<double> _rawAmplitudes = [];
 
-  /// Final compressed waveform.
+  /// Final compressed waveform (fixed length, represents the whole clip).
   List<double> waveform = [];
 
   /// Number of bars stored with the message.
@@ -100,9 +111,7 @@ class _VoiceRecorderState extends State<VoiceRecorder>
   // CURRENT DURATION
   // ============================================================
 
-  int get _durationSeconds {
-    return _recordingStopwatch.elapsed.inSeconds;
-  }
+  int get _durationSeconds => _recordingStopwatch.elapsed.inSeconds;
 
   // ============================================================
   // START RECORDING
@@ -113,16 +122,12 @@ class _VoiceRecorderState extends State<VoiceRecorder>
       final permission = await recorder.hasPermission();
 
       if (!permission) {
-        debugPrint(
-          'ChattªX microphone permission denied.',
-        );
+        debugPrint('ChattªX microphone permission denied.');
 
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
             const SnackBar(
-              content: Text(
-                'Microphone permission is required.',
-              ),
+              content: Text('Microphone permission is required.'),
             ),
           );
         }
@@ -166,9 +171,7 @@ class _VoiceRecorderState extends State<VoiceRecorder>
       _startAmplitudeCapture();
       _startDurationRefresh();
     } catch (e) {
-      debugPrint(
-        'ChattªX start recording error: $e',
-      );
+      debugPrint('ChattªX start recording error: $e');
     }
   }
 
@@ -208,45 +211,26 @@ class _VoiceRecorderState extends State<VoiceRecorder>
              *  -5 dB = very loud
              */
 
-            normalized = ((db + 60.0) / 60.0)
-                .clamp(0.0, 1.0)
-                .toDouble();
+            normalized = ((db + 60.0) / 60.0).clamp(0.0, 1.0).toDouble();
           }
 
-          // ------------------------------------------------------
-          // REAL SILENCE / NOISE FLOOR
-          // ------------------------------------------------------
-
+          // Real silence / noise floor.
           if (normalized < 0.08) {
             normalized = 0.0;
           }
 
-          // ------------------------------------------------------
-          // CONTRAST
-          // ------------------------------------------------------
-
+          // Contrast curve.
           if (normalized > 0.0) {
-            normalized = math
-                .pow(normalized, 0.72)
-                .toDouble()
-                .clamp(0.0, 1.0);
+            normalized = math.pow(normalized, 0.72).toDouble().clamp(0.0, 1.0);
           }
 
           /*
            * This sample belongs to the actual recording.
-           *
-           * No:
-           *   sin()
-           *   random()
-           *   fake waveform
+           * No: sin() / random() / fake waveform.
            */
-
           _rawAmplitudes.add(normalized);
 
-          /*
-           * Keep memory bounded during extremely long recordings.
-           * At 60ms this still represents several minutes of data.
-           */
+          // Keep memory bounded during extremely long recordings.
           if (_rawAmplitudes.length > 10000) {
             _rawAmplitudes.removeAt(0);
           }
@@ -255,9 +239,7 @@ class _VoiceRecorderState extends State<VoiceRecorder>
             currentAmplitude = normalized;
           });
         } catch (e) {
-          debugPrint(
-            'ChattªX amplitude capture error: $e',
-          );
+          debugPrint('ChattªX amplitude capture error: $e');
         }
       },
     );
@@ -268,7 +250,9 @@ class _VoiceRecorderState extends State<VoiceRecorder>
   // ============================================================
 
   void _startDurationRefresh() {
-    Timer.periodic(
+    durationTimer?.cancel();
+
+    durationTimer = Timer.periodic(
       const Duration(milliseconds: 250),
       (timer) {
         if (!mounted) {
@@ -320,9 +304,7 @@ class _VoiceRecorderState extends State<VoiceRecorder>
         });
       }
     } catch (e) {
-      debugPrint(
-        'ChattªX pause/resume error: $e',
-      );
+      debugPrint('ChattªX pause/resume error: $e');
     }
   }
 
@@ -335,26 +317,20 @@ class _VoiceRecorderState extends State<VoiceRecorder>
 
     try {
       amplitudeTimer?.cancel();
+      durationTimer?.cancel();
 
       _recordingStopwatch.stop();
 
       final path = await recorder.stop();
 
       if (path == null || path.isEmpty) {
-        debugPrint(
-          'ChattªX recorder returned no audio path.',
-        );
+        debugPrint('ChattªX recorder returned no audio path.');
         return;
       }
 
-      // --------------------------------------------------------
-      // GENERATE REAL WAVEFORM
-      // --------------------------------------------------------
-
-      final generatedWaveform = _compressWaveform(
-        _rawAmplitudes,
-        waveformBars,
-      );
+      // Compress the ENTIRE recording into a fixed set of bars —
+      // this is what gets shown full-width in preview, WhatsApp-style.
+      final generatedWaveform = _compressWaveform(_rawAmplitudes, waveformBars);
 
       final actualDuration = _durationSeconds;
 
@@ -372,31 +348,15 @@ class _VoiceRecorderState extends State<VoiceRecorder>
         waveform = generatedWaveform;
       });
 
-      debugPrint(
-        '==========================================',
-      );
-      debugPrint(
-        'ChattªX VOICE RECORDING COMPLETE',
-      );
-      debugPrint(
-        'Duration: ${actualDuration}s',
-      );
-      debugPrint(
-        'Raw samples: ${_rawAmplitudes.length}',
-      );
-      debugPrint(
-        'Waveform bars: ${waveform.length}',
-      );
-      debugPrint(
-        'Frozen: $frozen',
-      );
-      debugPrint(
-        '==========================================',
-      );
+      debugPrint('==========================================');
+      debugPrint('ChattªX VOICE RECORDING COMPLETE');
+      debugPrint('Duration: ${actualDuration}s');
+      debugPrint('Raw samples: ${_rawAmplitudes.length}');
+      debugPrint('Waveform bars: ${waveform.length}');
+      debugPrint('Frozen: $frozen');
+      debugPrint('==========================================');
     } catch (e) {
-      debugPrint(
-        'ChattªX stop recording error: $e',
-      );
+      debugPrint('ChattªX stop recording error: $e');
     }
   }
 
@@ -405,94 +365,109 @@ class _VoiceRecorderState extends State<VoiceRecorder>
   // ============================================================
 
   List<double> _compressWaveform(
-    List<double> samples,
-    int targetBars,
-  ) {
-    if (samples.isEmpty) {
-      return List<double>.filled(
-        targetBars,
-        0.0,
-      );
-    }
-
-    final result = <double>[];
-
-    for (int bar = 0; bar < targetBars; bar++) {
-      final start = ((bar / targetBars) * samples.length)
-          .floor();
-
-      final end = (((bar + 1) / targetBars) *
-              samples.length)
-          .ceil();
-
-      final safeStart =
-          start.clamp(0, samples.length - 1);
-
-      final safeEnd = end.clamp(
-        safeStart + 1,
-        samples.length,
-      );
-
-      final section = samples.sublist(
-        safeStart,
-        safeEnd,
-      );
-
-      if (section.isEmpty) {
-        result.add(0.0);
-        continue;
-      }
-
-      // --------------------------------------------------------
-      // RMS
-      // --------------------------------------------------------
-
-      double sumSquares = 0.0;
-
-      for (final value in section) {
-        sumSquares += value * value;
-      }
-
-      final rms = math.sqrt(
-        sumSquares / section.length,
-      );
-
-      // --------------------------------------------------------
-      // PEAK
-      // --------------------------------------------------------
-
-      double peak = 0.0;
-
-      for (final value in section) {
-        if (value > peak) {
-          peak = value;
-        }
-      }
-
-      // --------------------------------------------------------
-      // COMBINE RMS + PEAK
-      // --------------------------------------------------------
-
-      double value =
-          (rms * 0.72) +
-          (peak * 0.28);
-
-      // --------------------------------------------------------
-      // INTENTIONAL SILENCE
-      // --------------------------------------------------------
-
-      if (value < 0.055) {
-        value = 0.0;
-      }
-
-      result.add(
-        value.clamp(0.0, 1.0),
-      );
-    }
-
-    return result;
+  List<double> samples,
+  int targetBars,
+) {
+  if (samples.isEmpty) {
+    return List<double>.filled(targetBars, 0.0);
   }
 
+  final result = <double>[];
+
+  for (int bar = 0; bar < targetBars; bar++) {
+    final start =
+        ((bar / targetBars) * samples.length).floor();
+
+    final end =
+        (((bar + 1) / targetBars) * samples.length).ceil();
+
+    final safeStart =
+        start.clamp(0, samples.length - 1);
+
+    final safeEnd =
+        end.clamp(safeStart + 1, samples.length);
+
+    final section =
+        samples.sublist(safeStart, safeEnd);
+
+    if (section.isEmpty) {
+      result.add(0.0);
+      continue;
+    }
+
+    // ------------------------------------------------------------
+    // REAL SECTION AMPLITUDE
+    // ------------------------------------------------------------
+
+    double peak = 0.0;
+
+    for (final value in section) {
+      if (value > peak) {
+        peak = value;
+      }
+    }
+
+    // ------------------------------------------------------------
+    // RMS
+    // ------------------------------------------------------------
+
+    double sumSquares = 0.0;
+
+    for (final value in section) {
+      sumSquares += value * value;
+    }
+
+    final rms =
+        math.sqrt(sumSquares / section.length);
+
+    // ------------------------------------------------------------
+    // Combine RMS + PEAK
+    //
+    // RMS controls the overall loudness.
+    // Peak preserves real speech spikes.
+    // ------------------------------------------------------------
+
+    double value =
+        (rms * 0.82) +
+        (peak * 0.18);
+
+    // ------------------------------------------------------------
+    // IMPORTANT:
+    // Preserve REAL SILENCE.
+    //
+    // Previously quiet sections could become large because
+    // the RMS/peak combination was too forgiving.
+    // ------------------------------------------------------------
+
+    if (peak < 0.075) {
+      value = 0.0;
+    }
+
+    // Very quiet speech/noise should stay small.
+    if (value < 0.10) {
+      value *= 0.35;
+    }
+
+    // ------------------------------------------------------------
+    // Gentle contrast.
+    //
+    // Do NOT aggressively boost quiet audio.
+    // ------------------------------------------------------------
+
+    if (value > 0.0) {
+      value = math.pow(
+        value,
+        1.12,
+      ).toDouble();
+    }
+
+    result.add(
+      value.clamp(0.0, 1.0),
+    );
+  }
+
+  return result;
+}
   // ============================================================
   // CANCEL
   // ============================================================
@@ -500,6 +475,7 @@ class _VoiceRecorderState extends State<VoiceRecorder>
   Future<void> cancelRecording() async {
     try {
       amplitudeTimer?.cancel();
+      durationTimer?.cancel();
 
       _recordingStopwatch.stop();
 
@@ -515,29 +491,14 @@ class _VoiceRecorderState extends State<VoiceRecorder>
 
   // ============================================================
   // FREEZE STATE
+  //
+  // The actual frozen-message interaction will happen inside
+  // MessageBubble. This state exists so the recorder is already
+  // prepared for voice-note freezing without changing the audio.
+  //
+  // Freezing a voice note does NOT alter the audio file, waveform,
+  // or duration — MessageBubble simply stores/uses `isFrozen`.
   // ============================================================
-
-  /*
-   * The actual frozen-message interaction will happen inside
-   * MessageBubble.
-   *
-   * This state exists so the recorder is already prepared for
-   * voice-note freezing without changing the audio itself.
-   *
-   * IMPORTANT:
-   *
-   * Freezing a voice note does NOT alter:
-   *
-   *   - audio file
-   *   - waveform
-   *   - duration
-   *
-   * MessageBubble will simply store/use:
-   *
-   *   isFrozen
-   *
-   * for the voice message.
-   */
 
   void toggleFreeze() {
     if (!preview) return;
@@ -557,17 +518,11 @@ class _VoiceRecorderState extends State<VoiceRecorder>
       return;
     }
 
-    if (recordedPath == null) {
-      return;
-    }
+    if (recordedPath == null) return;
 
     final duration = _durationSeconds;
 
-    /*
-     * The exact waveform belonging to this recording
-     * is sent with it.
-     */
-
+    // The exact waveform belonging to this recording is sent with it.
     widget.onSend(
       recordedPath!,
       duration,
@@ -576,161 +531,60 @@ class _VoiceRecorderState extends State<VoiceRecorder>
   }
 
   // ============================================================
-  // LIVE WAVEFORM
+  // LIVE SAMPLE WINDOW
+  //
+  // Returns however many samples fit the given bar count, padding
+  // the front with silence so bars fill in from the left like
+  // WhatsApp does while you're recording.
   // ============================================================
 
-  Widget _buildLiveWaveform() {
-    const int visibleBars = 24;
+  List<double> _lastNSamples(int n) {
+    if (n <= 0) return const [];
 
-    final List<double> visibleSamples =
-        _rawAmplitudes.length > visibleBars
-            ? _rawAmplitudes.sublist(
-                _rawAmplitudes.length - visibleBars,
-              )
-            : List<double>.from(
-                _rawAmplitudes,
-              );
-
-    final List<double> bars =
-        List<double>.filled(
-      visibleBars,
-      0.0,
-    );
-
-    final offset =
-        visibleBars - visibleSamples.length;
-
-    for (int i = 0;
-        i < visibleSamples.length;
-        i++) {
-      bars[offset + i] =
-          visibleSamples[i];
+    if (_rawAmplitudes.length >= n) {
+      return _rawAmplitudes.sublist(_rawAmplitudes.length - n);
     }
 
-    return Row(
-      mainAxisAlignment:
-          MainAxisAlignment.center,
-      crossAxisAlignment:
-          CrossAxisAlignment.center,
-      children: List.generate(
-        bars.length,
-        (index) {
-          final amplitude =
-              bars[index];
-
-          final height =
-              amplitude <= 0.01
-                  ? 2.0
-                  : 5.0 +
-                      (amplitude * 38.0);
-
-          return AnimatedContainer(
-            duration:
-                const Duration(
-              milliseconds: 90,
-            ),
-            margin:
-                const EdgeInsets.symmetric(
-              horizontal: 1.5,
-            ),
-            width: 3,
-            height: height,
-            decoration:
-                BoxDecoration(
-              gradient:
-                  const LinearGradient(
-                begin:
-                    Alignment.topCenter,
-                end:
-                    Alignment.bottomCenter,
-                colors: [
-                  Color(0xFFB026FF),
-                  Color(0xFF00E5FF),
-                ],
-              ),
-              borderRadius:
-                  BorderRadius.circular(
-                10,
-              ),
-              boxShadow:
-                  amplitude > 0.55
-                      ? const [
-                          BoxShadow(
-                            color:
-                                Color(0x5500E5FF),
-                            blurRadius: 7,
-                          ),
-                        ]
-                      : null,
-            ),
-          );
-        },
-      ),
-    );
+    return [
+      ...List<double>.filled(n - _rawAmplitudes.length, 0.0),
+      ..._rawAmplitudes,
+    ];
   }
 
   // ============================================================
-  // PREVIEW WAVEFORM
+  // WAVEFORM AREA (overflow-proof: sized from real constraints)
   // ============================================================
 
-  Widget _buildPreviewWaveform() {
-    if (waveform.isEmpty) {
-      return const SizedBox(
-        height: 45,
-      );
-    }
+  Widget _buildWaveformArea() {
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final double width = constraints.maxWidth;
+        if (width <= 0) return const SizedBox.shrink();
 
-    return Row(
-      mainAxisAlignment:
-          MainAxisAlignment.center,
-      crossAxisAlignment:
-          CrossAxisAlignment.center,
-      children: waveform.map(
-        (amplitude) {
-          final height =
-              amplitude <= 0.01
-                  ? 2.0
-                  : 5.0 +
-                      (amplitude * 38.0);
-
-          return Container(
-            margin:
-                const EdgeInsets.symmetric(
-              horizontal: 1.5,
-            ),
-            width: 3,
-            height: height,
-            decoration:
-                BoxDecoration(
-              gradient:
-                  const LinearGradient(
-                begin:
-                    Alignment.topCenter,
-                end:
-                    Alignment.bottomCenter,
-                colors: [
-                  Color(0xFFB026FF),
-                  Color(0xFF00E5FF),
-                ],
-              ),
-              borderRadius:
-                  BorderRadius.circular(
-                10,
-              ),
-              boxShadow:
-                  amplitude > 0.55
-                      ? const [
-                          BoxShadow(
-                            color:
-                                Color(0x4400E5FF),
-                            blurRadius: 6,
-                          ),
-                        ]
-                      : null,
+        if (preview) {
+          // Show the FULL recording's waveform, scaled to fit exactly.
+          return CustomPaint(
+            size: Size(width, 44),
+            painter: _WaveformPainter(
+              amplitudes: waveform.isEmpty
+                  ? List<double>.filled(waveformBars, 0.0)
+                  : waveform,
             ),
           );
-        },
-      ).toList(),
+        }
+
+        // Live: pick however many bars comfortably fit this width.
+        const double targetSpacing = 6.0;
+        final int barCount =
+            math.max(10, (width / targetSpacing).floor());
+
+        return CustomPaint(
+          size: Size(width, 44),
+          painter: _WaveformPainter(
+            amplitudes: _lastNSamples(barCount),
+          ),
+        );
+      },
     );
   }
 
@@ -741,7 +595,6 @@ class _VoiceRecorderState extends State<VoiceRecorder>
   String _formatSeconds(int value) {
     final minutes = value ~/ 60;
     final seconds = value % 60;
-
     return '$minutes:${seconds.toString().padLeft(2, '0')}';
   }
 
@@ -751,45 +604,43 @@ class _VoiceRecorderState extends State<VoiceRecorder>
 
   @override
   Widget build(BuildContext context) {
-    final duration =
-        _formatSeconds(_durationSeconds);
+    final duration = _formatSeconds(_durationSeconds);
+    final bool showRecDot = recording && !paused;
 
     return Container(
-      height: 78,
-      padding:
-          const EdgeInsets.symmetric(
-        horizontal: 8,
-      ),
-      decoration:
-          const BoxDecoration(
-        color: Color(0xFF0D0D18),
+      height: 68,
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
+      decoration: BoxDecoration(
+        color: _bgColor,
+        borderRadius: BorderRadius.circular(999),
+        border: Border.all(
+          color: _borderColor.withValues(alpha: .35),
+          width: 1.2,
+        ),
+        boxShadow: [
+          BoxShadow(
+            color: _purple.withValues(alpha: .18),
+            blurRadius: 22,
+            spreadRadius: 1,
+          ),
+        ],
       ),
       child: Row(
+        mainAxisSize: MainAxisSize.max,
+        crossAxisAlignment: CrossAxisAlignment.center,
         children: [
           // ======================================================
           // DELETE
           // ======================================================
-
           GestureDetector(
             onTap: cancelRecording,
             child: Container(
               width: 42,
               height: 42,
-              decoration:
-                  BoxDecoration(
+              decoration: BoxDecoration(
                 shape: BoxShape.circle,
-                color: const Color(
-                  0xFFFF496C,
-                ).withValues(
-                  alpha: .10,
-                ),
-                border: Border.all(
-                  color: const Color(
-                    0xFFFF496C,
-                  ).withValues(
-                    alpha: .35,
-                  ),
-                ),
+                color: _red.withValues(alpha: .10),
+                border: Border.all(color: _red.withValues(alpha: .35)),
               ),
               child: const Icon(
                 Icons.delete_outline_rounded,
@@ -799,200 +650,143 @@ class _VoiceRecorderState extends State<VoiceRecorder>
             ),
           ),
 
-          const SizedBox(width: 7),
+          const SizedBox(width: 8),
 
           // ======================================================
-          // WAVEFORM
+          // WAVEFORM (flexible, never overflows)
           // ======================================================
+          Expanded(child: _buildWaveformArea()),
 
-          Expanded(
-            child: preview
-                ? _buildPreviewWaveform()
-                : _buildLiveWaveform(),
-          ),
-
-          const SizedBox(width: 5),
+          const SizedBox(width: 8),
 
           // ======================================================
-          // DURATION
+          // REC DOT + DURATION
           // ======================================================
+          if (showRecDot) ...[
+            AnimatedBuilder(
+              animation: pulseController,
+              builder: (context, _) {
+                final opacity = 0.35 + (pulseController.value * 0.65);
+                return Container(
+                  width: 7,
+                  height: 7,
+                  margin: const EdgeInsets.only(right: 5),
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    color: _red.withValues(alpha: opacity),
+                    boxShadow: [
+                      BoxShadow(
+                        color: _red.withValues(alpha: opacity * .6),
+                        blurRadius: 6,
+                      ),
+                    ],
+                  ),
+                );
+              },
+            ),
+          ],
 
           Text(
             duration,
-            style:
-                const TextStyle(
+            style: const TextStyle(
               color: Colors.white,
               fontSize: 12,
-              fontWeight:
-                  FontWeight.w700,
+              fontWeight: FontWeight.w700,
             ),
           ),
 
-          const SizedBox(width: 3),
+          const SizedBox(width: 6),
 
           // ======================================================
           // PAUSE / RESUME
           // ======================================================
-
           if (!preview)
             GestureDetector(
               onTap: pauseRecording,
               child: Container(
                 width: 40,
                 height: 40,
-                decoration:
-                    BoxDecoration(
+                decoration: BoxDecoration(
                   shape: BoxShape.circle,
-                  color:
-                      const Color(
-                    0xFF00E5FF,
-                  ).withValues(
-                    alpha: .08,
-                  ),
-                  border:
-                      Border.all(
-                    color:
-                        const Color(
-                      0xFF00E5FF,
-                    ).withValues(
-                      alpha: .30,
-                    ),
-                  ),
+                  color: _cyan.withValues(alpha: .08),
+                  border: Border.all(color: _cyan.withValues(alpha: .30)),
                 ),
                 child: Icon(
-                  paused
-                      ? Icons
-                          .play_arrow_rounded
-                      : Icons
-                          .pause_rounded,
-                  color:
-                      const Color(
-                    0xFF00E5FF,
-                  ),
+                  paused ? Icons.play_arrow_rounded : Icons.pause_rounded,
+                  color: _cyan,
                   size: 21,
                 ),
               ),
             ),
 
           // ======================================================
-          // FREEZE
+          // FREEZE (preview only)
           //
-          // Available in preview.
-          //
-          // The actual frozen voice-note behavior will be handled
-          // by MessageBubble after the message is sent.
+          // The actual frozen voice-note behavior is handled by
+          // MessageBubble after the message is sent.
           // ======================================================
-
           if (preview) ...[
-            const SizedBox(width: 5),
-
+            const SizedBox(width: 6),
             GestureDetector(
               onTap: toggleFreeze,
               child: AnimatedContainer(
-                duration:
-                    const Duration(
-                  milliseconds: 180,
-                ),
+                duration: const Duration(milliseconds: 180),
                 width: 40,
                 height: 40,
-                decoration:
-                    BoxDecoration(
+                decoration: BoxDecoration(
                   shape: BoxShape.circle,
                   color: frozen
-                      ? const Color(
-                          0xFF00E5FF,
-                        ).withValues(
-                          alpha: .16,
-                        )
-                      : const Color(
-                          0xFFB026FF,
-                        ).withValues(
-                          alpha: .10,
-                        ),
-                  border:
-                      Border.all(
+                      ? _cyan.withValues(alpha: .16)
+                      : _purple.withValues(alpha: .10),
+                  border: Border.all(
                     color: frozen
-                        ? const Color(
-                            0xFF00E5FF,
-                          )
-                        : const Color(
-                            0xFFB026FF,
-                          ).withValues(
-                            alpha: .45,
-                          ),
+                        ? _cyan
+                        : _purple.withValues(alpha: .45),
                   ),
                   boxShadow: frozen
-                      ? const [
+                      ? [
                           BoxShadow(
-                            color:
-                                Color(
-                              0x4400E5FF,
-                            ),
+                            color: _cyan.withValues(alpha: .27),
                             blurRadius: 10,
                           ),
                         ]
                       : null,
                 ),
                 child: Icon(
-                  frozen
-                      ? Icons.lock_rounded
-                      : Icons.ac_unit_rounded,
-                  color: frozen
-                      ? const Color(
-                          0xFF00E5FF,
-                        )
-                      : const Color(
-                          0xFFC78CFF,
-                        ),
+                  frozen ? Icons.lock_rounded : Icons.ac_unit_rounded,
+                  color: frozen ? _cyan : const Color(0xFFC78CFF),
                   size: 19,
                 ),
               ),
             ),
           ],
 
-          const SizedBox(width: 5),
+          const SizedBox(width: 6),
 
           // ======================================================
           // STOP / SEND
           // ======================================================
-
           GestureDetector(
             onTap: sendRecording,
             child: Container(
               width: 44,
               height: 44,
-              decoration:
-                  BoxDecoration(
+              decoration: BoxDecoration(
                 shape: BoxShape.circle,
-                gradient:
-                    const LinearGradient(
-                  begin:
-                      Alignment.topLeft,
-                  end:
-                      Alignment.bottomRight,
-                  colors: [
-                    Color(0xFFB026FF),
-                    Color(0xFF6C2BFF),
-                  ],
+                gradient: const LinearGradient(
+                  begin: Alignment.topLeft,
+                  end: Alignment.bottomRight,
+                  colors: [_purple, _deepPurple],
                 ),
                 boxShadow: [
                   BoxShadow(
-                    color:
-                        const Color(
-                      0xFFB026FF,
-                    ).withValues(
-                      alpha: .30,
-                    ),
+                    color: _purple.withValues(alpha: .30),
                     blurRadius: 13,
                   ),
                 ],
               ),
               child: Icon(
-                preview
-                    ? Icons
-                        .send_rounded
-                    : Icons
-                        .stop_rounded,
+                preview ? Icons.send_rounded : Icons.stop_rounded,
                 color: Colors.white,
                 size: 21,
               ),
@@ -1010,6 +804,7 @@ class _VoiceRecorderState extends State<VoiceRecorder>
   @override
   void dispose() {
     amplitudeTimer?.cancel();
+    durationTimer?.cancel();
 
     _recordingStopwatch.stop();
 
@@ -1018,5 +813,203 @@ class _VoiceRecorderState extends State<VoiceRecorder>
     recorder.dispose();
 
     super.dispose();
+  }
+}
+
+// ============================================================
+// WAVEFORM PAINTER
+//
+// Renders bars sized purely from the given canvas Size — this is
+// the piece that makes overflow structurally impossible: bar width
+// and gap are always derived from the real available width, never
+// from a fixed pixel value.
+// ============================================================
+
+class _WaveformPainter extends CustomPainter {
+  final List<double> amplitudes;
+
+  const _WaveformPainter({
+    required this.amplitudes,
+  });
+
+  static const List<Color> _gradientColors = [
+    Color(0xFFFF2D95),
+    Color(0xFFB026FF),
+    Color(0xFF00E5FF),
+  ];
+
+  @override
+  void paint(
+    Canvas canvas,
+    Size size,
+  ) {
+    if (amplitudes.isEmpty ||
+        size.width <= 0 ||
+        size.height <= 0) {
+      return;
+    }
+
+    final int barCount = amplitudes.length;
+
+    // ------------------------------------------------------------
+    // SPACING
+    //
+    // The important change:
+    // bars are now much thinner than their available slot.
+    //
+    // This creates visible space between every waveform line.
+    // ------------------------------------------------------------
+
+    final double slot =
+        size.width / barCount;
+
+    final double barWidth =
+        math.min(
+          1.8,
+          slot * 0.28,
+        );
+
+    final double centerY =
+        size.height / 2;
+
+    // ------------------------------------------------------------
+    // FULL WIDTH GRADIENT
+    // ------------------------------------------------------------
+
+    final shader =
+        const LinearGradient(
+      begin: Alignment.centerLeft,
+      end: Alignment.centerRight,
+      colors: _gradientColors,
+    ).createShader(
+      Rect.fromLTWH(
+        0,
+        0,
+        size.width,
+        size.height,
+      ),
+    );
+
+    // ------------------------------------------------------------
+    // MAIN BAR
+    // ------------------------------------------------------------
+
+    final barPaint = Paint()
+      ..shader = shader
+      ..style = PaintingStyle.fill;
+
+    // ------------------------------------------------------------
+    // SOFT GLOW
+    // ------------------------------------------------------------
+
+    final glowPaint = Paint()
+      ..shader = shader
+      ..style = PaintingStyle.fill
+      ..maskFilter = const MaskFilter.blur(
+        BlurStyle.normal,
+        4,
+      );
+
+    // ------------------------------------------------------------
+    // DRAW EVERY REAL SAMPLE
+    // ------------------------------------------------------------
+
+    for (int i = 0; i < barCount; i++) {
+      final double amp =
+          amplitudes[i]
+              .clamp(0.0, 1.0)
+              .toDouble();
+
+      // ----------------------------------------------------------
+      // TRUE SILENCE
+      //
+      // Silence should look like a tiny line, NOT a big bar.
+      // ----------------------------------------------------------
+
+      double barHeight;
+
+      if (amp <= 0.015) {
+        barHeight = 1.5;
+      } else if (amp <= 0.05) {
+        barHeight = 2.5;
+      } else if (amp <= 0.10) {
+        barHeight = 4.0;
+      } else {
+        // Real amplitude controls the height.
+        barHeight =
+            3.0 +
+            (amp * (size.height - 3.0));
+      }
+
+      barHeight = barHeight.clamp(
+        1.5,
+        size.height,
+      );
+
+      // ----------------------------------------------------------
+      // CENTER BAR IN ITS SLOT
+      // ----------------------------------------------------------
+
+      final double x =
+          (i * slot) +
+          (slot / 2) -
+          (barWidth / 2);
+
+      final rect = Rect.fromLTWH(
+        x,
+        centerY - (barHeight / 2),
+        barWidth,
+        barHeight,
+      );
+
+      final rrect =
+          RRect.fromRectAndRadius(
+        rect,
+        Radius.circular(
+          barWidth,
+        ),
+      );
+
+      // ----------------------------------------------------------
+      // GLOW ONLY ON ACTUAL LOUD AUDIO
+      // ----------------------------------------------------------
+
+      if (amp > 0.45) {
+        canvas.drawRRect(
+          rrect,
+          glowPaint,
+        );
+      }
+
+      // ----------------------------------------------------------
+      // MAIN THIN LINE
+      // ----------------------------------------------------------
+
+      canvas.drawRRect(
+        rrect,
+        barPaint,
+      );
+    }
+  }
+
+  @override
+  bool shouldRepaint(
+    covariant _WaveformPainter oldDelegate,
+  ) {
+    if (oldDelegate.amplitudes.length !=
+        amplitudes.length) {
+      return true;
+    }
+
+    for (int i = 0;
+        i < amplitudes.length;
+        i++) {
+      if (oldDelegate.amplitudes[i] !=
+          amplitudes[i]) {
+        return true;
+      }
+    }
+
+    return false;
   }
 }

@@ -7,6 +7,9 @@ import 'package:just_audio/just_audio.dart';
 
 import '../../services/call_service.dart';
 import 'voice_call_screen.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
+import '../../widgets/verified_name.dart';
+import 'package:firebase_auth/firebase_auth.dart';
 
 /// ============================================================================
 /// CHATTªX — OUTGOING VOICE CALL SCREEN
@@ -14,38 +17,42 @@ import 'voice_call_screen.dart';
 ///
 /// REAL CALL FLOW
 ///
-///   OutgoingVoiceCallScreen
-///             │
-///             ▼
-///      ChattaxCallService
-///             │
-///       ┌─────┼──────────────┐
-///       ▼     ▼              ▼
-///    calling ringing      connecting
-///                              │
-///                              ▼
-///                          connected
-///                              │
-///                              ▼
-///                       VoiceCallScreen
+///   Caller
+///     │
+///     ▼
+///   calling
+///     │
+///     │  receiver acknowledges
+///     ▼
+///   ringing
+///     │
+///     │  receiver answers
+///     ▼
+///   connecting
+///     │
+///     │  WebRTC actually connects
+///     ▼
+///   connected
+///     │
+///     ▼
+///   VoiceCallScreen
 ///
-/// This screen does NOT connect using a timer.
+/// IMPORTANT:
+/// This screen NEVER assumes that the call is connected based on a timer.
 /// ChattaxCallService remains the source of truth.
 ///
-/// RINGTONE:
-/// assets/audio/outgoing_ringtone.mp3
+/// This screen listens through:
 ///
-/// Plays:
-///   calling
-///   ringing
+/// 1. callStatusEvents
+///    - exact callId
+///    - preferred source
 ///
-/// Stops:
-///   connecting
-///   connected
-///   rejected
-///   ended
-///   failed
-///   cancelling
+/// 2. callStatusStream
+///    - compatibility/fallback
+///
+/// 3. getCall(callId)
+///    - initial Firestore synchronization
+///    - protects against missing a very fast state transition
 /// ============================================================================
 
 class OutgoingVoiceCallScreen extends StatefulWidget {
@@ -77,7 +84,11 @@ class _OutgoingVoiceCallScreenState
   final ChattaxCallService _callService =
       ChattaxCallService.instance;
 
+  /// Compatibility status listener.
   StreamSubscription<ChattaxCallStatus>? _statusSubscription;
+
+  /// Preferred exact-call listener.
+  StreamSubscription<ChattaxCallStatusEvent>? _statusEventSubscription;
 
   String? _activeCallId;
 
@@ -101,11 +112,14 @@ class _OutgoingVoiceCallScreenState
 
   bool _isCancelling = false;
   bool _hasFinished = false;
+
+  /// Prevents VoiceCallScreen from being pushed more than once.
   bool _hasOpenedConnectedScreen = false;
 
-  // Prevent multiple finish operations from
-  // competing with each other.
+  /// Prevents competing finish operations.
   bool _isFinishing = false;
+
+  bool _isVerified = false;
 
   // ==========================================================================
   // ANIMATIONS
@@ -124,15 +138,24 @@ class _OutgoingVoiceCallScreenState
   void initState() {
     super.initState();
 
-    _activeCallId = widget.callId;
+   _activeCallId = widget.callId?.trim().isNotEmpty == true
+    ? widget.callId!.trim()
+    : _callService.activeCallId;
 
     _initializeAnimations();
-    _setSystemUi();
+_setSystemUi();
 
-    // Prepare ringtone immediately.
-    unawaited(_prepareOutgoingRingtone());
+// Load the real ChattªX verification status.
+unawaited(
+  _loadVerificationStatus(),
+);
 
-    // Start listening to the real call service.
+// Prepare ringtone.
+unawaited(
+  _prepareOutgoingRingtone(),
+);
+
+    // Listen for the real call state.
     _listenForCallStatus();
   }
 
@@ -186,7 +209,8 @@ class _OutgoingVoiceCallScreenState
 
       if (!mounted ||
           _hasFinished ||
-          _isCancelling) {
+          _isCancelling ||
+          _isFinishing) {
         return;
       }
 
@@ -213,7 +237,8 @@ class _OutgoingVoiceCallScreenState
     if (!_ringtoneReady ||
         _ringtoneStarting ||
         _hasFinished ||
-        _isCancelling) {
+        _isCancelling ||
+        _isFinishing) {
       return;
     }
 
@@ -266,13 +291,20 @@ class _OutgoingVoiceCallScreenState
   }
 
   // ==========================================================================
-  // CALL STATUS
+  // CALL STATUS LISTENERS
   // ==========================================================================
 
   void _listenForCallStatus() {
-    _statusSubscription =
-        _callService.callStatusStream.listen(
-      (status) {
+    // ------------------------------------------------------------------------
+    // EXACT CALL EVENT LISTENER
+    // ------------------------------------------------------------------------
+    //
+    // This is the primary listener because every event carries its callId.
+    //
+
+    _statusEventSubscription =
+        _callService.callStatusEvents.listen(
+      (event) {
         if (!mounted ||
             _hasFinished ||
             _isCancelling ||
@@ -281,39 +313,203 @@ class _OutgoingVoiceCallScreenState
           return;
         }
 
-        // Ignore duplicate states.
-        if (_status == status) {
+        final String? activeId = _activeCallId;
+
+        if (activeId == null ||
+            activeId.isEmpty) {
+          debugPrint(
+            'ChattªX outgoing call event ignored: '
+            'missing active callId',
+          );
           return;
         }
 
-        setState(() {
-          _status = status;
-        });
+        // Never react to another call's status.
+        if (event.callId != activeId) {
+          return;
+        }
+
+        debugPrint(
+          'ChattªX outgoing call event: '
+          '$activeId → ${event.status}',
+        );
 
         unawaited(
-          _handleStatusChange(status),
+          _applyCallStatus(event.status),
         );
       },
       onError: (Object error) {
         debugPrint(
-          'ChattªX call status error: $error',
-        );
-
-        if (!mounted ||
-            _hasFinished ||
-            _isCancelling ||
-            _isFinishing) {
-          return;
-        }
-
-        unawaited(
-          _finishCall(
-            'Call connection failed',
-          ),
+          'ChattªX outgoing call event error: $error',
         );
       },
     );
+
+    // ------------------------------------------------------------------------
+    // GENERIC STATUS LISTENER
+    // ------------------------------------------------------------------------
+    //
+    // Kept as a fallback because the service exposes callStatusStream.
+    //
+
+    _statusSubscription =
+    _callService.callStatusStream.listen(
+  (status) {
+    if (!mounted ||
+        _hasFinished ||
+        _isCancelling ||
+        _isFinishing ||
+        _hasOpenedConnectedScreen) {
+      return;
+    }
+
+    final String? activeId = _activeCallId;
+    final String? serviceCallId =
+        _callService.activeCallId;
+
+    if (activeId == null ||
+        activeId.isEmpty ||
+        serviceCallId == null ||
+        serviceCallId != activeId) {
+      return;
+    }
+
+    debugPrint(
+      'ChattªX outgoing generic status: $status',
+    );
+
+    unawaited(
+      _applyCallStatus(status),
+    );
+  },
+  onError: (Object error) {
+    debugPrint(
+      'ChattªX outgoing call status error: $error',
+    );
+  },
+);
+
+    // ------------------------------------------------------------------------
+    // FIRESTORE SYNCHRONIZATION
+    // ------------------------------------------------------------------------
+    //
+    // This is important.
+    //
+    // If the receiver answers extremely quickly and the service reaches
+    // connected before this widget processes its stream event, getCall()
+    // catches the current Firestore state.
+    //
+
+    unawaited(
+      _synchronizeCurrentCall(),
+    );
   }
+
+  // ==========================================================================
+  // INITIAL CALL SYNCHRONIZATION
+  // ==========================================================================
+
+  Future<void> _synchronizeCurrentCall() async {
+    final String? callId = _activeCallId;
+
+    if (callId == null ||
+        callId.isEmpty ||
+        _hasFinished ||
+        _isCancelling ||
+        _isFinishing ||
+        _hasOpenedConnectedScreen) {
+      debugPrint(
+        'ChattªX cannot synchronize outgoing call: '
+        'missing callId',
+      );
+      return;
+    }
+
+    try {
+      final call =
+          await _callService.getCall(callId);
+
+      if (!mounted ||
+          _hasFinished ||
+          _isCancelling ||
+          _isFinishing ||
+          _hasOpenedConnectedScreen) {
+        return;
+      }
+
+      if (call == null) {
+        debugPrint(
+          'ChattªX outgoing call not found: $callId',
+        );
+        return;
+      }
+
+      debugPrint(
+        'ChattªX outgoing call synchronized: '
+        '$callId → ${call.status}',
+      );
+
+      await _applyCallStatus(
+        call.status,
+      );
+    } catch (error) {
+      debugPrint(
+        'ChattªX outgoing call synchronization error: '
+        '$error',
+      );
+    }
+  }
+
+  // ==========================================================================
+  // APPLY STATUS
+  // ==========================================================================
+
+  Future<void> _applyCallStatus(
+    ChattaxCallStatus status,
+  ) async {
+    if (!mounted ||
+        _hasFinished ||
+        _isCancelling ||
+        _isFinishing ||
+        _hasOpenedConnectedScreen) {
+      return;
+    }
+    // ========================================================================
+// IMPORTANT STATE PROTECTION
+// ========================================================================
+// Prevent stale/late Firestore or stream events from moving the call
+// backwards after it has already progressed.
+
+if (_status == ChattaxCallStatus.connecting &&
+    (status == ChattaxCallStatus.calling ||
+     status == ChattaxCallStatus.ringing)) {
+  return;
+}
+
+if (_status == ChattaxCallStatus.ringing &&
+    status == ChattaxCallStatus.calling) {
+  return;
+}
+
+if (_status == ChattaxCallStatus.connected &&
+    status != ChattaxCallStatus.connected) {
+  return;
+}
+
+    if (_status != status) {
+      setState(() {
+        _status = status;
+      });
+    }
+
+    await _handleStatusChange(
+      status,
+    );
+  }
+
+  // ==========================================================================
+  // HANDLE STATUS
+  // ==========================================================================
 
   Future<void> _handleStatusChange(
     ChattaxCallStatus status,
@@ -368,10 +564,22 @@ class _OutgoingVoiceCallScreenState
       // ======================================================================
 
       case ChattaxCallStatus.connecting:
-        HapticFeedback.selectionClick();
+  HapticFeedback.selectionClick();
 
-        await _stopOutgoingRingtone();
-        break;
+  unawaited(_stopOutgoingRingtone());
+
+  if (!mounted ||
+      _hasFinished ||
+      _isCancelling ||
+      _isFinishing ||
+      _hasOpenedConnectedScreen) {
+    return;
+  }
+
+  // The receiver has answered.
+  // Move immediately into the real active call screen.
+  _openConnectedCall();
+  break;
 
       // ======================================================================
       // CONNECTED
@@ -385,7 +593,8 @@ class _OutgoingVoiceCallScreenState
         if (!mounted ||
             _hasFinished ||
             _isCancelling ||
-            _isFinishing) {
+            _isFinishing ||
+            _hasOpenedConnectedScreen) {
           return;
         }
 
@@ -431,11 +640,58 @@ class _OutgoingVoiceCallScreenState
   }
 
   // ==========================================================================
+// LOAD VERIFICATION STATUS
+// ==========================================================================
+
+Future<void> _loadVerificationStatus() async {
+  try {
+    final String name = widget.callerName.trim();
+
+    if (name.isEmpty) {
+      return;
+    }
+
+    // We first try to find the user by the same profile data
+    // used by the calling screen.
+    final QuerySnapshot<Map<String, dynamic>> snapshot =
+        await FirebaseFirestore.instance
+            .collection('users')
+            .where('displayName', isEqualTo: name)
+            .limit(1)
+            .get();
+
+    if (!mounted || snapshot.docs.isEmpty) {
+      return;
+    }
+
+    final Map<String, dynamic> data =
+        snapshot.docs.first.data();
+
+    final bool verified =
+        data['verified'] == true ||
+        data['isVerified'] == true;
+
+    if (!mounted) {
+      return;
+    }
+
+    setState(() {
+      _isVerified = verified;
+    });
+  } catch (error) {
+    debugPrint(
+      'ChattªX verification status error: $error',
+    );
+  }
+}
+
+  // ==========================================================================
   // DISPLAY NAME
   // ==========================================================================
 
   String _displayName() {
-    final name = widget.callerName.trim();
+    final String name =
+        widget.callerName.trim();
 
     if (name.isEmpty) {
       return 'Unknown user';
@@ -445,7 +701,7 @@ class _OutgoingVoiceCallScreenState
   }
 
   // ==========================================================================
-  // CONNECTED CALL
+  // OPEN CONNECTED CALL
   // ==========================================================================
 
   void _openConnectedCall() {
@@ -457,14 +713,65 @@ class _OutgoingVoiceCallScreenState
       return;
     }
 
+    final String? callId = _activeCallId;
+
+    // ------------------------------------------------------------------------
+    // Never open VoiceCallScreen without the actual callId.
+    // ------------------------------------------------------------------------
+
+    if (callId == null ||
+        callId.isEmpty) {
+      debugPrint(
+        'ChattªX cannot open VoiceCallScreen: '
+        'missing callId',
+      );
+
+      unawaited(
+        _finishCall(
+          'Call ID is missing',
+        ),
+      );
+
+      return;
+    }
+
+    // ------------------------------------------------------------------------
+    // Lock navigation BEFORE pushing.
+    // ------------------------------------------------------------------------
+
     _hasOpenedConnectedScreen = true;
 
-    // Stop listening before replacing this route.
+    // ------------------------------------------------------------------------
+    // Stop both listeners.
+    // ------------------------------------------------------------------------
+
     unawaited(
       _statusSubscription?.cancel(),
     );
 
+    unawaited(
+      _statusEventSubscription?.cancel(),
+    );
+
     _statusSubscription = null;
+    _statusEventSubscription = null;
+
+    // ------------------------------------------------------------------------
+    // Make absolutely sure outgoing ringtone is stopped.
+    // ------------------------------------------------------------------------
+
+    unawaited(
+      _stopOutgoingRingtone(),
+    );
+
+    debugPrint(
+  'ChattªX opening VoiceCallScreen '
+  'for active call: $callId',
+);
+
+    // ------------------------------------------------------------------------
+    // Replace outgoing screen with the real active call screen.
+    // ------------------------------------------------------------------------
 
     Navigator.of(context).pushReplacement(
       PageRouteBuilder(
@@ -481,7 +788,7 @@ class _OutgoingVoiceCallScreenState
             callerName: _displayName(),
             profileImageUrl:
                 widget.profileImageUrl,
-            callId: _activeCallId,
+            callId: callId,
           );
         },
         transitionsBuilder: (
@@ -490,7 +797,8 @@ class _OutgoingVoiceCallScreenState
           secondaryAnimation,
           child,
         ) {
-          final curved = CurvedAnimation(
+          final CurvedAnimation curved =
+              CurvedAnimation(
             parent: animation,
             curve: Curves.easeOutCubic,
           );
@@ -511,7 +819,8 @@ class _OutgoingVoiceCallScreenState
   Future<void> _cancelCall() async {
     if (_isCancelling ||
         _hasFinished ||
-        _isFinishing) {
+        _isFinishing ||
+        _hasOpenedConnectedScreen) {
       return;
     }
 
@@ -525,20 +834,23 @@ class _OutgoingVoiceCallScreenState
 
     HapticFeedback.mediumImpact();
 
-    // Immediately stop the ringtone.
+    // Immediately stop ringtone.
     await _stopOutgoingRingtone();
 
     try {
-      // Cancel the real call through the service.
-      //
-      // The service remains responsible for changing
-      // Firestore state.
+      // ----------------------------------------------------------------------
+      // Let the service update Firestore and clean up WebRTC.
+      // ----------------------------------------------------------------------
+
       await _callService.cancelCall();
 
       _hasFinished = true;
 
       await _statusSubscription?.cancel();
+      await _statusEventSubscription?.cancel();
+
       _statusSubscription = null;
+      _statusEventSubscription = null;
 
       widget.onCancel?.call();
 
@@ -560,8 +872,6 @@ class _OutgoingVoiceCallScreenState
         _isCancelling = false;
       });
 
-      // Only restart if the call is still in a
-      // state where ringing should continue.
       if (_shouldPlayRingtone(_status)) {
         await _startOutgoingRingtone();
       }
@@ -581,7 +891,8 @@ class _OutgoingVoiceCallScreenState
   ) async {
     if (_hasFinished ||
         _isCancelling ||
-        _isFinishing) {
+        _isFinishing ||
+        _hasOpenedConnectedScreen) {
       return;
     }
 
@@ -591,7 +902,10 @@ class _OutgoingVoiceCallScreenState
     await _stopOutgoingRingtone();
 
     await _statusSubscription?.cancel();
+    await _statusEventSubscription?.cancel();
+
     _statusSubscription = null;
+    _statusEventSubscription = null;
 
     if (!mounted) {
       return;
@@ -658,19 +972,97 @@ class _OutgoingVoiceCallScreenState
   // ADD CALL
   // ==========================================================================
 
-  void _addCall() {
-    if (_isCancelling ||
-        _hasFinished ||
-        _isFinishing) {
-      return;
-    }
-
-    HapticFeedback.lightImpact();
-
-    _showSnackBar(
-      'Add participant is available after the call connects.',
-    );
+  Future<void> _addCall() async {
+  if (_isCancelling ||
+      _hasFinished ||
+      _isFinishing) {
+    return;
   }
+
+  HapticFeedback.lightImpact();
+
+  final selectedFriendIds = await _showAddCallPicker();
+
+  if (!mounted ||
+      selectedFriendIds == null ||
+      selectedFriendIds.isEmpty) {
+    return;
+  }
+
+  // We now have the real friend IDs selected by the user.
+  //
+  // Example:
+  // [
+  //   "friendUid1",
+  //   "friendUid2",
+  // ]
+  //
+  // The next step is passing these IDs into ChattaxCallService
+  // for the actual multi-person call.
+
+try {
+  await _callService.addParticipantsToCall(
+    selectedFriendIds,
+  );
+
+  if (!mounted) {
+    return;
+  }
+
+  ScaffoldMessenger.of(context).showSnackBar(
+    SnackBar(
+      content: Text(
+        '${selectedFriendIds.length} '
+        '${selectedFriendIds.length == 1 ? 'person' : 'people'} '
+        'added to the call.',
+      ),
+      backgroundColor:
+          const Color(0xFF111827),
+      behavior:
+          SnackBarBehavior.floating,
+    ),
+  );
+} catch (error) {
+  if (!mounted) {
+    return;
+  }
+
+  ScaffoldMessenger.of(context).showSnackBar(
+    SnackBar(
+      content: Text(
+        error.toString().replaceFirst(
+          'Exception: ',
+          '',
+        ),
+      ),
+      backgroundColor:
+          const Color(0xFF111827),
+      behavior:
+          SnackBarBehavior.floating,
+    ),
+  );
+}
+}
+
+Future<List<String>?> _showAddCallPicker() async {
+  final currentUser = FirebaseAuth.instance.currentUser;
+
+  if (currentUser == null) {
+    return null;
+  }
+
+  return showModalBottomSheet<List<String>>(
+    context: context,
+    isScrollControlled: true,
+    backgroundColor: Colors.transparent,
+    barrierColor: Colors.black.withValues(alpha: 0.72),
+    builder: (context) {
+      return _AddCallFriendPicker(
+        currentUserId: currentUser.uid,
+      );
+    },
+  );
+}
 
   // ==========================================================================
   // MORE
@@ -679,7 +1071,8 @@ class _OutgoingVoiceCallScreenState
   void _showMore() {
     if (_isCancelling ||
         _hasFinished ||
-        _isFinishing) {
+        _isFinishing ||
+        _hasOpenedConnectedScreen) {
       return;
     }
 
@@ -884,6 +1277,9 @@ class _OutgoingVoiceCallScreenState
     _statusSubscription?.cancel();
     _statusSubscription = null;
 
+    _statusEventSubscription?.cancel();
+    _statusEventSubscription = null;
+
     unawaited(
       _stopOutgoingRingtone(),
     );
@@ -905,20 +1301,14 @@ class _OutgoingVoiceCallScreenState
   @override
   Widget build(BuildContext context) {
     return PopScope(
-      // IMPORTANT:
-      //
-      // Never allow the route to pop directly while
-      // an outgoing call is active.
-      //
-      // This guarantees Android back / system back
-      // goes through _cancelCall().
       canPop: false,
       onPopInvokedWithResult:
           (didPop, result) {
         if (didPop ||
             _isCancelling ||
             _hasFinished ||
-            _isFinishing) {
+            _isFinishing ||
+            _hasOpenedConnectedScreen) {
           return;
         }
 
@@ -1007,33 +1397,6 @@ class _OutgoingVoiceCallScreenState
                         ),
                       ),
                     ],
-                  ),
-
-                  // ==========================================================
-                  // HOME INDICATOR
-                  // ==========================================================
-
-                  Positioned(
-                    left: 0,
-                    right: 0,
-                    bottom: 7,
-                    child: IgnorePointer(
-                      child: Center(
-                        child: Container(
-                          width: 115,
-                          height: 4,
-                          decoration:
-                              BoxDecoration(
-                            color:
-                                Colors.white,
-                            borderRadius:
-                                BorderRadius.circular(
-                              20,
-                            ),
-                          ),
-                        ),
-                      ),
-                    ),
                   ),
 
                   // ==========================================================
@@ -1137,7 +1500,7 @@ class _OutgoingVoiceCallScreenState
       animation: _glowController,
       builder:
           (context, child) {
-        final value =
+        final double value =
             _glowController.value;
 
         return DecoratedBox(
@@ -1174,9 +1537,9 @@ class _OutgoingVoiceCallScreenState
   Widget _buildMainContent(
     BoxConstraints constraints,
   ) {
-    final screenHeight =
+    final double screenHeight =
         constraints.maxHeight;
-    final screenWidth =
+    final double screenWidth =
         constraints.maxWidth;
 
     final bool verySmall =
@@ -1240,16 +1603,14 @@ class _OutgoingVoiceCallScreenState
         // ====================================================================
 
         Padding(
-          padding:
-              const EdgeInsets.symmetric(
-            horizontal: 12,
-          ),
-          child:
-              _buildWaitingCard(
-            _status,
-            compact: compact,
-          ),
-        ),
+  padding: const EdgeInsets.symmetric(
+    horizontal: 4,
+  ),
+  child: _buildWaitingCard(
+    _status,
+    compact: compact,
+  ),
+),
 
         SizedBox(
           height:
@@ -1265,16 +1626,14 @@ class _OutgoingVoiceCallScreenState
         // ====================================================================
 
         Padding(
-          padding:
-              const EdgeInsets.symmetric(
-            horizontal: 6,
-          ),
-          child:
-              _buildControls(
-            compact: compact,
-            verySmall: verySmall,
-          ),
-        ),
+  padding: const EdgeInsets.symmetric(
+    horizontal: 2,
+  ),
+  child: _buildControls(
+    compact: compact,
+    verySmall: verySmall,
+  ),
+),
 
         SizedBox(
           height:
@@ -1309,7 +1668,6 @@ class _OutgoingVoiceCallScreenState
                   _cancelCall,
             ),
           ),
-
           Positioned(
             top: 5,
             child: Column(
@@ -1386,7 +1744,6 @@ class _OutgoingVoiceCallScreenState
               ],
             ),
           ),
-
           Positioned(
             right: 7,
             top: 7,
@@ -1415,7 +1772,8 @@ class _OutgoingVoiceCallScreenState
       onTap:
           _isCancelling ||
                   _hasFinished ||
-                  _isFinishing
+                  _isFinishing ||
+                  _hasOpenedConnectedScreen
               ? null
               : onTap,
       behavior:
@@ -1479,10 +1837,6 @@ class _OutgoingVoiceCallScreenState
             alignment:
                 Alignment.center,
             children: [
-              // ==============================================================
-              // WAVE
-              // ==============================================================
-
               Positioned.fill(
                 child:
                     AnimatedBuilder(
@@ -1501,17 +1855,12 @@ class _OutgoingVoiceCallScreenState
                   },
                 ),
               ),
-
-              // ==============================================================
-              // PULSE
-              // ==============================================================
-
               AnimatedBuilder(
                 animation:
                     _pulseController,
                 builder:
                     (context, child) {
-                  final pulse =
+                  final double pulse =
                       _pulseController.value;
 
                   return Container(
@@ -1541,11 +1890,6 @@ class _OutgoingVoiceCallScreenState
                   );
                 },
               ),
-
-              // ==============================================================
-              // ROTATING RING + AVATAR
-              // ==============================================================
-
               AnimatedBuilder(
                 animation:
                     _ringController,
@@ -1616,7 +1960,6 @@ class _OutgoingVoiceCallScreenState
             ],
           ),
         ),
-
         SizedBox(
           height:
               verySmall
@@ -1625,93 +1968,19 @@ class _OutgoingVoiceCallScreenState
                       ? 6
                       : 8,
         ),
-
-        // ====================================================================
-        // NAME
-        // ====================================================================
-
         Padding(
-          padding:
-              const EdgeInsets.symmetric(
-            horizontal: 18,
-          ),
-          child: Row(
-            mainAxisSize:
-                MainAxisSize.min,
-            children: [
-              Flexible(
-                child: Text(
-                  _displayName(),
-                  maxLines: 1,
-                  overflow:
-                      TextOverflow.ellipsis,
-                  textAlign:
-                      TextAlign.center,
-                  style:
-                      TextStyle(
-                    color:
-                        Colors.white,
-                    fontSize:
-                        nameSize,
-                    fontWeight:
-                        FontWeight.w600,
-                    letterSpacing:
-                        -0.6,
-                  ),
-                ),
-              ),
-
-              const SizedBox(width: 7),
-
-              // ==============================================================
-              // VERIFIED BADGE
-              // ==============================================================
-
-              Container(
-                width:
-                    verySmall
-                        ? 23
-                        : compact
-                            ? 26
-                            : 29,
-                height:
-                    verySmall
-                        ? 23
-                        : compact
-                            ? 26
-                            : 29,
-                decoration:
-                    const BoxDecoration(
-                  shape:
-                      BoxShape.circle,
-                  gradient:
-                      LinearGradient(
-                    colors: [
-                      Color(
-                        0xFFB34BFF,
-                      ),
-                      Color(
-                        0xFF7131FF,
-                      ),
-                    ],
-                  ),
-                ),
-                child: Icon(
-                  Icons.check_rounded,
-                  color:
-                      Colors.white,
-                  size:
-                      verySmall
-                          ? 15
-                          : 18,
-                ),
-              ),
-            ],
-          ),
-        ),
-
+  padding: const EdgeInsets.symmetric(
+    horizontal: 18,
+  ),
+  child: VerifiedName(
+    name: _displayName(),
+    verified: _isVerified,
+    fontSize: nameSize,
+    fontWeight: FontWeight.w600,
+    textColor: Colors.white,
+  ),
+),
         const SizedBox(height: 4),
-
         const Text(
           'Outgoing Voice Call',
           style:
@@ -1824,7 +2093,8 @@ class _OutgoingVoiceCallScreenState
         break;
 
       case ChattaxCallStatus.ringing:
-        text = 'Ringing...';
+        text =
+            'Ringing...';
         color =
             const Color(0xFF17EFAF);
         icon =
@@ -1841,7 +2111,8 @@ class _OutgoingVoiceCallScreenState
         break;
 
       case ChattaxCallStatus.connected:
-        text = 'Connected';
+        text =
+            'Connected';
         color =
             const Color(0xFF17EFAF);
         icon =
@@ -1849,7 +2120,8 @@ class _OutgoingVoiceCallScreenState
         break;
 
       case ChattaxCallStatus.rejected:
-        text = 'Call declined';
+        text =
+            'Call declined';
         color =
             const Color(0xFFFF4752);
         icon =
@@ -1857,7 +2129,8 @@ class _OutgoingVoiceCallScreenState
         break;
 
       case ChattaxCallStatus.ended:
-        text = 'Call ended';
+        text =
+            'Call ended';
         color =
             Colors.white54;
         icon =
@@ -2055,9 +2328,7 @@ class _OutgoingVoiceCallScreenState
                   compact ? 21 : 23,
             ),
           ),
-
           const SizedBox(width: 11),
-
           Expanded(
             child: Column(
               mainAxisAlignment:
@@ -2095,9 +2366,7 @@ class _OutgoingVoiceCallScreenState
               ],
             ),
           ),
-
           const SizedBox(width: 8),
-
           AnimatedSwitcher(
             duration:
                 const Duration(
@@ -2167,7 +2436,8 @@ class _OutgoingVoiceCallScreenState
           child: _control(
             icon:
                 Icons.mic_rounded,
-            label: 'Mute',
+            label:
+                'Mute',
             buttonSize:
                 buttonSize,
             onTap: () {
@@ -2177,12 +2447,12 @@ class _OutgoingVoiceCallScreenState
             },
           ),
         ),
-
         Expanded(
           child: _control(
             icon:
                 Icons.volume_up_rounded,
-            label: 'Speaker',
+            label:
+                'Speaker',
             buttonSize:
                 buttonSize,
             onTap: () {
@@ -2192,12 +2462,12 @@ class _OutgoingVoiceCallScreenState
             },
           ),
         ),
-
         Expanded(
           child: _control(
             icon:
                 Icons.person_add_alt_1_rounded,
-            label: 'Add Call',
+            label:
+                'Add Call',
             buttonSize:
                 buttonSize,
             activeColor:
@@ -2208,15 +2478,16 @@ class _OutgoingVoiceCallScreenState
                 _addCall,
           ),
         ),
-
         Expanded(
           child: _control(
             icon:
                 Icons.call_end_rounded,
-            label: 'Cancel',
+            label:
+                'Cancel',
             buttonSize:
                 buttonSize,
-            isEnd: true,
+            isEnd:
+                true,
             onTap:
                 _cancelCall,
           ),
@@ -2246,7 +2517,8 @@ class _OutgoingVoiceCallScreenState
           onTap:
               _isCancelling ||
                       _hasFinished ||
-                      _isFinishing
+                      _isFinishing ||
+                      _hasOpenedConnectedScreen
                   ? null
                   : onTap,
           behavior:
@@ -2317,9 +2589,7 @@ class _OutgoingVoiceCallScreenState
             ),
           ),
         ),
-
         const SizedBox(height: 5),
-
         Text(
           label,
           maxLines: 1,
@@ -2473,4 +2743,578 @@ class _OutgoingWavePainter
     return oldDelegate.progress !=
         progress;
   }
+}
+
+class _AddCallFriendPicker extends StatefulWidget {
+  const _AddCallFriendPicker({
+    required this.currentUserId,
+  });
+
+  final String currentUserId;
+
+  @override
+  State<_AddCallFriendPicker> createState() =>
+      _AddCallFriendPickerState();
+}
+
+class _AddCallFriendPickerState
+    extends State<_AddCallFriendPicker> {
+  static const Color background = Color(0xFF050816);
+  static const Color surface = Color(0xFF0D1528);
+  static const Color surfaceRaised = Color(0xFF111827);
+  static const Color border = Color(0xFF18243A);
+  static const Color cyan = Color(0xFF00D9FF);
+  static const Color purple = Color(0xFF8B2CF8);
+  static const Color primaryText = Color(0xFFF5F7FF);
+
+  final TextEditingController _searchController =
+      TextEditingController();
+
+  final Set<String> _selectedIds = <String>{};
+
+  String _search = '';
+
+  @override
+  void initState() {
+    super.initState();
+
+    _searchController.addListener(() {
+      if (!mounted) return;
+
+      setState(() {
+        _search = _searchController.text.trim().toLowerCase();
+      });
+    });
+  }
+
+  @override
+  void dispose() {
+    _searchController.dispose();
+    super.dispose();
+  }
+
+  Future<List<_CallFriend>> _loadFriends() async {
+    final friendsSnapshot = await FirebaseFirestore.instance
+        .collection('friends')
+        .doc(widget.currentUserId)
+        .collection('contacts')
+        .get();
+
+    if (friendsSnapshot.docs.isEmpty) {
+      return <_CallFriend>[];
+    }
+
+    final List<_CallFriend> friends = [];
+
+    for (final friendDoc in friendsSnapshot.docs) {
+      final friendId = friendDoc.id;
+
+      try {
+        final userSnapshot = await FirebaseFirestore.instance
+            .collection('users')
+            .doc(friendId)
+            .get();
+
+        if (!userSnapshot.exists) {
+          continue;
+        }
+
+        final data =
+            userSnapshot.data() as Map<String, dynamic>?;
+
+        if (data == null) {
+          continue;
+        }
+
+        final String name =
+            (data['displayName'] ?? 'Unknown').toString();
+
+        final String username =
+            (data['username'] ?? '').toString();
+
+        final String photo =
+            (data['photoUrl'] ?? '').toString();
+
+        final bool verified =
+            data['verified'] == true ||
+            data['isVerified'] == true;
+
+        friends.add(
+          _CallFriend(
+            id: friendId,
+            name: name,
+            username: username,
+            photoUrl: photo,
+            verified: verified,
+          ),
+        );
+      } catch (_) {
+        // Ignore a friend whose profile cannot currently
+        // be loaded.
+      }
+    }
+
+    friends.sort((a, b) {
+      return a.name.toLowerCase().compareTo(
+            b.name.toLowerCase(),
+          );
+    });
+
+    return friends;
+  }
+
+  bool _matchesSearch(_CallFriend friend) {
+    if (_search.isEmpty) {
+      return true;
+    }
+
+    return friend.name.toLowerCase().contains(_search) ||
+        friend.username.toLowerCase().contains(_search);
+  }
+
+  void _toggleFriend(String friendId) {
+    HapticFeedback.selectionClick();
+
+    setState(() {
+      if (_selectedIds.contains(friendId)) {
+        _selectedIds.remove(friendId);
+      } else {
+        _selectedIds.add(friendId);
+      }
+    });
+  }
+
+  void _addSelected() {
+    if (_selectedIds.isEmpty) {
+      return;
+    }
+
+    Navigator.of(context).pop(
+      List<String>.from(_selectedIds),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final bottomInset = MediaQuery.of(context).viewInsets.bottom;
+
+    return SafeArea(
+      top: false,
+      child: Container(
+        height: MediaQuery.of(context).size.height * 0.78,
+        padding: EdgeInsets.only(
+          bottom: bottomInset,
+        ),
+        decoration: const BoxDecoration(
+          color: background,
+          borderRadius: BorderRadius.vertical(
+            top: Radius.circular(28),
+          ),
+          border: Border(
+            top: BorderSide(
+              color: border,
+              width: 1,
+            ),
+          ),
+        ),
+        child: Column(
+          children: [
+            const SizedBox(height: 10),
+
+            Container(
+              width: 42,
+              height: 4,
+              decoration: BoxDecoration(
+                color: Colors.white24,
+                borderRadius: BorderRadius.circular(99),
+              ),
+            ),
+
+            Padding(
+              padding: const EdgeInsets.fromLTRB(
+                20,
+                18,
+                20,
+                12,
+              ),
+              child: Row(
+                children: [
+                  Container(
+                    width: 42,
+                    height: 42,
+                    decoration: BoxDecoration(
+                      color: cyan.withValues(alpha: 0.10),
+                      borderRadius: BorderRadius.circular(14),
+                      border: Border.all(
+                        color: cyan.withValues(alpha: 0.25),
+                      ),
+                    ),
+                    child: const Icon(
+                      Icons.person_add_alt_1_rounded,
+                      color: cyan,
+                      size: 21,
+                    ),
+                  ),
+
+                  const SizedBox(width: 12),
+
+                  const Expanded(
+                    child: Column(
+                      crossAxisAlignment:
+                          CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          'Add people',
+                          style: TextStyle(
+                            color: primaryText,
+                            fontSize: 19,
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
+                        SizedBox(height: 3),
+                        Text(
+                          'Choose friends to add to this call',
+                          style: TextStyle(
+                            color: Colors.white54,
+                            fontSize: 12.5,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+
+                  if (_selectedIds.isNotEmpty)
+                    Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 10,
+                        vertical: 6,
+                      ),
+                      decoration: BoxDecoration(
+                        color: purple.withValues(alpha: 0.14),
+                        borderRadius: BorderRadius.circular(20),
+                        border: Border.all(
+                          color: purple.withValues(alpha: 0.30),
+                        ),
+                      ),
+                      child: Text(
+                        '${_selectedIds.length}',
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                    ),
+                ],
+              ),
+            ),
+
+            Padding(
+              padding: const EdgeInsets.symmetric(
+                horizontal: 18,
+              ),
+              child: Container(
+                height: 48,
+                decoration: BoxDecoration(
+                  color: surface,
+                  borderRadius: BorderRadius.circular(15),
+                  border: Border.all(
+                    color: border,
+                  ),
+                ),
+                child: TextField(
+                  controller: _searchController,
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 14,
+                  ),
+                  cursorColor: cyan,
+                  decoration: const InputDecoration(
+                    border: InputBorder.none,
+                    prefixIcon: Icon(
+                      Icons.search_rounded,
+                      color: Colors.white54,
+                    ),
+                    hintText: 'Search friends',
+                    hintStyle: TextStyle(
+                      color: Colors.white38,
+                    ),
+                    contentPadding:
+                        EdgeInsets.symmetric(vertical: 14),
+                  ),
+                ),
+              ),
+            ),
+
+            const SizedBox(height: 12),
+
+            Expanded(
+              child: FutureBuilder<List<_CallFriend>>(
+                future: _loadFriends(),
+                builder: (context, snapshot) {
+                  if (snapshot.connectionState ==
+                      ConnectionState.waiting) {
+                    return const Center(
+                      child: SizedBox(
+                        width: 24,
+                        height: 24,
+                        child: CircularProgressIndicator(
+                          strokeWidth: 2,
+                          color: cyan,
+                        ),
+                      ),
+                    );
+                  }
+
+                  if (snapshot.hasError) {
+                    return const Center(
+                      child: Text(
+                        'Could not load friends',
+                        style: TextStyle(
+                          color: Colors.white54,
+                        ),
+                      ),
+                    );
+                  }
+
+                  final allFriends =
+                      snapshot.data ?? <_CallFriend>[];
+
+                  final friends = allFriends
+                      .where(_matchesSearch)
+                      .toList();
+
+                  if (allFriends.isEmpty) {
+                    return const Center(
+                      child: Text(
+                        'No friends yet',
+                        style: TextStyle(
+                          color: Colors.white54,
+                          fontSize: 15,
+                        ),
+                      ),
+                    );
+                  }
+
+                  if (friends.isEmpty) {
+                    return const Center(
+                      child: Text(
+                        'No friends found',
+                        style: TextStyle(
+                          color: Colors.white54,
+                          fontSize: 15,
+                        ),
+                      ),
+                    );
+                  }
+
+                  return ListView.separated(
+                    padding: const EdgeInsets.fromLTRB(
+                      18,
+                      4,
+                      18,
+                      110,
+                    ),
+                    itemCount: friends.length,
+                    separatorBuilder: (_, __) =>
+                        const SizedBox(height: 7),
+                    itemBuilder: (context, index) {
+                      final friend = friends[index];
+                      final selected =
+                          _selectedIds.contains(friend.id);
+
+                      return _buildFriendTile(
+                        friend,
+                        selected,
+                      );
+                    },
+                  );
+                },
+              ),
+            ),
+
+            Padding(
+              padding: const EdgeInsets.fromLTRB(
+                18,
+                8,
+                18,
+                14,
+              ),
+              child: SizedBox(
+                width: double.infinity,
+                height: 52,
+                child: ElevatedButton(
+                  onPressed:
+                      _selectedIds.isEmpty ? null : _addSelected,
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: cyan,
+                    disabledBackgroundColor:
+                        surfaceRaised,
+                    foregroundColor: Colors.black,
+                    disabledForegroundColor:
+                        Colors.white30,
+                    elevation: 0,
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(17),
+                    ),
+                  ),
+                  child: Text(
+                    _selectedIds.isEmpty
+                        ? 'Select friends'
+                        : 'Add ${_selectedIds.length} '
+                          '${_selectedIds.length == 1 ? 'person' : 'people'} '
+                          'to call',
+                    style: const TextStyle(
+                      fontWeight: FontWeight.w800,
+                      fontSize: 14,
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildFriendTile(
+    _CallFriend friend,
+    bool selected,
+  ) {
+    return InkWell(
+      onTap: () => _toggleFriend(friend.id),
+      borderRadius: BorderRadius.circular(17),
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 180),
+        padding: const EdgeInsets.all(10),
+        decoration: BoxDecoration(
+          color: selected
+              ? cyan.withValues(alpha: 0.08)
+              : surface,
+          borderRadius: BorderRadius.circular(17),
+          border: Border.all(
+            color: selected
+                ? cyan.withValues(alpha: 0.48)
+                : border,
+          ),
+        ),
+        child: Row(
+          children: [
+            Stack(
+              children: [
+                CircleAvatar(
+                  radius: 24,
+                  backgroundColor: surfaceRaised,
+                  backgroundImage:
+                      friend.photoUrl.isNotEmpty
+                          ? NetworkImage(friend.photoUrl)
+                          : null,
+                  child: friend.photoUrl.isEmpty
+                      ? const Icon(
+                          Icons.person_rounded,
+                          color: Colors.white54,
+                        )
+                      : null,
+                ),
+
+                if (selected)
+                  Positioned(
+                    right: -1,
+                    bottom: -1,
+                    child: Container(
+                      width: 20,
+                      height: 20,
+                      decoration: BoxDecoration(
+                        color: cyan,
+                        shape: BoxShape.circle,
+                        border: Border.all(
+                          color: background,
+                          width: 2,
+                        ),
+                      ),
+                      child: const Icon(
+                        Icons.check_rounded,
+                        color: Colors.black,
+                        size: 13,
+                      ),
+                    ),
+                  ),
+              ],
+            ),
+
+            const SizedBox(width: 12),
+
+            Expanded(
+              child: Column(
+                crossAxisAlignment:
+                    CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      Flexible(
+                        child: Text(
+                          friend.name,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                            color: Colors.white,
+                            fontSize: 14.5,
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
+                      ),
+
+                      if (friend.verified) ...[
+                        const SizedBox(width: 5),
+                        const Icon(
+                          Icons.verified_rounded,
+                          color: Color(0xFF2196F3),
+                          size: 16,
+                        ),
+                      ],
+                    ],
+                  ),
+
+                  if (friend.username.isNotEmpty)
+                    Text(
+                      '@${friend.username}',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 12,
+                      ),
+                    ),
+                ],
+              ),
+            ),
+
+            Icon(
+              selected
+                  ? Icons.check_circle_rounded
+                  : Icons.radio_button_unchecked_rounded,
+              color: selected ? cyan : Colors.white24,
+              size: 23,
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _CallFriend {
+  const _CallFriend({
+    required this.id,
+    required this.name,
+    required this.username,
+    required this.photoUrl,
+    required this.verified,
+  });
+
+  final String id;
+  final String name;
+  final String username;
+  final String photoUrl;
+  final bool verified;
 }
